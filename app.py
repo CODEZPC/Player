@@ -323,16 +323,6 @@ class LrcPlayerApp:
 
         _status_sep(bar)
 
-        # 音量（w=75）
-        vol_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=75, height=24)
-        vol_frame.pack(side="left")
-        vol_frame.pack_propagate(False)
-        self._vol_var = tk.StringVar(value="Vol: --")
-        vol_lbl = tk.Label(vol_frame, textvariable=self._vol_var, **lbl_cfg)
-        vol_lbl.pack(fill="both", expand=True)
-
-        _status_sep(bar)
-
         # 歌曲列表统计（w=130）
         list_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=130, height=24)
         list_frame.pack(side="left")
@@ -384,7 +374,9 @@ class LrcPlayerApp:
         info_label.pack(fill="x", pady=(4, 6))
 
     def _build_button_rows(self, parent: tk.Frame) -> None:
-        """两行按钮，每行 5 个。"""
+        """两行按钮，每行 5 个。包裹在容器中供取消条覆盖。"""
+        self._btn_container = tk.Frame(parent, bg=BG_COLOR)
+        self._btn_container.pack(fill="x")
         btn_cfg = dict(
             bg=SUBTLE_COLOR,
             fg=FG_COLOR,
@@ -398,7 +390,7 @@ class LrcPlayerApp:
         )
 
         # ---- 第一行 ----
-        row1 = tk.Frame(parent, bg=BG_COLOR)
+        row1 = tk.Frame(self._btn_container, bg=BG_COLOR)
         row1.pack(fill="x")
 
         self.open_file_btn = tk.Button(
@@ -423,7 +415,7 @@ class LrcPlayerApp:
         self.mode_btn.pack(side="left", padx=(8, 0))
 
         # ---- 第二行 ----
-        row2 = tk.Frame(parent, bg=BG_COLOR)
+        row2 = tk.Frame(self._btn_container, bg=BG_COLOR)
         row2.pack(fill="x", pady=(6, 0))
 
         self.open_folder_btn = tk.Button(
@@ -570,11 +562,13 @@ class LrcPlayerApp:
         row.columnconfigure(1, weight=1)
 
         self._btn_b = tk.Button(
-            row, text="添加到插播", command=self._interlude_add, **btn_cfg)
+            row, text="添加到插播", command=self._interlude_add,
+            width=7, **btn_cfg)
         self._btn_b.grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=1)
 
         self._btn_c = tk.Button(
-            row, text="清除插播队列", command=self._il_clear_confirm, **btn_cfg)
+            row, text="清除插播", command=self._il_clear_confirm,
+            width=7, **btn_cfg)
         self._btn_c.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=1)
 
         # ---- 插播列表（可伸展，填充剩余空间）----
@@ -655,7 +649,7 @@ class LrcPlayerApp:
         else:
             self._btn_a.config(text="播放此首", command=self._play_viewed_song)
             self._btn_b.config(text="添加到插播", command=self._interlude_add)
-            self._btn_c.config(text="清除插播队列", command=self._il_clear_confirm)
+            self._btn_c.config(text="清除插播", command=self._il_clear_confirm)
 
     def _reset_clear_button(self) -> None:
         """将清除按钮恢复为默认状态。"""
@@ -663,8 +657,8 @@ class LrcPlayerApp:
             self.root.after_cancel(self._clear_confirm_timer)
             self._clear_confirm_timer = None
         self._clear_confirm_active = False
-        self._btn_c.config(text="清除插播队列", fg=FG_COLOR,
-                          font=self.button_font,
+        self._btn_c.config(text="清除插播", fg=FG_COLOR,
+                          font=self.button_font, width=7,
                           command=self._il_clear_confirm)
 
     # ---- 插播基本操作 ----
@@ -728,8 +722,8 @@ class LrcPlayerApp:
             self._refresh_il_buttons()
             return
         self._clear_confirm_active = True
-        self._btn_c.config(text="确定？再次点击", fg="#FF4444",
-                          font=self.button_font_sm,
+        self._btn_c.config(text="确定？再点", fg="#FF4444",
+                          font=self.button_font, width=7,
                           command=self._il_clear_confirm)
         self._clear_confirm_timer = self.root.after(
             3000, self._reset_clear_button)
@@ -807,8 +801,6 @@ class LrcPlayerApp:
 
     def _refresh_status_bar(self) -> None:
         """刷新状态栏所有字段（主线程安全）。"""
-        self._refresh_vol()
-
         # 歌曲统计
         if self.audio_items:
             total = len(self.audio_items)
@@ -820,18 +812,6 @@ class LrcPlayerApp:
         # 插播统计
         n = len(self.interlude_items)
         self._ilst_var.set(f"插播: {n}首" if n else "插播: 0")
-
-    def _refresh_vol(self) -> None:
-        """刷新音量显示。"""
-        if self.engine.ready:
-            try:
-                import pygame
-                vol = round(pygame.mixer.music.get_volume() * 100)
-            except Exception:
-                vol = 0
-            self._vol_var.set(f"Vol: {vol}%")
-        else:
-            self._vol_var.set("Vol: --")
 
     def _set_scan_progress(self, done: int, total: int) -> None:
         """更新扫描进度（主线程安全）。"""
@@ -1251,24 +1231,21 @@ class LrcPlayerApp:
         self.seek_var.set(0.0)
 
     def _on_seek_press(self, _event: tk.Event) -> None:
-        """进度条拖动开始：记录当前位置，显示取消条。"""
+        """进度条拖动开始：覆盖取消条到按钮区上方。"""
         if not self.engine.ready or not self.audio_path or self.duration is None:
             return
         self.user_seeking = True
-        self._pre_seek_time = self._current_time()
-        self._cancel_frame.pack(fill="x", pady=(4, 2),
-                                before=self.seek_scale.master)
+        self._cancel_frame.place(in_=self._btn_container,
+                                 relx=0, rely=0, relwidth=1, relheight=1)
 
     def _on_seek_release(self, _event: tk.Event) -> None:
-        """进度条拖动结束：判断鼠标是否在取消条上，是则恢复原位。"""
+        """进度条拖动结束：在取消条上则不跳转（继续当前播放），否则跳转。"""
         if not self.engine.ready or not self.audio_path or self.duration is None:
             return
         target = float(self.seek_var.get())
         self.user_seeking = False
-        self._cancel_frame.pack_forget()
-        if self._is_pointer_in_cancel():
-            self._seek_to(self._pre_seek_time)
-        else:
+        self._cancel_frame.place_forget()
+        if not self._is_pointer_in_cancel():
             self._seek_to(target)
 
     def _is_pointer_in_cancel(self) -> bool:
@@ -1492,10 +1469,6 @@ class LrcPlayerApp:
             current = self._current_time()
             self.time_var.set(
                 f"{_format_time(current)} / {_format_time(self.duration)}")
-        # 每 ~500ms 刷新音量
-        self._tick_counter = getattr(self, '_tick_counter', 0) + 1
-        if self._tick_counter % 50 == 0:
-            self._refresh_vol()
         self.root.after(TICK_INTERVAL_MS, self._tick)
 
     def _handle_track_end(self) -> None:
