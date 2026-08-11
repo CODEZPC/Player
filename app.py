@@ -210,6 +210,7 @@ class LrcPlayerApp:
             messagebox.showwarning("音频后端", "未安装 pygame，音频播放不可用。")
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
+        self._setup_keyboard_shortcuts()
 
     # ==================================================================
     # 字体 & 样式
@@ -345,6 +346,95 @@ class LrcPlayerApp:
 
         # 初始刷新
         self._refresh_status_bar()
+
+    # ==================================================================
+    # 键盘快捷键（Alt + 字母 / Space / F11）
+    # ==================================================================
+
+    def _setup_keyboard_shortcuts(self) -> None:
+        """Alt+字母永久绑定 + Space/F11 + 字母提示标签。"""
+        self._key_tips: list = []
+        self._tips_visible = False
+        tip_font = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+
+        shortcuts = [
+            (self.open_file_btn,    "O", self._open_file),
+            (self.open_folder_btn,  "F", self._scan_folder),
+            (self.prev_btn,         "A", self._prev_track),
+            (self.next_btn,         "D", self._next_track),
+            (self.mode_btn,         "M", self._toggle_play_mode),
+            (self.back_10s_btn,     "Q", self._seek_back_10s),
+            (self.forward_10s_btn,  "E", self._seek_forward_10s),
+            (self.stop_btn,         "S", self._stop),
+            (self.topmost_btn,      "T", self._toggle_topmost),
+        ]
+
+        for btn, key, cmd in shortcuts:
+            # 提示标签
+            tip = tk.Label(self.root, text=key, bg="#333333", fg="#FFFFFF",
+                           font=tip_font, padx=3, pady=1)
+            self._key_tips.append((btn, key, cmd, tip))
+            # 永久绑定 Alt+Key → 始终可用
+            k = key.lower()
+            self.root.bind(f"<Alt-Key-{k}>",
+                           lambda e, c=cmd: self._on_alt_shortcut(c))
+
+        # 也尝试绑定 Alt 单按 → 显示提示（可能部分平台不触发，不影响快捷键）
+        self.root.bind("<Alt_L>", lambda e: self._show_key_tips())
+        self.root.bind("<Alt_R>", lambda e: self._show_key_tips())
+
+        # Space → 播放/暂停（始终可用）
+        self.root.bind("<space>",
+                       lambda e: (self._toggle_play_pause(), "break")[1])
+        # F11 → 全屏
+        self.root.bind("<F11>",
+                       lambda e: (self._toggle_fullscreen(), "break")[1])
+        # Escape → 隐藏提示
+        self.root.bind("<Escape>", lambda e: self._hide_key_tips())
+
+    def _on_alt_shortcut(self, cmd) -> str:
+        """Alt+Key 触发：先显示提示（若未显示），执行命令，重置自动隐藏计时。"""
+        if not self._tips_visible:
+            self._show_key_tips()
+        cmd()
+        self._reset_tip_timer()
+        return "break"
+
+    def _show_key_tips(self) -> None:
+        """在按钮下方显示快捷键字母提示。"""
+        if self._tips_visible:
+            return
+        self._tips_visible = True
+        for btn, key, cmd, tip in self._key_tips:
+            x = btn.winfo_rootx() - self.root.winfo_rootx() + btn.winfo_width() // 2 - 8
+            y = btn.winfo_rooty() - self.root.winfo_rooty() + btn.winfo_height()
+            tip.place(x=x, y=y)
+            tip.lift()
+        self._reset_tip_timer()
+
+    def _hide_key_tips(self) -> None:
+        """隐藏快捷键提示。"""
+        if not self._tips_visible:
+            return
+        self._tips_visible = False
+        for _, key, cmd, tip in self._key_tips:
+            tip.place_forget()
+        self._cancel_tip_timer()
+
+    def _reset_tip_timer(self) -> None:
+        """重置 3 秒自动隐藏计时。"""
+        self._cancel_tip_timer()
+        self._tip_timer = self.root.after(3000, self._hide_key_tips)
+
+    def _cancel_tip_timer(self) -> None:
+        if hasattr(self, '_tip_timer') and self._tip_timer is not None:
+            self.root.after_cancel(self._tip_timer)
+            self._tip_timer = None
+
+    def _toggle_fullscreen(self) -> None:
+        """切换全屏状态。"""
+        state = not self.root.attributes("-fullscreen")
+        self.root.attributes("-fullscreen", state)
 
     def _build_header(self, parent: tk.Frame) -> None:
         """顶部：当前歌词行 + 音视频信息行。"""
