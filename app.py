@@ -199,6 +199,7 @@ class LrcPlayerApp:
         self.lyric_font = self._pick_font("汉仪文黑-85W", 13)
         self.info_font = self._pick_font("Jetbrains Mono", 11)
         self.button_font = self._pick_font("汉仪文黑-85W", 12)
+        self.button_font_sm = self._pick_font("汉仪文黑-85W", 10)
 
         # ---- 构建 ----
         self._configure_style()
@@ -268,6 +269,14 @@ class LrcPlayerApp:
 
         self._build_header(left_col)
         self._build_button_rows(left_col)
+
+        # 拖拽取消条（初始隐藏，拖动进度条时显示）
+        self._cancel_frame = tk.Frame(left_col, bg="#6B1010", height=40)
+        self._cancel_label = tk.Label(
+            self._cancel_frame, text="拖动到此处以取消",
+            bg="#6B1010", fg="#FF5555", font=self.title_font)
+        self._cancel_label.pack(expand=True)
+
         self._build_progress_bar(left_col)
 
         self.bottom_frame = tk.Frame(left_col, bg=BG_COLOR)
@@ -547,23 +556,26 @@ class LrcPlayerApp:
             relief="flat", padx=6, pady=4,
         )
 
-        # ---- 按钮区 A（状态感知：1行全宽 + 2列半宽）----
+        # ---- 按钮区 A（状态感知：1行全宽 + 2列等宽固定）----
         btn_frame = tk.Frame(parent, bg=BG_COLOR)
         btn_frame.pack(side="bottom", fill="x")
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
 
         self._btn_a = tk.Button(
             btn_frame, text="播放此首", command=self._play_viewed_song, **btn_cfg)
-        self._btn_a.grid(row=0, column=0, columnspan=2, sticky="ew", pady=1)
+        self._btn_a.pack(fill="x", pady=1)
+
+        row = tk.Frame(btn_frame, bg=BG_COLOR)
+        row.pack(fill="x")
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, weight=1)
 
         self._btn_b = tk.Button(
-            btn_frame, text="添加到插播", command=self._interlude_add, **btn_cfg)
-        self._btn_b.grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=1)
+            row, text="添加到插播", command=self._interlude_add, **btn_cfg)
+        self._btn_b.grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=1)
 
         self._btn_c = tk.Button(
-            btn_frame, text="清除插播队列", command=self._il_clear_confirm, **btn_cfg)
-        self._btn_c.grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=1)
+            row, text="清除插播队列", command=self._il_clear_confirm, **btn_cfg)
+        self._btn_c.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=1)
 
         # ---- 插播列表（可伸展，填充剩余空间）----
         il_frame = tk.Frame(parent, bg=BG_COLOR)
@@ -652,6 +664,7 @@ class LrcPlayerApp:
             self._clear_confirm_timer = None
         self._clear_confirm_active = False
         self._btn_c.config(text="清除插播队列", fg=FG_COLOR,
+                          font=self.button_font,
                           command=self._il_clear_confirm)
 
     # ---- 插播基本操作 ----
@@ -716,6 +729,7 @@ class LrcPlayerApp:
             return
         self._clear_confirm_active = True
         self._btn_c.config(text="确定？再次点击", fg="#FF4444",
+                          font=self.button_font_sm,
                           command=self._il_clear_confirm)
         self._clear_confirm_timer = self.root.after(
             3000, self._reset_clear_button)
@@ -793,16 +807,7 @@ class LrcPlayerApp:
 
     def _refresh_status_bar(self) -> None:
         """刷新状态栏所有字段（主线程安全）。"""
-        # 音量
-        if self.engine.ready:
-            try:
-                import pygame
-                vol = round(pygame.mixer.music.get_volume() * 100)
-            except Exception:
-                vol = 0
-            self._vol_var.set(f"Vol: {vol}%")
-        else:
-            self._vol_var.set("Vol: --")
+        self._refresh_vol()
 
         # 歌曲统计
         if self.audio_items:
@@ -815,6 +820,18 @@ class LrcPlayerApp:
         # 插播统计
         n = len(self.interlude_items)
         self._ilst_var.set(f"插播: {n}首" if n else "插播: 0")
+
+    def _refresh_vol(self) -> None:
+        """刷新音量显示。"""
+        if self.engine.ready:
+            try:
+                import pygame
+                vol = round(pygame.mixer.music.get_volume() * 100)
+            except Exception:
+                vol = 0
+            self._vol_var.set(f"Vol: {vol}%")
+        else:
+            self._vol_var.set("Vol: --")
 
     def _set_scan_progress(self, done: int, total: int) -> None:
         """更新扫描进度（主线程安全）。"""
@@ -1234,18 +1251,33 @@ class LrcPlayerApp:
         self.seek_var.set(0.0)
 
     def _on_seek_press(self, _event: tk.Event) -> None:
-        """进度条拖动开始。"""
+        """进度条拖动开始：记录当前位置，显示取消条。"""
         if not self.engine.ready or not self.audio_path or self.duration is None:
             return
         self.user_seeking = True
+        self._pre_seek_time = self._current_time()
+        self._cancel_frame.pack(fill="x", pady=(4, 2),
+                                before=self.seek_scale.master)
 
     def _on_seek_release(self, _event: tk.Event) -> None:
-        """进度条拖动结束，跳转到目标位置。"""
+        """进度条拖动结束：判断鼠标是否在取消条上，是则恢复原位。"""
         if not self.engine.ready or not self.audio_path or self.duration is None:
             return
         target = float(self.seek_var.get())
         self.user_seeking = False
-        self._seek_to(target)
+        self._cancel_frame.pack_forget()
+        if self._is_pointer_in_cancel():
+            self._seek_to(self._pre_seek_time)
+        else:
+            self._seek_to(target)
+
+    def _is_pointer_in_cancel(self) -> bool:
+        """判断当前鼠标指针是否在取消条范围内。"""
+        try:
+            y = self.root.winfo_pointery() - self._cancel_frame.winfo_rooty()
+            return 0 <= y <= self._cancel_frame.winfo_height()
+        except Exception:
+            return False
 
     def _on_seek_changed(self, value: str) -> None:
         """进度条拖动中，实时更新时间与歌词预览。"""
@@ -1460,6 +1492,10 @@ class LrcPlayerApp:
             current = self._current_time()
             self.time_var.set(
                 f"{_format_time(current)} / {_format_time(self.duration)}")
+        # 每 ~500ms 刷新音量
+        self._tick_counter = getattr(self, '_tick_counter', 0) + 1
+        if self._tick_counter % 50 == 0:
+            self._refresh_vol()
         self.root.after(TICK_INTERVAL_MS, self._tick)
 
     def _handle_track_end(self) -> None:
