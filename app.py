@@ -1,7 +1,6 @@
 """音乐播放器主应用 —— UI 布局、交互逻辑、歌词同步。"""
 
 import os
-import sys
 import random
 import threading
 import time
@@ -12,6 +11,15 @@ from tkinter import ttk, filedialog, messagebox, font as tkfont
 from lrc_parser import LrcParser
 from audio_engine import AudioEngine
 from cover_utils import extract_cover_art, cover_to_tk_image
+from utils import (
+    format_time,
+    read_text_file,
+    get_duration_mutagen,
+    make_progress_bar,
+    status_sep,
+    bind_tooltip,
+    resource_path,
+)
 
 
 # ===========================================================================
@@ -36,103 +44,6 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac"}
 
 
 # ===========================================================================
-# 辅助函数
-# ===========================================================================
-
-def _format_time(seconds: float | None) -> str:
-    """将秒数格式化为 mm:ss 字符串。"""
-    if seconds is None:
-        return "--:--"
-    total = int(max(0.0, seconds))
-    minutes = total // 60
-    secs = total % 60
-    return f"{minutes:02d}:{secs:02d}"
-
-
-def _read_text_file(path: str) -> str | None:
-    """尝试多种编码读取文本文件内容。"""
-    encodings = ["utf-8", "utf-8-sig", "gbk", "gb18030"]
-    for enc in encodings:
-        try:
-            with open(path, "r", encoding=enc) as f:
-                return f.read()
-        except UnicodeError:
-            continue
-        except OSError:
-            return None
-    return None
-
-
-def _get_duration_mutagen(path: str) -> float | None:
-    """用 mutagen 读取音频时长（不占用 pygame mixer，线程安全）。"""
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        if ext == ".mp3":
-            from mutagen.mp3 import MP3
-            return MP3(path).info.length
-        elif ext == ".flac":
-            from mutagen.flac import FLAC
-            return FLAC(path).info.length
-        elif ext == ".ogg":
-            from mutagen.oggvorbis import OggVorbis
-            return OggVorbis(path).info.length
-        elif ext == ".wav":
-            from mutagen.wave import WAVE
-            return WAVE(path).info.length
-    except Exception:
-        pass
-    return None
-
-
-def _make_progress_bar(pct: float, width: int = 10) -> str:
-    """生成文字进度条：▓▓▓▓▓░░░ 60%"""
-    done = int(round(pct / 100 * width))
-    done = max(0, min(width, done))
-    return f"{'▓' * done}{'░' * (width - done)} {pct:.0f}%"
-
-
-def _status_sep(parent: tk.Frame) -> None:
-    """状态栏分隔竖线。"""
-    sep = tk.Frame(parent, bg=FG_COLOR, width=1, height=18)
-    sep.pack(side="left", pady=3)
-
-
-def _bind_tooltip(widget: tk.Widget, text_var: tk.StringVar,
-                  app: "LrcPlayerApp", font: tkfont.Font) -> None:
-    """给状态栏标签绑定悬停提示。"""
-    def _enter(event: tk.Event) -> None:
-        if app._tooltip:
-            return
-        t = tk.Toplevel(widget)
-        t.wm_overrideredirect(True)
-        x = event.x_root + 10
-        y = event.y_root - 10
-        t.wm_geometry(f"+{x}+{y}")
-        lbl = tk.Label(t, text=text_var.get(), bg="#FFFFCC", fg="black",
-                       font=font, padx=4, pady=2)
-        lbl.pack()
-        app._tooltip = t
-
-    def _leave(_event: tk.Event) -> None:
-        if app._tooltip:
-            app._tooltip.destroy()
-            app._tooltip = None
-
-    widget.bind("<Enter>", _enter)
-    widget.bind("<Leave>", _leave)
-
-def resource_path(relative_path):
-    """获取资源的绝对路径，兼容开发环境和 PyInstaller 打包后的环境"""
-    try:
-        # PyInstaller 打包后，临时目录路径存在 sys._MEIPASS 中
-        base_path = sys._MEIPASS
-    except AttributeError:
-        # 开发环境中，使用当前文件所在目录
-        base_path = os.path.abspath(".\\_internal\\")
-    return os.path.join(base_path, relative_path)
-
-
-# ===========================================================================
 # LrcPlayerApp
 # ===========================================================================
 
@@ -145,7 +56,7 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player")
+        self.root.title("Player PRO V1.2.9")
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(820, 250)
         self.root.resizable(True, True)
@@ -309,9 +220,9 @@ class LrcPlayerApp:
         self._prog_var = tk.StringVar(value="就绪")
         prog_lbl = tk.Label(prog_frame, textvariable=self._prog_var, **lbl_cfg)
         prog_lbl.pack(fill="both", expand=True)
-        _bind_tooltip(prog_lbl, self._prog_var, self, status_font)
+        bind_tooltip(prog_lbl, self._prog_var, self, status_font)
 
-        _status_sep(bar)
+        status_sep(bar)
 
         # 音频设备（w=170）
         audio_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=170, height=24)
@@ -320,9 +231,9 @@ class LrcPlayerApp:
         self._audio_var = tk.StringVar(value=self._read_audio_info())
         audio_lbl = tk.Label(audio_frame, textvariable=self._audio_var, **lbl_cfg)
         audio_lbl.pack(fill="both", expand=True)
-        _bind_tooltip(audio_lbl, self._audio_var, self, status_font)
+        bind_tooltip(audio_lbl, self._audio_var, self, status_font)
 
-        _status_sep(bar)
+        status_sep(bar)
 
         # 歌曲列表统计（w=130）
         list_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=130, height=24)
@@ -331,9 +242,9 @@ class LrcPlayerApp:
         self._liststat_var = tk.StringVar(value="共 0 首")
         list_lbl = tk.Label(list_frame, textvariable=self._liststat_var, **lbl_cfg)
         list_lbl.pack(fill="both", expand=True)
-        _bind_tooltip(list_lbl, self._liststat_var, self, status_font)
+        bind_tooltip(list_lbl, self._liststat_var, self, status_font)
 
-        _status_sep(bar)
+        status_sep(bar)
 
         # 插播统计（w=85）
         il_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=85, height=24)
@@ -342,7 +253,7 @@ class LrcPlayerApp:
         self._ilst_var = tk.StringVar(value="插播: 0")
         il_lbl = tk.Label(il_frame, textvariable=self._ilst_var, **lbl_cfg)
         il_lbl.pack(fill="both", expand=True)
-        _bind_tooltip(il_lbl, self._ilst_var, self, status_font)
+        bind_tooltip(il_lbl, self._ilst_var, self, status_font)
 
         # 初始刷新
         self._refresh_status_bar()
@@ -600,28 +511,43 @@ class LrcPlayerApp:
         info_outer = tk.Frame(parent, bg=BG_COLOR)
         info_outer.grid(row=2, column=0, sticky="ew")
 
+        # 列宽策略：第 0 列（文件名/专辑）弹性伸缩，右边三栏定宽
+        info_outer.columnconfigure(0, weight=1)
+        # 右边三栏的固定列宽（像素）
+        _FIXED_COL_WIDTHS = {1: 120, 2: 100, 3: 160}
+
         self.song_info_labels: dict[str, tk.StringVar] = {}
+        self._song_info_val_widgets: dict[str, tk.Label] = {}
         info_fields = [
             ("文件名", 0, 0), ("时长", 0, 1), ("格式", 0, 2), ("文件大小", 0, 3),
             ("专辑", 1, 0), ("音轨号", 1, 1), ("歌词", 1, 2),
         ]
         for field, row, col in info_fields:
             seg = tk.Frame(info_outer, bg=BG_COLOR)
-            seg.grid(row=row, column=col, sticky="w", padx=(0 if col == 0 else 16, 0), pady=1)
+            seg.grid(row=row, column=col, sticky="w",
+                     padx=(0 if col == 0 else 12, 0), pady=1)
+
             key_lbl = tk.Label(
                 seg, text=f"{field}:", bg=BG_COLOR, fg=ACCENT_COLOR,
                 font=self.info_font, anchor="w")
             key_lbl.pack(side="left")
+
             var = tk.StringVar(value="-")
             val_lbl = tk.Label(
                 seg, textvariable=var, bg=BG_COLOR, fg=FG_COLOR,
-                font=self.info_font, anchor="w", wraplength=220)
+                font=self.info_font, anchor="w")
             val_lbl.pack(side="left", padx=(2, 0))
             self.song_info_labels[field] = var
+            self._song_info_val_widgets[field] = val_lbl
 
-        # 让各列均匀分配宽度
-        for c in range(4):
-            info_outer.columnconfigure(c, weight=1)
+            # 右边三栏固定宽度，超出裁剪
+            if col > 0:
+                w = _FIXED_COL_WIDTHS.get(col, 75)
+                seg.config(width=w, height=22)
+                seg.pack_propagate(False)
+
+            # 悬停显示完整文本
+            bind_tooltip(val_lbl, var, self, self.info_font)
 
         # 初始化空列表
         self._refresh_song_list()
@@ -906,7 +832,7 @@ class LrcPlayerApp:
     def _set_scan_progress(self, done: int, total: int) -> None:
         """更新扫描进度（主线程安全）。"""
         pct = done / total * 100 if total > 0 else 0
-        bar = _make_progress_bar(pct)
+        bar = make_progress_bar(pct)
         self._prog_var.set(f"解析中 {bar}")
 
     def _set_status_ready(self) -> None:
@@ -984,7 +910,7 @@ class LrcPlayerApp:
                 return
             path = item.get("path")
             if path:
-                dur = _get_duration_mutagen(path)
+                dur = get_duration_mutagen(path)
                 item["duration"] = dur
             self.root.after(0, lambda idx=i, d=item.get("duration"):
                            self._on_duration_cached(idx, d))
@@ -1001,7 +927,7 @@ class LrcPlayerApp:
             return
         if "时长" in self.song_info_labels:
             self.song_info_labels["时长"].set(
-                _format_time(duration) if duration else "未知")
+                format_time(duration) if duration else "未知")
 
     @staticmethod
     def _song_sort_key(item: dict) -> tuple:
@@ -1122,7 +1048,7 @@ class LrcPlayerApp:
 
         # 时长（已缓存直接用，否则显示"计算中"）
         dur = item.get("duration")
-        info["时长"] = _format_time(dur) if dur is not None else "计算中..."
+        info["时长"] = format_time(dur) if dur is not None else "计算中..."
 
         # 格式
         _, ext = os.path.splitext(path)
@@ -1151,7 +1077,7 @@ class LrcPlayerApp:
         # 歌词
         lrc = item.get("lrc")
         if lrc and os.path.exists(lrc):
-            info["歌词"] = f"已匹配 ({os.path.basename(lrc)})"
+            info["歌词"] = f"已匹配"
         else:
             info["歌词"] = "未匹配"
 
@@ -1269,7 +1195,7 @@ class LrcPlayerApp:
 
     def _load_lrc_file(self, path: str) -> None:
         """加载并解析 LRC 歌词文件。"""
-        content = _read_text_file(path)
+        content = read_text_file(path)
         if content is None:
             messagebox.showerror("加载歌词", "无法读取 LRC 文件。")
             self._clear_lrc()
@@ -1355,7 +1281,7 @@ class LrcPlayerApp:
         except ValueError:
             return
         self.time_var.set(
-            f"{_format_time(target)} / {_format_time(self.duration)}")
+            f"{format_time(target)} / {format_time(self.duration)}")
         self._sync_lyrics(target)
 
     # ==================================================================
@@ -1415,7 +1341,7 @@ class LrcPlayerApp:
             self.is_playing = True
         self.seek_var.set(seconds)
         self.time_var.set(
-            f"{_format_time(seconds)} / {_format_time(self.duration)}")
+            f"{format_time(seconds)} / {format_time(self.duration)}")
         self._sync_lyrics(seconds)
 
     def _seek_back_10s(self) -> None:
@@ -1498,7 +1424,7 @@ class LrcPlayerApp:
         self.play_started_at = None
         self.user_seeking = False
         self.seek_var.set(0.0)
-        dur_str = _format_time(self.duration)
+        dur_str = format_time(self.duration)
         self.time_var.set(f"00:00 / {dur_str}")
         self._highlight_line(-1)
         self.play_pause_btn.config(text="播放")
@@ -1553,12 +1479,12 @@ class LrcPlayerApp:
                 if self.duration:
                     self.seek_var.set(current)
                 self.time_var.set(
-                    f"{_format_time(current)} / {_format_time(self.duration)}")
+                    f"{format_time(current)} / {format_time(self.duration)}")
                 self._sync_lyrics(current)
         elif self.is_paused and not self.user_seeking:
             current = self._current_time()
             self.time_var.set(
-                f"{_format_time(current)} / {_format_time(self.duration)}")
+                f"{format_time(current)} / {format_time(self.duration)}")
         self.root.after(TICK_INTERVAL_MS, self._tick)
 
     def _handle_track_end(self) -> None:

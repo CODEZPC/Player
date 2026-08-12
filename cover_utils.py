@@ -71,8 +71,46 @@ def _extract_ogg(path: str) -> bytes | None:
     pics = audio.get("metadata_block_picture", [])
     if pics:
         import base64
-        return base64.b64decode(pics[0])
+        raw = base64.b64decode(pics[0])
+        return _parse_flac_picture_block(raw)
     return None
+
+
+def _parse_flac_picture_block(data: bytes) -> bytes | None:
+    """解析 FLAC 图片块，提取其中的原始图片数据。
+
+    FLAC picture block 结构（大端序）：
+      4 bytes  - 图片类型
+      4 bytes  - MIME 类型长度
+      N bytes  - MIME 类型字符串
+      4 bytes  - 描述长度
+      M bytes  - 描述字符串
+      4 bytes  - 宽度
+      4 bytes  - 高度
+      4 bytes  - 色彩深度
+      4 bytes  - 颜色数
+      4 bytes  - 图片数据长度
+      K bytes  - 图片数据
+    """
+    import struct
+    try:
+        pos = 0
+        # 跳过图片类型 (4 bytes)
+        pos += 4
+        # 读取并跳过 MIME 类型
+        mime_len = struct.unpack_from(">I", data, pos)[0]
+        pos += 4 + mime_len
+        # 读取并跳过描述
+        desc_len = struct.unpack_from(">I", data, pos)[0]
+        pos += 4 + desc_len
+        # 跳过宽、高、色彩深度、颜色数 (4 × 4 bytes)
+        pos += 16
+        # 读取图片数据长度
+        pic_len = struct.unpack_from(">I", data, pos)[0]
+        pos += 4
+        return data[pos:pos + pic_len]
+    except (struct.error, IndexError):
+        return None
 
 
 def _extract_wav(path: str) -> bytes | None:
