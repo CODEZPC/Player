@@ -56,7 +56,7 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.2.9")
+        self.root.title("Player PRO V1.2.12")
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(820, 250)
         self.root.resizable(True, True)
@@ -606,9 +606,9 @@ class LrcPlayerApp:
         self.interlude_list.pack(side="left", fill="both", expand=True)
         self.interlude_list.bind("<FocusOut>", self._on_interlude_focus_out)
 
-        # 插播列表选择变化时刷新按钮
+        # 插播列表选择变化时刷新按钮，移动模式下锁定选中项
         self.interlude_list.bind("<<ListboxSelect>>",
-                                lambda e: self._refresh_il_buttons())
+                                lambda e: self._on_interlude_select())
 
         # ---- 专辑封面（固定 220×220，与图片尺寸一致，避免灰边）----
         cover_frame = tk.Frame(parent, bg=BG_COLOR, height=220, width=220)
@@ -686,6 +686,14 @@ class LrcPlayerApp:
             name = os.path.basename(item.get("path") or "")
             self.interlude_list.insert("end", name)
         self._refresh_status_bar()
+
+    def _on_interlude_select(self) -> None:
+        """插播列表选择变化：移动模式下锁定选中项，否则刷新按钮。"""
+        if self._il_move_mode and self._move_locked_index is not None:
+            # 移动模式下强制选中锁定项，禁止点击其他歌曲
+            self.interlude_list.selection_clear(0, "end")
+            self.interlude_list.selection_set(self._move_locked_index)
+        self._refresh_il_buttons()
 
     def _on_interlude_focus_out(self, _event: tk.Event) -> None:
         """插播列表失焦后清空选择（移动模式下不处理）。"""
@@ -1529,8 +1537,23 @@ class LrcPlayerApp:
         """播放插播列表队首歌曲，并将其从列表中移除。"""
         if not self.interlude_items:
             return
+
+        # 若处于移动模式，队首被消费需调整锁定索引
+        if self._il_move_mode and self._move_locked_index is not None:
+            if self._move_locked_index == 0:
+                # 锁定项即队首，将被消费，退出移动模式
+                self._il_move_confirm()
+            else:
+                # 队首移除后，所有后续索引前移一位
+                self._move_locked_index -= 1
+
         item = self.interlude_items.pop(0)
         self._refresh_interlude_list()
+
+        # 移动模式下恢复选中状态
+        if self._il_move_mode and self._move_locked_index is not None:
+            self.interlude_list.selection_set(self._move_locked_index)
+
         path = item.get("path")
         if not path or not os.path.exists(path):
             return
