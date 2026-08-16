@@ -56,7 +56,7 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.2.12")
+        self.root.title("Player PRO V1.3.2")
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(820, 250)
         self.root.resizable(True, True)
@@ -88,6 +88,11 @@ class LrcPlayerApp:
         self._clear_confirm_active = False
         self._clear_confirm_timer: str | None = None
 
+        # ---- 歌词浮层 ----
+        self._lyric_overlay = None  # 全窗口歌词浮层 Frame
+        self._overlay_cover_photo = None
+        self._overlay_lyric_vars: list[tk.StringVar] = []
+
         # ---- 播放状态 ----
         self.is_playing = False
         self.is_paused = False
@@ -111,6 +116,10 @@ class LrcPlayerApp:
         self.info_font = self._pick_font("Jetbrains Mono", 11)
         self.button_font = self._pick_font("汉仪文黑-85W", 12)
         self.button_font_sm = self._pick_font("汉仪文黑-85W", 10)
+        self.overlay_name_font = self._pick_font("汉仪文黑-85W", 20)
+        self.overlay_artist_font = self._pick_font("汉仪文黑-85W", 14)
+        self.overlay_lyric_big_font = self._pick_font("汉仪文黑-85W", 24)
+        self.overlay_lyric_small_font = self._pick_font("汉仪文黑-85W", 13)
 
         # ---- 构建 ----
         self._configure_style()
@@ -619,6 +628,8 @@ class LrcPlayerApp:
             text="专辑封面", font=self.info_font,
         )
         self.cover_label.pack(fill="both", expand=True)
+        # 点击封面打开全窗口歌词浮层
+        self.cover_label.bind("<Button-1>", self._open_lyric_overlay)
 
     # ==================================================================
     # 专辑封面
@@ -628,6 +639,7 @@ class LrcPlayerApp:
         """根据当前播放的音频文件更新专辑封面。"""
         if not path:
             self._show_default_cover()
+            self._refresh_overlay_header()
             return
         data = extract_cover_art(path)
         photo = cover_to_tk_image(data) if data else None
@@ -636,6 +648,7 @@ class LrcPlayerApp:
             self.cover_label.config(image=photo, text="")
         else:
             self._show_default_cover()
+        self._refresh_overlay_header()
 
     def _show_default_cover(self) -> None:
         """显示默认封面占位。"""
@@ -896,7 +909,7 @@ class LrcPlayerApp:
                     continue
                 path = os.path.join(root, name)
                 lrc_path = self._find_lrc_for_audio(path)
-                track_number, album_name = self._get_metadata(path)
+                track_number, album_name, artist_name = self._get_metadata(path)
                 rel = os.path.relpath(path, folder)
                 items.append({
                     "path": path,
@@ -904,6 +917,7 @@ class LrcPlayerApp:
                     "display": rel,
                     "track": track_number,
                     "album": album_name,
+                    "artist": artist_name,
                     "duration": None,
                 })
         items.sort(key=self._song_sort_key)
@@ -954,22 +968,22 @@ class LrcPlayerApp:
         return (dir_parts, album, track_key, filename)
 
     @staticmethod
-    def _get_metadata(path: str) -> tuple[int | None, str]:
-        """从音频元数据中读取音轨号（整数）和专辑名。
+    def _get_metadata(path: str) -> tuple[int | None, str, str]:
+        """从音频元数据中读取音轨号（整数）、专辑名和歌手名。
 
         Returns:
-            (track_number, album_name) —— track_number 为 None 表示读取失败。
+            (track_number, album_name, artist_name) —— track_number 为 None 表示读取失败。
         """
         try:
             from mutagen import File as MutagenFile
         except Exception:
-            return None, ""
+            return None, "", ""
         try:
             audio = MutagenFile(path, easy=True)
         except Exception:
-            return None, ""
+            return None, "", ""
         if not audio or not audio.tags:
-            return None, ""
+            return None, "", ""
         import re
         tags = {k.lower(): v for k, v in audio.tags.items()}
         # 读取专辑
@@ -977,6 +991,11 @@ class LrcPlayerApp:
         album_values = tags.get("album")
         if album_values:
             album = str(album_values[0]) if isinstance(album_values, (list, tuple)) else str(album_values)
+        # 读取歌手
+        artist = ""
+        artist_values = tags.get("artist")
+        if artist_values:
+            artist = str(artist_values[0]) if isinstance(artist_values, (list, tuple)) else str(artist_values)
         # 读取音轨号
         for key in ("tracknumber", "track", "trck"):
             if key not in tags:
@@ -988,10 +1007,10 @@ class LrcPlayerApp:
             match = re.search(r"\d+", raw)
             if match:
                 try:
-                    return int(match.group(0)), album
+                    return int(match.group(0)), album, artist
                 except ValueError:
-                    return None, album
-        return None, album
+                    return None, album, artist
+        return None, album, artist
 
     def _refresh_song_list(self) -> None:
         """刷新 Listbox 中的歌曲显示。"""
@@ -1229,8 +1248,10 @@ class LrcPlayerApp:
         if not self.lrc_lines:
             self.now_line_var.set(
                 "未加载歌词" if self.lrc_path is None else "未找到时间轴歌词")
+            self._update_lyric_overlay()
             return
         self.now_line_var.set(self.lrc_lines[0][1])
+        self._update_lyric_overlay()
 
     # ==================================================================
     # 信息行
@@ -1383,14 +1404,26 @@ class LrcPlayerApp:
         self._load_track_by_index(idx, autoplay=True)
 
     def _next_track(self) -> None:
-        """下一曲：若插播列表有歌曲则优先消费插播，否则正常切歌。"""
+        """下一曲：插播优先，否则按播放模式切歌（随机模式下随机选曲）。"""
         if self.interlude_items:
             self._stop()
             self._play_next_interlude()
             return
         if not self.audio_items:
             return
-        if self.current_song_index is None:
+        if self.play_mode == "shuffle":
+            # 随机模式：与曲目自然结束的随机逻辑一致
+            if self.current_song_index is None:
+                idx = random.randrange(len(self.audio_items))
+            elif len(self.audio_items) == 1:
+                idx = 0
+            else:
+                choices = [
+                    i for i in range(len(self.audio_items))
+                    if i != self.current_song_index
+                ]
+                idx = random.choice(choices)
+        elif self.current_song_index is None:
             idx = 0
         elif self.current_song_index < len(self.audio_items) - 1:
             idx = self.current_song_index + 1
@@ -1461,17 +1494,227 @@ class LrcPlayerApp:
             self._highlight_line(index)
 
     def _highlight_line(self, index: int) -> None:
-        """高亮指定索引的歌词行。"""
+        """高亮指定索引的歌词行，并同步歌词浮层。"""
         if not self.lrc_lines:
             self.now_line_var.set(
                 "未加载歌词" if self.lrc_path is None else "未找到时间轴歌词")
+            self._update_lyric_overlay()
             return
         if index < 0:
             self.now_line_var.set(self.lrc_lines[0][1])
+            self._update_lyric_overlay()
             return
         if index >= len(self.lrc_lines):
+            self._update_lyric_overlay()
             return
         self.now_line_var.set(self.lrc_lines[index][1])
+        self._update_lyric_overlay()
+
+    # ==================================================================
+    # 全窗口歌词浮层（点击封面打开）
+    # ==================================================================
+
+    def _open_lyric_overlay(self, _event: tk.Event | None = None) -> None:
+        """点击专辑封面：打开全窗口歌词浮层。"""
+        if self._lyric_overlay is not None or not self.audio_path:
+            return
+        self._build_lyric_overlay()
+        self._refresh_overlay_header()
+        self._update_lyric_overlay()
+
+    def _build_lyric_overlay(self) -> None:
+        """构建全窗口浮层：左栏放大封面+歌曲信息，右栏七行歌词。"""
+        overlay = tk.Frame(self.root, bg=BG_COLOR)
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        overlay.lift()
+        self._lyric_overlay = overlay
+
+        # 左上角返回按钮（小正方形、与背景同色、FLAT）
+        close_btn = tk.Button(
+            overlay, text="↓", command=self._close_lyric_overlay,
+            bg=BG_COLOR, fg=FG_COLOR, font=self.button_font_sm,
+            activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+            relief="flat", bd=0, highlightthickness=0, padx=6, pady=3)
+        close_btn.place(x=10, y=10)
+
+        # 左右两栏定宽占比 9:11（uniform 保证严格比例，内容不会顶开布局）
+        overlay.columnconfigure(0, weight=9, uniform="ovl")
+        overlay.columnconfigure(1, weight=11, uniform="ovl")
+        overlay.rowconfigure(0, weight=1)
+
+        # ---- 左栏：内容垂直居中 ----
+        left = tk.Frame(overlay, bg=BG_COLOR)
+        left.grid(row=0, column=0, sticky="nsew")
+
+        tk.Frame(left, bg=BG_COLOR).pack(expand=True)  # 顶部弹性（垂直居中）
+
+        self._overlay_cover_label = tk.Label(
+            left, bg=BG_COLOR, fg=FG_COLOR, text="专辑封面",
+            font=self.info_font)
+        self._overlay_cover_label.pack(anchor="s", pady=(0, 16))
+
+        self._overlay_name_var = tk.StringVar(value="")
+        self._overlay_name_label = tk.Label(
+            left, textvariable=self._overlay_name_var, bg=BG_COLOR,
+            fg=FG_COLOR, font=self.overlay_name_font,
+            anchor="center", justify="center")
+        self._overlay_name_label.pack()
+
+        self._overlay_artist_var = tk.StringVar(value="")
+        self._overlay_artist_label = tk.Label(
+            left, textvariable=self._overlay_artist_var, bg=BG_COLOR,
+            fg=ACCENT_COLOR, font=self.overlay_artist_font,
+            anchor="center", justify="center")
+        self._overlay_artist_label.pack(pady=(6, 0))
+
+        # 初始换行宽度（不依赖 Configure 事件，保证首次显示即生效）
+        init_wrap = max(80, int(self.root.winfo_width() * 9 / 20) - 60)
+        self._overlay_name_label.config(wraplength=init_wrap)
+        self._overlay_artist_label.config(wraplength=init_wrap)
+
+        tk.Frame(left, bg=BG_COLOR).pack(expand=True)  # 底部弹性（垂直居中）
+
+        # ---- 右栏：七行歌词（上三/下三小字，中间大字）----
+        right = tk.Frame(overlay, bg=BG_COLOR)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        tk.Frame(right, bg=BG_COLOR).pack(expand=True)  # 顶部弹性空间
+        self._overlay_lyric_vars = []
+        self._overlay_lyric_labels = []
+        lyric_wrap = max(80, int(self.root.winfo_width() * 11 / 20) - 48)
+        for i in range(7):
+            is_middle = (i == 3)
+            var = tk.StringVar(value="")
+            lbl = tk.Label(
+                right, textvariable=var, bg=BG_COLOR,
+                fg=ACCENT_COLOR if is_middle else FG_COLOR,
+                font=(self.overlay_lyric_big_font if is_middle
+                      else self.overlay_lyric_small_font),
+                anchor="w",
+                justify="left",
+                wraplength=lyric_wrap)
+            lbl.pack(fill="x", padx=24,
+                     pady=(10, 10) if is_middle else 6)
+            self._overlay_lyric_vars.append(var)
+            self._overlay_lyric_labels.append(lbl)
+        tk.Frame(right, bg=BG_COLOR).pack(expand=True)  # 底部弹性空间
+
+        # 浮层尺寸变化时更新左栏文字换行宽度
+        overlay.bind("<Configure>", self._on_overlay_configure)
+        # 后创建的两栏 Frame 会盖住先创建的返回按钮，必须提升到最上层
+        close_btn.lift()
+
+    def _on_overlay_configure(self, event: tk.Event) -> None:
+        """浮层尺寸变化时更新左右两栏文字的换行宽度。"""
+        left_wrap = max(80, int(event.width * 9 / 20) - 60)
+        lyric_wrap = max(80, int(event.width * 11 / 20) - 48)
+        if hasattr(self, "_overlay_name_label"):
+            self._overlay_name_label.config(wraplength=left_wrap)
+            self._overlay_artist_label.config(wraplength=left_wrap)
+        for lbl in getattr(self, "_overlay_lyric_labels", []):
+            lbl.config(wraplength=lyric_wrap)
+
+    def _close_lyric_overlay(self) -> None:
+        """销毁歌词浮层并清理引用。"""
+        if self._lyric_overlay is None:
+            return
+        self._lyric_overlay.destroy()
+        self._lyric_overlay = None
+        self._overlay_cover_photo = None
+        self._overlay_lyric_vars = []
+        self._overlay_lyric_labels = []
+
+    def _refresh_overlay_header(self) -> None:
+        """刷新浮层左栏：放大封面、歌曲名、歌手名。"""
+        if self._lyric_overlay is None:
+            return
+        path = self.audio_path
+        if not path:
+            return
+        # 封面（按窗口高度与左栏宽度动态放大，避免溢出）
+        left_w = int(self.root.winfo_width() * 9 / 20)
+        size = max(120, min(420, self.root.winfo_height() - 260, left_w - 40))
+        data = extract_cover_art(path)
+        photo = cover_to_tk_image(data, size) if data else None
+        if photo:
+            self._overlay_cover_photo = photo
+            self._overlay_cover_label.config(image=photo, text="")
+        else:
+            self._overlay_cover_photo = None
+            self._overlay_cover_label.config(image="", text="无封面")
+        # 歌曲名（去扩展名）与歌手名
+        name = os.path.splitext(os.path.basename(path))[0]
+        self._overlay_name_var.set(name)
+        artist = self._get_current_artist()
+        self._overlay_artist_var.set(artist if artist else "")
+
+    def _get_current_artist(self) -> str:
+        """获取当前播放曲目的歌手名（优先扫描缓存，否则现场读标签）。"""
+        if not self.audio_path:
+            return ""
+        if (self.current_song_index is not None
+                and self.current_song_index < len(self.audio_items)):
+            item = self.audio_items[self.current_song_index]
+            if item.get("path") == self.audio_path:
+                artist = item.get("artist")
+                if artist:
+                    return artist
+        try:
+            _, _, artist = self._get_metadata(self.audio_path)
+            return artist
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _build_lyric_stem(lines: list[tuple[float, str]]) -> list[int]:
+        """提取主干歌词行（剔除逐字展开的中间态）。
+
+        若某行去除空白后是下一行的前缀，则为逐字展开的中间态，跳过；
+        返回保留行的原始索引列表。
+        """
+        def _norm(text: str) -> str:
+            return text.replace("\u3000", "").replace(" ", "").strip()
+
+        stem: list[int] = []
+        for i, (_, text) in enumerate(lines):
+            cur = _norm(text)
+            if i + 1 < len(lines):
+                nxt = _norm(lines[i + 1][1])
+                if cur and nxt.startswith(cur) and nxt != cur:
+                    continue
+            stem.append(i)
+        return stem
+
+    def _update_lyric_overlay(self) -> None:
+        """刷新浮层右栏七行歌词：中间为当前逐字行，上下为主干歌词。"""
+        if self._lyric_overlay is None or not self._overlay_lyric_vars:
+            return
+        vars_ = self._overlay_lyric_vars
+        for var in vars_:
+            var.set("")
+        if not self.lrc_lines:
+            vars_[3].set("未加载歌词" if self.lrc_path is None
+                         else "未找到时间轴歌词")
+            return
+
+        # 当前行（-1 时按首行处理，与主窗口一致）
+        cur = self.current_lrc_index if self.current_lrc_index >= 0 else 0
+        stem_indices = self._build_lyric_stem(self.lrc_lines)
+
+        # 定位中间行所属的主干分组
+        g = bisect_right(stem_indices, cur) - 1
+        if cur not in stem_indices:
+            g += 1  # 逐字中间态属于下一个主干分组
+
+        # 上三行 / 下三行：主干完整歌词（去尾部占位空白）
+        for offset in (-3, -2, -1, 1, 2, 3):
+            idx = g + offset
+            if 0 <= idx < len(stem_indices):
+                text = self.lrc_lines[stem_indices[idx]][1].rstrip(" \u3000")
+                vars_[offset + 3].set(text)
+
+        # 中间行与现有解析一致（逐字原样）
+        vars_[3].set(self.lrc_lines[cur][1])
 
     # ==================================================================
     # 主循环
