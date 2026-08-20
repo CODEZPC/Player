@@ -114,6 +114,7 @@ class LrcPlayerApp:
         self.title_font = self._pick_font("汉仪文黑-85W", 18)
         self.lyric_font = self._pick_font("汉仪文黑-85W", 13)
         self.info_font = self._pick_font("Jetbrains Mono", 11)
+        self.list_font = self._pick_font("汉仪文黑-85W", 11)
         self.button_font = self._pick_font("汉仪文黑-85W", 12)
         self.button_font_sm = self._pick_font("汉仪文黑-85W", 10)
         self.overlay_name_font = self._pick_font("汉仪文黑-85W", 20)
@@ -372,7 +373,7 @@ class LrcPlayerApp:
         )
         now_label.pack(fill="x")
 
-        self.info_var = tk.StringVar(value="音频: - | 歌词: -")
+        self.info_var = tk.StringVar(value="音频: --- | 歌词: ---/---")
         info_label = tk.Label(
             header,
             textvariable=self.info_var,
@@ -491,7 +492,7 @@ class LrcPlayerApp:
 
         list_label = tk.Label(
             list_panel, text="歌曲列表", bg=BG_COLOR, fg=FG_COLOR,
-            font=self.info_font, anchor="w")
+            font=self.list_font, anchor="w")
         list_label.pack(anchor="w")
 
         list_inner = tk.Frame(list_panel, bg=BG_COLOR)
@@ -499,7 +500,7 @@ class LrcPlayerApp:
 
         self.song_list = tk.Listbox(
             list_inner,
-            bg=BG_COLOR, fg=FG_COLOR, font=self.info_font,
+            bg=BG_COLOR, fg=FG_COLOR, font=self.list_font,
             selectbackground=ACCENT_COLOR, selectforeground=BG_COLOR,
             highlightthickness=0, relief="flat", activestyle="none",
             exportselection=False,
@@ -602,12 +603,12 @@ class LrcPlayerApp:
 
         il_label = tk.Label(
             il_frame, text="插播列表", bg=BG_COLOR, fg=FG_COLOR,
-            font=self.info_font, anchor="w")
+            font=self.list_font, anchor="w")
         il_label.pack(anchor="w")
 
         self.interlude_list = tk.Listbox(
             il_frame,
-            bg=BG_COLOR, fg=FG_COLOR, font=self.info_font,
+            bg=BG_COLOR, fg=FG_COLOR, font=self.list_font,
             selectbackground=ACCENT_COLOR, selectforeground=BG_COLOR,
             highlightthickness=0, relief="flat", activestyle="none",
             exportselection=False,
@@ -625,7 +626,7 @@ class LrcPlayerApp:
         cover_frame.pack_propagate(False)
         self.cover_label = tk.Label(
             cover_frame, bg=BG_COLOR, fg=FG_COLOR,
-            text="专辑封面", font=self.info_font,
+            text="专辑封面", font=self.list_font,
         )
         self.cover_label.pack(fill="both", expand=True)
         # 点击封面打开全窗口歌词浮层
@@ -1258,10 +1259,11 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _update_info(self) -> None:
-        """更新「音频: xxx | 歌词: xxx」信息行。"""
+        """更新「音频: xxx | 歌词: xxx/xxx」信息行。"""
         audio_name = os.path.basename(self.audio_path) if self.audio_path else "未选择"
-        lrc_name = os.path.basename(self.lrc_path) if self.lrc_path else "未匹配"
-        self.info_var.set(f"音频: {audio_name} | 歌词: {lrc_name}")
+        current_lyric_count = (self.current_lrc_index + 1) if self.lrc_lines else "---"
+        total_lyric_count = len(self.lrc_lines) if self.lrc_lines else "---"
+        self.info_var.set(f"音频: {audio_name} | 歌词: {current_lyric_count} / {total_lyric_count}")
 
     # ==================================================================
     # 进度条
@@ -1492,6 +1494,7 @@ class LrcPlayerApp:
         if index != self.current_lrc_index:
             self.current_lrc_index = index
             self._highlight_line(index)
+            self._update_info()
 
     def _highlight_line(self, index: int) -> None:
         """高亮指定索引的歌词行，并同步歌词浮层。"""
@@ -1550,7 +1553,7 @@ class LrcPlayerApp:
 
         self._overlay_cover_label = tk.Label(
             left, bg=BG_COLOR, fg=FG_COLOR, text="专辑封面",
-            font=self.info_font)
+            font=self.list_font)
         self._overlay_cover_label.pack(anchor="s", pady=(0, 16))
 
         self._overlay_name_var = tk.StringVar(value="")
