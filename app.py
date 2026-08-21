@@ -13,6 +13,7 @@ from audio_engine import AudioEngine
 from cover_utils import extract_cover_art, cover_to_tk_image
 from utils import (
     format_time,
+    format_hms,
     read_text_file,
     get_duration_mutagen,
     make_progress_bar,
@@ -56,7 +57,7 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.3.2")
+        self.root.title("Player PRO V1.3.4")
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(820, 250)
         self.root.resizable(True, True)
@@ -601,10 +602,10 @@ class LrcPlayerApp:
         il_frame = tk.Frame(parent, bg=BG_COLOR)
         il_frame.pack(side="bottom", fill="both", expand=True, pady=(0, 6))
 
-        il_label = tk.Label(
+        self._il_label = tk.Label(
             il_frame, text="插播列表", bg=BG_COLOR, fg=FG_COLOR,
             font=self.list_font, anchor="w")
-        il_label.pack(anchor="w")
+        self._il_label.pack(anchor="w")
 
         self.interlude_list = tk.Listbox(
             il_frame,
@@ -694,12 +695,37 @@ class LrcPlayerApp:
     # ---- 插播基本操作 ----
 
     def _refresh_interlude_list(self) -> None:
-        """刷新插播列表显示。"""
+        """刷新插播列表显示，并保持原滚动位置不变。"""
+        try:
+            yv_top, yv_bottom = self.interlude_list.yview()
+        except tk.TclError:
+            yv_top, yv_bottom = None, None
+
         self.interlude_list.delete(0, "end")
         for item in self.interlude_items:
             name = os.path.basename(item.get("path") or "")
             self.interlude_list.insert("end", name)
+
+        # 恢复滚动位置（仅当之前有内容且当前列表非空）
+        if yv_top is not None and self.interlude_items:
+            self.interlude_list.yview_moveto(yv_top)
+
+        self._update_interlude_label()
         self._refresh_status_bar()
+
+    def _update_interlude_label(self) -> None:
+        """更新插播列表标题：有歌曲时追加播完所需总时长。"""
+        label = getattr(self, "_il_label", None)
+        if label is None:
+            return
+        if not self.interlude_items:
+            label.config(text="插播列表")
+            return
+        total = sum(
+            d for d in (item.get("duration") for item in self.interlude_items)
+            if isinstance(d, (int, float))
+        )
+        label.config(text=f"插播列表 ({format_hms(total)})")
 
     def _on_interlude_select(self) -> None:
         """插播列表选择变化：移动模式下锁定选中项，否则刷新按钮。"""
@@ -737,6 +763,7 @@ class LrcPlayerApp:
         item = dict(self.audio_items[self.viewed_song_index])
         self.interlude_items.insert(pos, item)
         self._refresh_interlude_list()
+        self._refresh_il_buttons()
 
     def _interlude_remove(self) -> None:
         """移除插播列表中选中的条目（无确认弹窗）。"""
@@ -795,6 +822,7 @@ class LrcPlayerApp:
         self._move_locked_index = idx - 1
         self._refresh_interlude_list()
         self.interlude_list.selection_set(self._move_locked_index)
+        self._ensure_interlude_visible(self._move_locked_index)
 
     def _il_move_down(self) -> None:
         """移动模式下将锁定项下移。"""
@@ -807,6 +835,69 @@ class LrcPlayerApp:
         self._move_locked_index = idx + 1
         self._refresh_interlude_list()
         self.interlude_list.selection_set(self._move_locked_index)
+        self._ensure_interlude_visible(self._move_locked_index)
+
+    def _ensure_interlude_visible(self, index: int) -> None:
+        """仅当目标项不可见或部分可见时，以最小幅度滚动使其完全可见；已可见则不动。"""
+        if not self.interlude_items or index < 0 or index >= len(self.interlude_items):
+            return
+
+        lb = self.interlude_list
+        try:
+            list_height = lb.winfo_height()
+            if list_height <= 0:
+                return
+            yv_top, yv_bottom = lb.yview()
+        except tk.TclError:
+            return
+
+        visible_ratio = max(yv_bottom - yv_top, 0.0001)
+        total_height = list_height / visible_ratio
+
+        # 内容没有超出视口，无需滚动
+        if total_height <= list_height:
+            return
+
+        # 尝试直接获取目标项的像素位置（相对 Listbox 窗口）
+        try:
+            bbox = lb.bbox(index)
+        except tk.TclError:
+            bbox = None
+
+        if bbox:
+            _x, item_top, _w, item_h = bbox
+            item_bottom = item_top + item_h
+        else:
+            # bbox 不可用：目标项完全不可见，按均匀行高估算
+            row_height = total_height / len(self.interlude_items)
+            item_top = index * row_height - yv_top * total_height
+            item_bottom = item_top + row_height
+
+        # 已经完整可见，不滚动
+        if item_top >= 0 and item_bottom <= list_height:
+            return
+
+        # 计算需要滚动的比例（正数向下，负数向上）
+        if item_top < 0:
+            # 目标项顶部被遮住：向上滚动使其顶部贴住视口顶部
+            delta_fraction = item_top / total_height
+        else:
+            # 目标项底部超出：向下滚动使其底部贴住视口底部
+            delta_fraction = (item_bottom - list_height) / total_height
+
+        new_top_fraction = yv_top + delta_fraction
+
+        # 钳制在合法范围
+        new_top_fraction = max(0.0, min(1.0 - visible_ratio, new_top_fraction))
+
+        # 忽略极小的浮点变化
+        if abs(new_top_fraction - yv_top) < 0.0001:
+            return
+
+        try:
+            lb.yview_moveto(new_top_fraction)
+        except tk.TclError:
+            pass
 
     # ==================================================================
     # 音频控件状态

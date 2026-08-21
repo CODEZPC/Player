@@ -20,6 +20,15 @@ def format_time(seconds: float | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def format_hms(seconds: float) -> str:
+    """将秒数格式化为 hh:mm:ss 字符串。"""
+    total = int(max(0.0, seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 # ===========================================================================
 # 文本文件读取
 # ===========================================================================
