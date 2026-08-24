@@ -57,9 +57,9 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.3.4")
+        self.root.title("Player PRO V1.4.0")
         self.root.configure(bg=BG_COLOR)
-        self.root.minsize(820, 250)
+        self.root.minsize(1270, 600)
         self.root.resizable(True, True)
 
         # ---- 音频引擎 ----
@@ -110,6 +110,8 @@ class LrcPlayerApp:
         self.always_on_top = False
         self.play_mode_index = 0
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
+        self._speed_dragging = False
+        self._vol_dragging = False
 
         # ---- 字体 ----
         self.title_font = self._pick_font("汉仪文黑-85W", 18)
@@ -129,7 +131,11 @@ class LrcPlayerApp:
 
         if not self.engine.ready:
             self._disable_audio_controls()
-            messagebox.showwarning("音频后端", "未安装 pygame，音频播放不可用。")
+            messagebox.showwarning("音频后端", "音频后端不可用（需 sounddevice 或 pygame）。")
+
+        # 非 sounddevice 后端不支持倍速/保音高，禁用对应控件
+        if self.engine.backend != "sounddevice":
+            self._disable_op_controls()
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
         self._setup_keyboard_shortcuts()
@@ -210,6 +216,12 @@ class LrcPlayerApp:
         right_col.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
         right_col.grid_propagate(False)
         self._build_right_column(right_col)
+
+        # ---- 操作区（固定宽度：倍速 / 音量）----
+        op_col = tk.Frame(outer, bg=BG_COLOR, width=250)
+        op_col.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
+        op_col.pack_propagate(False)  # 子控件为 pack，须用 pack_propagate 保持定宽
+        self._build_operation_area(op_col)
 
         # ---- 状态栏 ----
         self._build_status_bar()
@@ -634,6 +646,153 @@ class LrcPlayerApp:
         self.cover_label.bind("<Button-1>", self._open_lyric_overlay)
 
     # ==================================================================
+    # 操作区：倍速 / 音量（文字+滑块，带取消机制）
+    # ==================================================================
+
+    def _build_operation_area(self, parent: tk.Frame) -> None:
+        """右侧操作区：倍速区（含保音高开关） + 音量区。
+
+        每区两行：第一行为标题行（兼作拖拽取消区域），第二行为"滑块 + 数值"（数值在右侧）。
+        """
+        # ---- 倍速区 ----
+        speed_frame = tk.Frame(parent, bg=BG_COLOR)
+        speed_frame.pack(side="top", fill="x", pady=(4, 18))
+
+        # 第一行：标题 + 按钮（拖动时的取消区域）
+        self._speed_cancel_row = tk.Frame(speed_frame, bg=BG_COLOR)
+        self._speed_cancel_row.pack(fill="x")
+        tk.Label(self._speed_cancel_row, text="倍速", bg=BG_COLOR,
+                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
+        self._pitch_btn = tk.Button(
+            self._speed_cancel_row, text="保音高: 关",
+            command=self._toggle_pitch_fix,
+            bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.button_font_sm,
+            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
+            relief="flat", padx=6, pady=2)
+        self._pitch_btn.pack(side="right")
+
+        # 第二行：滑块 + 数值（数值在右侧）
+        slider_row = tk.Frame(speed_frame, bg=BG_COLOR)
+        slider_row.pack(fill="x", pady=(2, 0))
+        self._speed_var = tk.DoubleVar(value=1.0)
+        self._speed_scale = ttk.Scale(
+            slider_row, style="LRC.Horizontal.TScale", orient="horizontal",
+            from_=0.1, to=3.0, variable=self._speed_var,
+            command=self._on_speed_changed)
+        self._speed_scale.pack(side="left", fill="x", expand=True)
+        self._speed_scale.bind("<ButtonPress-1>", self._on_speed_press)
+        self._speed_scale.bind("<ButtonRelease-1>", self._on_speed_release)
+        self._speed_preview = tk.Label(
+            slider_row, text="1.00x", width=6, bg=BG_COLOR, fg=FG_COLOR,
+            font=self.info_font, anchor="e")
+        self._speed_preview.pack(side="right", padx=(10, 0))
+
+        # 取消条：仅覆盖第一行（标题行）
+        self._speed_cancel = tk.Frame(speed_frame, bg="#6B1010", height=36)
+        tk.Label(self._speed_cancel, text="拖动到此处以取消",
+                 bg="#6B1010", fg="#FF5555",
+                 font=self.button_font_sm).pack(expand=True)
+
+        # ---- 音量区 ----
+        vol_frame = tk.Frame(parent, bg=BG_COLOR)
+        vol_frame.pack(side="top", fill="x")
+
+        # 第一行：标题（拖动时的取消区域）
+        self._vol_cancel_row = tk.Frame(vol_frame, bg=BG_COLOR)
+        self._vol_cancel_row.pack(fill="x")
+        tk.Label(self._vol_cancel_row, text="音量", bg=BG_COLOR,
+                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
+
+        # 第二行：滑块 + 数值（数值在右侧）
+        vol_slider_row = tk.Frame(vol_frame, bg=BG_COLOR)
+        vol_slider_row.pack(fill="x", pady=(2, 0))
+        self._vol_var = tk.DoubleVar(value=100.0)
+        self._vol_scale = ttk.Scale(
+            vol_slider_row, style="LRC.Horizontal.TScale", orient="horizontal",
+            from_=0, to=100, variable=self._vol_var,
+            command=self._on_vol_changed)
+        self._vol_scale.pack(side="left", fill="x", expand=True)
+        self._vol_scale.bind("<ButtonPress-1>", self._on_vol_press)
+        self._vol_scale.bind("<ButtonRelease-1>", self._on_vol_release)
+        self._vol_preview = tk.Label(
+            vol_slider_row, text="100%", width=6, bg=BG_COLOR, fg=FG_COLOR,
+            font=self.info_font, anchor="e")
+        self._vol_preview.pack(side="right", padx=(10, 0))
+
+        # 取消条：仅覆盖第一行（标题行）
+        self._vol_cancel = tk.Frame(vol_frame, bg="#6B1010", height=36)
+        tk.Label(self._vol_cancel, text="拖动到此处以取消",
+                 bg="#6B1010", fg="#FF5555",
+                 font=self.button_font_sm).pack(expand=True)
+
+    def _on_speed_press(self, _event: tk.Event) -> None:
+        """倍速拖动开始：取消条仅覆盖标题行。"""
+        if not self.engine.ready or not self.audio_path:
+            return
+        self._speed_dragging = True
+        self._speed_cancel.place(in_=self._speed_cancel_row,
+                                 relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _on_speed_changed(self, value: str) -> None:
+        """倍速拖动中：仅更新预览（吸附到 0.05 步进），不生效。"""
+        if not self._speed_dragging:
+            return
+        v = round(float(value) / 0.05) * 0.05
+        self._speed_var.set(v)
+        self._speed_preview.config(text=f"{v:.2f}x")
+
+    def _on_speed_release(self, _event: tk.Event) -> None:
+        """倍速拖动结束：取消则回退，否则应用。"""
+        if not self._speed_dragging:
+            return
+        self._speed_dragging = False
+        self._speed_cancel.place_forget()
+        if self._is_pointer_in_cancel(self._speed_cancel):
+            self._speed_var.set(self.engine.get_speed())
+            self._speed_preview.config(text=f"{self.engine.get_speed():.2f}x")
+        else:
+            v = round(float(self._speed_var.get()) / 0.05) * 0.05
+            self._speed_var.set(v)
+            self.engine.set_speed(v)
+
+    def _on_vol_press(self, _event: tk.Event) -> None:
+        """音量拖动开始：取消条仅覆盖标题行。"""
+        if not self.engine.ready:
+            return
+        self._vol_dragging = True
+        self._vol_cancel.place(in_=self._vol_cancel_row,
+                               relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _on_vol_changed(self, value: str) -> None:
+        """音量拖动中：仅更新预览（吸附到整数），不生效。"""
+        if not self._vol_dragging:
+            return
+        v = int(round(float(value)))
+        self._vol_var.set(v)
+        self._vol_preview.config(text=f"{v}%")
+
+    def _on_vol_release(self, _event: tk.Event) -> None:
+        """音量拖动结束：取消则回退，否则应用。"""
+        if not self._vol_dragging:
+            return
+        self._vol_dragging = False
+        self._vol_cancel.place_forget()
+        if self._is_pointer_in_cancel(self._vol_cancel):
+            self._vol_var.set(self.engine.get_volume() * 100)
+            self._vol_preview.config(
+                text=f"{int(self.engine.get_volume() * 100)}%")
+        else:
+            v = int(round(float(self._vol_var.get())))
+            self._vol_var.set(v)
+            self.engine.set_volume(v / 100.0)
+
+    def _toggle_pitch_fix(self) -> None:
+        """切换保音高模式（变速不变调）。"""
+        on = not self.engine.get_pitch_fix()
+        self.engine.set_pitch_fix(on)
+        self._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
+
+    # ==================================================================
     # 专辑封面
     # ==================================================================
 
@@ -908,6 +1067,14 @@ class LrcPlayerApp:
         for btn in (self.play_pause_btn, self.stop_btn):
             btn.config(state="disabled")
 
+    def _disable_op_controls(self) -> None:
+        """非 sounddevice 后端时禁用倍速/保音高控件（音量保留）。"""
+        for w in (self._speed_scale, self._pitch_btn):
+            try:
+                w.config(state="disabled")
+            except Exception:
+                pass
+
     # ==================================================================
     # 状态栏更新
     # ==================================================================
@@ -916,6 +1083,13 @@ class LrcPlayerApp:
         """读取音频输出设备/参数信息。"""
         if not self.engine.ready:
             return "音频: 未就绪"
+        if self.engine.backend == "sounddevice":
+            sr = self.engine.samplerate
+            ch = self.engine.channels
+            if sr > 0:
+                ch_name = {1: "Mono", 2: "Stereo"}.get(ch, f"{ch}ch")
+                return f"音频: {sr}Hz {ch_name}"
+            return "音频: 就绪"
         try:
             import pygame
             info = pygame.mixer.get_init()
@@ -976,8 +1150,8 @@ class LrcPlayerApp:
         self.bottom_frame.pack(fill="both", expand=True, pady=(6, 0))
         if not self._first_scan_done:
             self._first_scan_done = True
-            self.root.geometry("1010x650")
-            self.root.minsize(1010, 650)
+            self.root.geometry("1270x600")
+            self.root.minsize(1270, 600)
 
         # 启动后台缓存并更新进度状态
         self._scan_total = len(self.audio_items)
@@ -1386,11 +1560,15 @@ class LrcPlayerApp:
         if not self._is_pointer_in_cancel():
             self._seek_to(target)
 
-    def _is_pointer_in_cancel(self) -> bool:
+    def _is_pointer_in_cancel(self,
+                              cancel_widget: tk.Widget | None = None) -> bool:
         """判断当前鼠标指针是否在取消条范围内。"""
+        widget = cancel_widget or self._cancel_frame
         try:
-            y = self.root.winfo_pointery() - self._cancel_frame.winfo_rooty()
-            return 0 <= y <= self._cancel_frame.winfo_height()
+            x = self.root.winfo_pointerx() - widget.winfo_rootx()
+            y = self.root.winfo_pointery() - widget.winfo_rooty()
+            return (0 <= x <= widget.winfo_width()
+                    and 0 <= y <= widget.winfo_height())
         except Exception:
             return False
 
@@ -1564,11 +1742,16 @@ class LrcPlayerApp:
         self.play_pause_btn.config(text="播放")
 
     def _current_time(self) -> float:
-        """根据播放起始时间计算当前播放位置（秒）。"""
+        """根据播放状态计算当前播放位置（秒）。"""
         if not self.is_playing:
             return 0.0
         if self.is_paused:
             return self.base_time
+        # sounddevice 后端：位置由引擎按倍速真实推进
+        if self.engine.backend == "sounddevice":
+            pos = self.engine.get_position()
+            if pos is not None:
+                return max(0.0, pos)
         if self.play_started_at is None:
             return 0.0
         return max(0.0, time.monotonic() - self.play_started_at)
