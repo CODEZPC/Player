@@ -813,7 +813,7 @@ class LrcPlayerApp:
         if key == "lrc":
             self.lrc_offset = 0
             self._lrc_offset_var.set(0)
-            self._lrc_offset_val.config(text="0ms")
+            self._lrc_offset_val.config(text="0ms", fg=FG_COLOR)
             self._sync_lyrics(self._current_time())
         elif key == "balance":
             self._balance_var.set(0.0)
@@ -822,7 +822,7 @@ class LrcPlayerApp:
         elif key == "gain":
             self._gain_var.set(1.0)
             self.engine.set_gain(1.0)
-            self._gain_val.config(text="1.00x")
+            self._gain_val.config(text="1.00x", fg=FG_COLOR)
             self._update_vol_preview()
 
     def _on_lrc_offset_changed(self, value: str) -> None:
