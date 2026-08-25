@@ -57,9 +57,9 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.4.0")
+        self.root.title("Player PRO V1.5.1")
         self.root.configure(bg=BG_COLOR)
-        self.root.minsize(1270, 600)
+        self.root.minsize(1380, 600)
         self.root.resizable(True, True)
 
         # ---- 音频引擎 ----
@@ -99,6 +99,7 @@ class LrcPlayerApp:
         self.is_paused = False
         self.play_started_at: float | None = None
         self.base_time = 0.0
+        self.lrc_offset = 0.0  # 歌词偏移（秒），正值=歌词延后，负值=歌词提前
 
         # ---- 歌词 ----
         self.lrc_lines: list[tuple[float, str]] = []
@@ -111,7 +112,8 @@ class LrcPlayerApp:
         self.play_mode_index = 0
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
         self._speed_dragging = False
-        self._vol_dragging = False
+        self._adv_dragging = False
+        self._adv_active: str | None = None
 
         # ---- 字体 ----
         self.title_font = self._pick_font("汉仪文黑-85W", 18)
@@ -133,9 +135,12 @@ class LrcPlayerApp:
             self._disable_audio_controls()
             messagebox.showwarning("音频后端", "音频后端不可用（需 sounddevice 或 pygame）。")
 
-        # 非 sounddevice 后端不支持倍速/保音高，禁用对应控件
+        # 非 sounddevice 后端不支持倍速/保音高/平衡/增益，禁用对应控件
         if self.engine.backend != "sounddevice":
             self._disable_op_controls()
+
+        # 未加载歌曲前统一禁用播放相关控件
+        self._update_controls_state()
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
         self._setup_keyboard_shortcuts()
@@ -211,14 +216,14 @@ class LrcPlayerApp:
         self.bottom_frame = tk.Frame(left_col, bg=BG_COLOR)
         self._build_bottom_panels(self.bottom_frame)
 
-        # ---- 右栏（固定宽度）----
+        # ---- 右栏（固定宽度；子控件为 pack，须用 pack_propagate 保持定宽）----
         right_col = tk.Frame(outer, bg=BG_COLOR, width=260)
         right_col.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
-        right_col.grid_propagate(False)
+        right_col.pack_propagate(False)
         self._build_right_column(right_col)
 
-        # ---- 操作区（固定宽度：倍速 / 音量）----
-        op_col = tk.Frame(outer, bg=BG_COLOR, width=250)
+        # ---- 操作区（固定宽度：倍速 / 音量 / 高级功能）----
+        op_col = tk.Frame(outer, bg=BG_COLOR, width=340)
         op_col.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
         op_col.pack_propagate(False)  # 子控件为 pack，须用 pack_propagate 保持定宽
         self._build_operation_area(op_col)
@@ -247,8 +252,8 @@ class LrcPlayerApp:
 
         status_sep(bar)
 
-        # 音频设备（w=170）
-        audio_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=170, height=24)
+        # 音频设备（w=260，显示输出设备名）
+        audio_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=260, height=24)
         audio_frame.pack(side="left")
         audio_frame.pack_propagate(False)
         self._audio_var = tk.StringVar(value=self._read_audio_info())
@@ -282,88 +287,17 @@ class LrcPlayerApp:
         self._refresh_status_bar()
 
     # ==================================================================
-    # 键盘快捷键（Alt + 字母 / Space / F11）
+    # 键盘快捷键（Space / F11）
     # ==================================================================
 
     def _setup_keyboard_shortcuts(self) -> None:
-        """Alt+字母永久绑定 + Space/F11 + 字母提示标签。"""
-        self._key_tips: list = []
-        self._tips_visible = False
-        tip_font = tkfont.Font(family="Segoe UI", size=9, weight="bold")
-
-        shortcuts = [
-            (self.open_file_btn,    "O", self._open_file),
-            (self.open_folder_btn,  "F", self._scan_folder),
-            (self.prev_btn,         "A", self._prev_track),
-            (self.next_btn,         "D", self._next_track),
-            (self.mode_btn,         "M", self._toggle_play_mode),
-            (self.back_10s_btn,     "Q", self._seek_back_10s),
-            (self.forward_10s_btn,  "E", self._seek_forward_10s),
-            (self.stop_btn,         "S", self._stop),
-            (self.topmost_btn,      "T", self._toggle_topmost),
-        ]
-
-        for btn, key, cmd in shortcuts:
-            # 提示标签
-            tip = tk.Label(self.root, text=key, bg="#333333", fg="#FFFFFF",
-                           font=tip_font, padx=3, pady=1)
-            self._key_tips.append((btn, key, cmd, tip))
-            # 永久绑定 Alt+Key → 始终可用
-            k = key.lower()
-            self.root.bind(f"<Alt-Key-{k}>",
-                           lambda e, c=cmd: self._on_alt_shortcut(c))
-
-        # 也尝试绑定 Alt 单按 → 显示提示（可能部分平台不触发，不影响快捷键）
-        self.root.bind("<Alt_L>", lambda e: self._show_key_tips())
-        self.root.bind("<Alt_R>", lambda e: self._show_key_tips())
-
-        # Space → 播放/暂停（始终可用）
+        """全局键盘快捷键（已移除 Alt 快捷键）：Space 播放/暂停、F11 全屏。"""
+        # Space → 播放/暂停
         self.root.bind("<space>",
                        lambda e: (self._toggle_play_pause(), "break")[1])
         # F11 → 全屏
         self.root.bind("<F11>",
                        lambda e: (self._toggle_fullscreen(), "break")[1])
-        # Escape → 隐藏提示
-        self.root.bind("<Escape>", lambda e: self._hide_key_tips())
-
-    def _on_alt_shortcut(self, cmd) -> str:
-        """Alt+Key 触发：先显示提示（若未显示），执行命令，重置自动隐藏计时。"""
-        if not self._tips_visible:
-            self._show_key_tips()
-        cmd()
-        self._reset_tip_timer()
-        return "break"
-
-    def _show_key_tips(self) -> None:
-        """在按钮下方显示快捷键字母提示。"""
-        if self._tips_visible:
-            return
-        self._tips_visible = True
-        for btn, key, cmd, tip in self._key_tips:
-            x = btn.winfo_rootx() - self.root.winfo_rootx() + btn.winfo_width() // 2 - 8
-            y = btn.winfo_rooty() - self.root.winfo_rooty() + btn.winfo_height()
-            tip.place(x=x, y=y)
-            tip.lift()
-        self._reset_tip_timer()
-
-    def _hide_key_tips(self) -> None:
-        """隐藏快捷键提示。"""
-        if not self._tips_visible:
-            return
-        self._tips_visible = False
-        for _, key, cmd, tip in self._key_tips:
-            tip.place_forget()
-        self._cancel_tip_timer()
-
-    def _reset_tip_timer(self) -> None:
-        """重置 3 秒自动隐藏计时。"""
-        self._cancel_tip_timer()
-        self._tip_timer = self.root.after(3000, self._hide_key_tips)
-
-    def _cancel_tip_timer(self) -> None:
-        if hasattr(self, '_tip_timer') and self._tip_timer is not None:
-            self.root.after_cancel(self._tip_timer)
-            self._tip_timer = None
 
     def _toggle_fullscreen(self) -> None:
         """切换全屏状态。"""
@@ -650,15 +584,17 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _build_operation_area(self, parent: tk.Frame) -> None:
-        """右侧操作区：倍速区（含保音高开关） + 音量区。
+        """右侧操作区：倍速区（含保音高开关） + 音量区 + 高级功能区。
 
-        每区两行：第一行为标题行（兼作拖拽取消区域），第二行为"滑块 + 数值"（数值在右侧）。
+        - 倍速：第一行标题行兼作拖拽区，拖动时覆盖「左取消(红)/右重置(蓝)」条；
+        - 音量：无取消，拖动实时生效；
+        - 高级功能：第一行标题行，拖动任一高级滑块时覆盖蓝色「重置」条，仅重置该项。
         """
         # ---- 倍速区 ----
         speed_frame = tk.Frame(parent, bg=BG_COLOR)
         speed_frame.pack(side="top", fill="x", pady=(4, 18))
 
-        # 第一行：标题 + 按钮（拖动时的取消区域）
+        # 第一行：标题 + 按钮（拖动时的拖拽区）
         self._speed_cancel_row = tk.Frame(speed_frame, bg=BG_COLOR)
         self._speed_cancel_row.pack(fill="x")
         tk.Label(self._speed_cancel_row, text="倍速", bg=BG_COLOR,
@@ -687,20 +623,27 @@ class LrcPlayerApp:
             font=self.info_font, anchor="e")
         self._speed_preview.pack(side="right", padx=(10, 0))
 
-        # 取消条：仅覆盖第一行（标题行）
-        self._speed_cancel = tk.Frame(speed_frame, bg="#6B1010", height=36)
-        tk.Label(self._speed_cancel, text="拖动到此处以取消",
+        # 拖拽条（拖动时覆盖标题行）：左半取消（红）/ 右半重置（蓝）
+        self._speed_drag_bar = tk.Frame(speed_frame, height=36)
+        self._speed_cancel_part = tk.Frame(self._speed_drag_bar, bg="#6B1010")
+        self._speed_cancel_part.pack(side="left", fill="both", expand=True)
+        tk.Label(self._speed_cancel_part, text="取消",
                  bg="#6B1010", fg="#FF5555",
                  font=self.button_font_sm).pack(expand=True)
+        self._speed_reset_part = tk.Frame(self._speed_drag_bar, bg="#1F3A8A")
+        self._speed_reset_part.pack(side="right", fill="both", expand=True)
+        tk.Label(self._speed_reset_part, text="重置",
+                 bg="#1F3A8A", fg="#6FA3FF",
+                 font=self.button_font_sm).pack(expand=True)
 
-        # ---- 音量区 ----
+        # ---- 音量区（无取消，拖动实时生效）----
         vol_frame = tk.Frame(parent, bg=BG_COLOR)
         vol_frame.pack(side="top", fill="x")
 
-        # 第一行：标题（拖动时的取消区域）
-        self._vol_cancel_row = tk.Frame(vol_frame, bg=BG_COLOR)
-        self._vol_cancel_row.pack(fill="x")
-        tk.Label(self._vol_cancel_row, text="音量", bg=BG_COLOR,
+        # 第一行：标题
+        vol_title_row = tk.Frame(vol_frame, bg=BG_COLOR)
+        vol_title_row.pack(fill="x")
+        tk.Label(vol_title_row, text="音量", bg=BG_COLOR,
                  fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
 
         # 第二行：滑块 + 数值（数值在右侧）
@@ -712,26 +655,49 @@ class LrcPlayerApp:
             from_=0, to=100, variable=self._vol_var,
             command=self._on_vol_changed)
         self._vol_scale.pack(side="left", fill="x", expand=True)
-        self._vol_scale.bind("<ButtonPress-1>", self._on_vol_press)
-        self._vol_scale.bind("<ButtonRelease-1>", self._on_vol_release)
         self._vol_preview = tk.Label(
             vol_slider_row, text="100%", width=6, bg=BG_COLOR, fg=FG_COLOR,
             font=self.info_font, anchor="e")
         self._vol_preview.pack(side="right", padx=(10, 0))
 
-        # 取消条：仅覆盖第一行（标题行）
-        self._vol_cancel = tk.Frame(vol_frame, bg="#6B1010", height=36)
-        tk.Label(self._vol_cancel, text="拖动到此处以取消",
-                 bg="#6B1010", fg="#FF5555",
+        # ---- 高级功能区：歌词偏移 / 声道平衡 / 响度增益 ----
+        adv_frame = tk.Frame(parent, bg=BG_COLOR)
+        adv_frame.pack(side="top", fill="x", pady=(18, 4))
+
+        # 第一行：标题（拖动任一高级滑块时的拖拽区）
+        self._adv_cancel_row = tk.Frame(adv_frame, bg=BG_COLOR)
+        self._adv_cancel_row.pack(fill="x")
+        tk.Label(self._adv_cancel_row, text="高级功能", bg=BG_COLOR,
+                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
+
+        # 蓝色重置条（拖动任一高级滑块时覆盖标题行）
+        self._adv_reset = tk.Frame(adv_frame, bg="#1F3A8A", height=36)
+        tk.Label(self._adv_reset, text="重置", bg="#1F3A8A", fg="#6FA3FF",
                  font=self.button_font_sm).pack(expand=True)
 
+        self._build_adv_slider(
+            adv_frame, "歌词偏移", -10.0, 10.0, 0.0,
+            lambda v: f"{v:+.1f}s", "_lrc_offset_var",
+            "_lrc_offset_scale", "_lrc_offset_val",
+            self._on_lrc_offset_changed, "lrc")
+        self._build_adv_slider(
+            adv_frame, "声道平衡", -1.0, 1.0, 0.0,
+            lambda v: f"{v:+.2f}", "_balance_var",
+            "_balance_scale", "_balance_val",
+            self._on_balance_changed, "balance")
+        self._build_adv_slider(
+            adv_frame, "响度增益", 0.0, 2.0, 1.0,
+            lambda v: f"{v:.2f}x", "_gain_var",
+            "_gain_scale", "_gain_val",
+            self._on_gain_changed, "gain")
+
     def _on_speed_press(self, _event: tk.Event) -> None:
-        """倍速拖动开始：取消条仅覆盖标题行。"""
+        """倍速拖动开始：拖拽条（左取消/右重置）覆盖标题行。"""
         if not self.engine.ready or not self.audio_path:
             return
         self._speed_dragging = True
-        self._speed_cancel.place(in_=self._speed_cancel_row,
-                                 relx=0, rely=0, relwidth=1, relheight=1)
+        self._speed_drag_bar.place(in_=self._speed_cancel_row,
+                                   relx=0, rely=0, relwidth=1, relheight=1)
 
     def _on_speed_changed(self, value: str) -> None:
         """倍速拖动中：仅更新预览（吸附到 0.05 步进），不生效。"""
@@ -742,55 +708,152 @@ class LrcPlayerApp:
         self._speed_preview.config(text=f"{v:.2f}x")
 
     def _on_speed_release(self, _event: tk.Event) -> None:
-        """倍速拖动结束：取消则回退，否则应用。"""
+        """倍速拖动结束：左半取消回退 / 右半重置为 1.0x / 其余应用。"""
         if not self._speed_dragging:
             return
         self._speed_dragging = False
-        self._speed_cancel.place_forget()
-        if self._is_pointer_in_cancel(self._speed_cancel):
+        self._speed_drag_bar.place_forget()
+        side = self._pointer_side_in(self._speed_drag_bar)
+        if side == "left":
+            # 取消：回退到当前生效倍速
             self._speed_var.set(self.engine.get_speed())
             self._speed_preview.config(text=f"{self.engine.get_speed():.2f}x")
+        elif side == "right":
+            # 重置：回到默认 1.0x
+            v = 1.0
+            self._speed_var.set(v)
+            self.engine.set_speed(v)
+            self._speed_preview.config(text=f"{v:.2f}x")
         else:
             v = round(float(self._speed_var.get()) / 0.05) * 0.05
             self._speed_var.set(v)
             self.engine.set_speed(v)
 
-    def _on_vol_press(self, _event: tk.Event) -> None:
-        """音量拖动开始：取消条仅覆盖标题行。"""
-        if not self.engine.ready:
-            return
-        self._vol_dragging = True
-        self._vol_cancel.place(in_=self._vol_cancel_row,
-                               relx=0, rely=0, relwidth=1, relheight=1)
+    def _pointer_side_in(self, widget) -> str | None:
+        """判断指针是否在控件内，并返回所在半区（'left'/'right'/None）。"""
+        try:
+            x = self.root.winfo_pointerx() - widget.winfo_rootx()
+            y = self.root.winfo_pointery() - widget.winfo_rooty()
+            if not (0 <= x <= widget.winfo_width()
+                    and 0 <= y <= widget.winfo_height()):
+                return None
+            return "left" if x < widget.winfo_width() / 2 else "right"
+        except Exception:
+            return None
 
     def _on_vol_changed(self, value: str) -> None:
-        """音量拖动中：仅更新预览（吸附到整数），不生效。"""
-        if not self._vol_dragging:
-            return
+        """音量变化：吸附到整数并实时生效（无取消功能）。"""
         v = int(round(float(value)))
+        v = max(0, min(100, v))
         self._vol_var.set(v)
-        self._vol_preview.config(text=f"{v}%")
+        self.engine.set_volume(v / 100.0)
+        self._update_vol_preview()
 
-    def _on_vol_release(self, _event: tk.Event) -> None:
-        """音量拖动结束：取消则回退，否则应用。"""
-        if not self._vol_dragging:
-            return
-        self._vol_dragging = False
-        self._vol_cancel.place_forget()
-        if self._is_pointer_in_cancel(self._vol_cancel):
-            self._vol_var.set(self.engine.get_volume() * 100)
-            self._vol_preview.config(
-                text=f"{int(self.engine.get_volume() * 100)}%")
+    def _update_vol_preview(self) -> None:
+        """按音量×增益更新音量数值显示；增益≠1 时显示有效音量并置黄色。"""
+        vol = int(round(float(self._vol_var.get())))
+        gain = (self.engine.get_gain()
+                if self.engine.backend == "sounddevice" else 1.0)
+        if abs(gain - 1.0) < 1e-9:
+            self._vol_preview.config(text=f"{vol}%", fg=FG_COLOR)
         else:
-            v = int(round(float(self._vol_var.get())))
-            self._vol_var.set(v)
-            self.engine.set_volume(v / 100.0)
+            eff = int(round(vol * gain))
+            self._vol_preview.config(text=f"{eff}%", fg="#FFD54F")
 
     def _toggle_pitch_fix(self) -> None:
         """切换保音高模式（变速不变调）。"""
         on = not self.engine.get_pitch_fix()
         self.engine.set_pitch_fix(on)
         self._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
+
+    def _build_adv_slider(self, parent, title, from_, to, default, fmt,
+                          var_attr, scale_attr, val_attr, on_change,
+                          key) -> None:
+        """构建一行高级参数滑块：左侧标题、中间滑块、右侧数值。
+
+        拖动时在「高级功能」标题行覆盖蓝色重置条，松手在条内则仅重置该项（key 标识）。
+        """
+        row = tk.Frame(parent, bg=BG_COLOR)
+        row.pack(fill="x", pady=(4, 0))
+        tk.Label(row, text=title, bg=BG_COLOR, fg=FG_COLOR,
+                 font=self.info_font, width=8, anchor="w").pack(side="left")
+        var = tk.DoubleVar(value=default)
+        setattr(self, var_attr, var)
+        scale = ttk.Scale(row, style="LRC.Horizontal.TScale",
+                          orient="horizontal", from_=from_, to=to,
+                          variable=var, command=on_change)
+        scale.pack(side="left", fill="x", expand=True)
+        setattr(self, scale_attr, scale)
+        scale.bind("<ButtonPress-1>",
+                   lambda e, k=key, d=default: self._on_adv_press(e, k, d))
+        scale.bind("<ButtonRelease-1>", self._on_adv_release)
+        val = tk.Label(row, text=fmt(default), width=8, bg=BG_COLOR,
+                       fg=FG_COLOR, font=self.info_font, anchor="e")
+        val.pack(side="right", padx=(10, 0))
+        setattr(self, val_attr, val)
+
+    def _on_adv_press(self, _event: tk.Event, key: str, default: float) -> None:
+        """高级滑块拖动开始：记录正在调整的项，显示蓝色重置条。"""
+        self._adv_dragging = True
+        self._adv_active = key
+        self._adv_reset.place(in_=self._adv_cancel_row,
+                              relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _on_adv_release(self, _event: tk.Event) -> None:
+        """高级滑块拖动结束：松手在重置条内则仅重置该项，否则保持当前值。"""
+        if not self._adv_dragging:
+            return
+        self._adv_dragging = False
+        self._adv_reset.place_forget()
+        if self._is_pointer_in_cancel(self._adv_reset):
+            self._reset_adv(self._adv_active)
+
+    def _reset_adv(self, key: str | None) -> None:
+        """重置指定高级参数为默认值（仅当前正在调整的那一项）。"""
+        if key == "lrc":
+            self.lrc_offset = 0.0
+            self._lrc_offset_var.set(0.0)
+            self._lrc_offset_val.config(text="+0.0s")
+            self._sync_lyrics(self._current_time())
+        elif key == "balance":
+            self._balance_var.set(0.0)
+            self.engine.set_balance(0.0)
+            self._balance_val.config(text="+0.00")
+        elif key == "gain":
+            self._gain_var.set(1.0)
+            self.engine.set_gain(1.0)
+            self._gain_val.config(text="1.00x")
+            self._update_vol_preview()
+
+    def _on_lrc_offset_changed(self, value: str) -> None:
+        """歌词偏移：正值=歌词延后，负值=歌词提前（步进 0.1s）。"""
+        v = round(float(value) / 0.1) * 0.1
+        v = max(-10.0, min(10.0, v))
+        self._lrc_offset_var.set(v)
+        self.lrc_offset = v
+        self._lrc_offset_val.config(text=f"{v:+.1f}s")
+        self._sync_lyrics(self._current_time())
+
+    def _on_balance_changed(self, value: str) -> None:
+        """声道平衡：-1 全左，0 居中，+1 全右（仅 sounddevice）。"""
+        if self.engine.backend != "sounddevice":
+            return
+        v = round(float(value) / 0.05) * 0.05
+        v = max(-1.0, min(1.0, v))
+        self._balance_var.set(v)
+        self.engine.set_balance(v)
+        self._balance_val.config(text=f"{v:+.2f}")
+
+    def _on_gain_changed(self, value: str) -> None:
+        """响度增益（前置放大）：1.0 原始，最高 2.0（+6dB，仅 sounddevice）。"""
+        if self.engine.backend != "sounddevice":
+            return
+        v = round(float(value) / 0.05) * 0.05
+        v = max(0.0, min(2.0, v))
+        self._gain_var.set(v)
+        self.engine.set_gain(v)
+        self._gain_val.config(text=f"{v:.2f}x")
+        self._update_vol_preview()  # 增益变化同步音量显示
 
     # ==================================================================
     # 专辑封面
@@ -829,6 +892,8 @@ class LrcPlayerApp:
             self._btn_a.config(text="确认", command=self._il_move_confirm)
             self._btn_b.config(text="上移", command=self._il_move_up)
             self._btn_c.config(text="下移", command=self._il_move_down)
+            for b in (self._btn_a, self._btn_b, self._btn_c):
+                b.config(state="normal")
             return
 
         sel = self.interlude_list.curselection()
@@ -840,6 +905,10 @@ class LrcPlayerApp:
             self._btn_a.config(text="播放此首", command=self._play_viewed_song)
             self._btn_b.config(text="添加到插播", command=self._interlude_add)
             self._btn_c.config(text="清除插播", command=self._il_clear_confirm)
+        # 未加载任何文件/文件夹时禁用歌曲相关按钮，否则全部启用
+        loaded = self.audio_path is not None or bool(self.audio_items)
+        for b in (self._btn_a, self._btn_b, self._btn_c):
+            b.config(state="normal" if loaded else "disabled")
 
     def _reset_clear_button(self) -> None:
         """将清除按钮恢复为默认状态。"""
@@ -1068,28 +1137,69 @@ class LrcPlayerApp:
             btn.config(state="disabled")
 
     def _disable_op_controls(self) -> None:
-        """非 sounddevice 后端时禁用倍速/保音高控件（音量保留）。"""
-        for w in (self._speed_scale, self._pitch_btn):
+        """非 sounddevice 后端时禁用倍速/保音高/平衡/增益控件（音量保留）。"""
+        for w in (self._speed_scale, self._pitch_btn,
+                  self._balance_scale, self._gain_scale):
             try:
                 w.config(state="disabled")
             except Exception:
                 pass
+
+    def _update_controls_state(self) -> None:
+        """根据是否已加载文件/文件夹统一启用/禁用播放相关控件。
+
+        加载任何文件或扫描任何文件夹后，除 sounddevice 专属控件（pygame 后端禁用）外全部启用；
+        完全未加载时（刚启动）全部禁用。
+        """
+        loaded = self.audio_path is not None or bool(self.audio_items)
+        state = "normal" if loaded else "disabled"
+
+        for w in (self.play_pause_btn, self.stop_btn,
+                  self.back_10s_btn, self.forward_10s_btn,
+                  self.prev_btn, self.next_btn,
+                  self.seek_scale):
+            w.config(state=state)
+
+        # 倍速/保音高/平衡/增益：仅 sounddevice 后端可用
+        op_widgets = (self._speed_scale, self._pitch_btn,
+                      self._balance_scale, self._gain_scale)
+        if self.engine.backend == "sounddevice":
+            for w in op_widgets:
+                try:
+                    w.config(state=state)
+                except Exception:
+                    pass
+        else:
+            for w in op_widgets:
+                try:
+                    w.config(state="disabled")
+                except Exception:
+                    pass
+
+        # 右栏按钮状态由 _refresh_il_buttons 维护
+        self._refresh_il_buttons()
 
     # ==================================================================
     # 状态栏更新
     # ==================================================================
 
     def _read_audio_info(self) -> str:
-        """读取音频输出设备/参数信息。"""
+        """读取当前音频输出设备名称/参数信息。"""
         if not self.engine.ready:
             return "音频: 未就绪"
         if self.engine.backend == "sounddevice":
-            sr = self.engine.samplerate
-            ch = self.engine.channels
-            if sr > 0:
+            try:
+                import sounddevice as sd
+                dev = sd.query_devices(kind="output")
+                name = str(dev.get("name", "")).strip()
+                if name:
+                    return f"音频: {name}"
+                sr = int(dev.get("default_samplerate", 0) or 0)
+                ch = int(dev.get("max_output_channels", 2) or 2)
                 ch_name = {1: "Mono", 2: "Stereo"}.get(ch, f"{ch}ch")
-                return f"音频: {sr}Hz {ch_name}"
-            return "音频: 就绪"
+                return f"音频: {sr}Hz {ch_name}" if sr > 0 else "音频: 就绪"
+            except Exception:
+                return "音频: 就绪"
         try:
             import pygame
             info = pygame.mixer.get_init()
@@ -1097,7 +1207,7 @@ class LrcPlayerApp:
                 freq, fmt, ch = info
                 ch_name = {1: "Mono", 2: "Stereo"}.get(ch, f"{ch}ch")
                 bits = 16 if fmt < 0 else 8
-                return f"音频: {freq}Hz {bits}bit {ch_name}"
+                return f"音频: pygame {freq}Hz {bits}bit {ch_name}"
         except Exception:
             pass
         return "音频: 就绪"
@@ -1132,62 +1242,105 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _scan_folder(self) -> None:
-        """扫描文件夹：同步快扫显示列表，子线程后台缓存时长。"""
+        """扫描文件夹：子线程执行枚举与元数据收集，主线程实时显示进度，不卡界面。"""
         folder = filedialog.askdirectory(title="选择歌曲文件夹")
         if not folder:
             return
         self.audio_root = folder
 
-        # 同步快扫：walk + mutagen 元数据（不含 pygame.Sound，快速完成）
-        self.audio_items = self._quick_scan_files(folder)
+        # 置空列表，显示扫描占位（列表操作在主线程，保证 UI 不冻结）
+        self.audio_items = []
         self.current_song_index = None
         self.viewed_song_index = None
         self.song_list.selection_clear(0, "end")
-        self._refresh_song_list()
+        self.song_list.delete(0, "end")
+        self.song_list.insert("end", "正在扫描文件夹...")
         self._clear_song_info()
+        self._update_controls_state()
 
         # 显示底部面板 + 首次扫描调整窗口尺寸并锁定最小宽度
         self.bottom_frame.pack(fill="both", expand=True, pady=(6, 0))
         if not self._first_scan_done:
             self._first_scan_done = True
-            self.root.geometry("1270x600")
-            self.root.minsize(1270, 600)
+            self.root.geometry("1380x600")
+            self.root.minsize(1380, 600)
 
-        # 启动后台缓存并更新进度状态
-        self._scan_total = len(self.audio_items)
+        # 启动后台扫描线程
+        self._bg_cache_gen += 1
+        gen = self._bg_cache_gen
+        self._prog_var.set("正在扫描文件夹...")
+        threading.Thread(
+            target=self._scan_thread, args=(folder, gen), daemon=True
+        ).start()
+
+    def _scan_thread(self, folder: str, generation: int) -> None:
+        """后台扫描线程：先枚举音频文件路径，再逐个读取元数据，实时上报进度。"""
+        # 阶段一：枚举音频文件路径（仅列目录，较快），期间只更新"已发现 N 个"
+        audio_paths: list[str] = []
+        try:
+            for root_dir, _, files in os.walk(folder):
+                if generation != self._bg_cache_gen:
+                    return
+                for name in files:
+                    if generation != self._bg_cache_gen:
+                        return
+                    if os.path.splitext(name)[1].lower() not in AUDIO_EXTENSIONS:
+                        continue
+                    audio_paths.append(os.path.join(root_dir, name))
+                    if len(audio_paths) % 50 == 0:
+                        n = len(audio_paths)
+                        self.root.after(
+                            0, lambda c=n: self._prog_var.set(f"正在扫描... {c} 个"))
+        except Exception:
+            pass
+        if generation != self._bg_cache_gen:
+            return
+        total = len(audio_paths)
+
+        # 阶段二：逐个读取元数据 + 匹配 LRC，实时显示百分比进度
+        items: list[dict[str, str | int | None]] = []
+        for i, path in enumerate(audio_paths):
+            if generation != self._bg_cache_gen:
+                return
+            lrc_path = self._find_lrc_for_audio(path)
+            track_number, album_name, artist_name = self._get_metadata(path)
+            rel = os.path.relpath(path, folder)
+            items.append({
+                "path": path,
+                "lrc": lrc_path,
+                "display": rel,
+                "track": track_number,
+                "album": album_name,
+                "artist": artist_name,
+                "duration": None,
+            })
+            if (i + 1) % 5 == 0 or i + 1 == total:
+                done, tot = i + 1, total
+                self.root.after(
+                    0, lambda d=done, t=tot: self._set_scan_progress(d, t))
+
+        if generation != self._bg_cache_gen:
+            return
+        items.sort(key=self._song_sort_key)
+        self.root.after(0, lambda: self._apply_scan_result(items, generation))
+
+    def _apply_scan_result(self, items: list, generation: int) -> None:
+        """主线程：应用扫描结果，刷新列表，启动后台时长缓存。"""
+        if generation != self._bg_cache_gen:
+            return
+        self.audio_items = items
+        self._refresh_song_list()
+        self._update_controls_state()  # 有列表后启用上一曲/下一曲
+
+        # 启动后台时长缓存（不阻塞主线程）
+        self._scan_total = len(items)
         self._scan_done = 0
         self._set_scan_progress(0, self._scan_total)
-
-        # 子线程后台缓存时长（不阻塞主线程）
         self._bg_cache_gen += 1
         gen = self._bg_cache_gen
         threading.Thread(
             target=self._bg_cache_thread, args=(gen,), daemon=True
         ).start()
-
-    def _quick_scan_files(self, folder: str) -> list[dict[str, str | int | None]]:
-        """快速扫描：只收集文件路径和元数据，不计算时长。"""
-        items: list[dict[str, str | int | None]] = []
-        for root, _, files in os.walk(folder):
-            for name in files:
-                ext = os.path.splitext(name)[1].lower()
-                if ext not in AUDIO_EXTENSIONS:
-                    continue
-                path = os.path.join(root, name)
-                lrc_path = self._find_lrc_for_audio(path)
-                track_number, album_name, artist_name = self._get_metadata(path)
-                rel = os.path.relpath(path, folder)
-                items.append({
-                    "path": path,
-                    "lrc": lrc_path,
-                    "display": rel,
-                    "track": track_number,
-                    "album": album_name,
-                    "artist": artist_name,
-                    "duration": None,
-                })
-        items.sort(key=self._song_sort_key)
-        return items
 
     def _bg_cache_thread(self, generation: int) -> None:
         """后台子线程：用 mutagen 获取时长，不触碰 pygame 避免音频撕裂。"""
@@ -1202,10 +1355,11 @@ class LrcPlayerApp:
                 item["duration"] = dur
             self.root.after(0, lambda idx=i, d=item.get("duration"):
                            self._on_duration_cached(idx, d))
-            # 更新进度
-            self._scan_done = i + 1
-            self.root.after(0, lambda d=i + 1, t=total:
-                           self._set_scan_progress(d, t))
+            # 更新进度（每 5 首投递一次，避免大列表在消息队列堆积回调）
+            if (i + 1) % 5 == 0 or i + 1 == total:
+                self._scan_done = i + 1
+                self.root.after(0, lambda d=i + 1, t=total:
+                               self._set_scan_progress(d, t))
         # 全部完成
         self.root.after(0, self._set_status_ready)
 
@@ -1304,6 +1458,7 @@ class LrcPlayerApp:
             return
         self.viewed_song_index = index
         self._show_song_info_for_index(index)
+        self._refresh_il_buttons()
 
     # ==================================================================
     # 歌曲信息面板
@@ -1392,6 +1547,7 @@ class LrcPlayerApp:
         self.viewed_song_index = None
         for var in self.song_info_labels.values():
             var.set("-")
+        self._refresh_il_buttons()
 
     def _play_viewed_song(self) -> None:
         """播放当前在信息面板中查看的歌曲。"""
@@ -1761,10 +1917,11 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _sync_lyrics(self, current_time: float) -> None:
-        """根据当前播放时间更新高亮歌词行。"""
+        """根据当前播放时间更新高亮歌词行（考虑歌词偏移）。"""
         if not self.lrc_times:
             return
-        index = bisect_right(self.lrc_times, current_time) - 1
+        lookup = current_time - self.lrc_offset  # 正值偏移 → 歌词延后
+        index = bisect_right(self.lrc_times, lookup) - 1
         if index != self.current_lrc_index:
             self.current_lrc_index = index
             self._highlight_line(index)

@@ -194,6 +194,8 @@ class AudioEngine:
         self._eof = False
         self._speed = 1.0
         self._volume = 1.0
+        self._balance = 0.0   # 声道平衡：-1 全左 ~ +1 全右
+        self._gain = 1.0      # 响度增益（前置放大）：0 ~ 2
         self._pitch_fix = False
         self._pv: PhaseVocoder | None = None
         self._pv_spill: np.ndarray = np.empty((0, 2), dtype=np.float32)
@@ -403,6 +405,22 @@ class AudioEngine:
         """当前音量。"""
         return self._volume
 
+    def set_balance(self, balance: float) -> None:
+        """设置声道平衡（-1 全左 ~ +1 全右）。仅 sounddevice 后端生效。"""
+        self._balance = max(-1.0, min(1.0, float(balance)))
+
+    def get_balance(self) -> float:
+        """当前声道平衡。"""
+        return self._balance
+
+    def set_gain(self, gain: float) -> None:
+        """设置响度增益（0 ~ 2，1 为原始音量）。仅 sounddevice 后端生效。"""
+        self._gain = max(0.0, min(2.0, float(gain)))
+
+    def get_gain(self) -> float:
+        """当前响度增益。"""
+        return self._gain
+
     def set_pitch_fix(self, on: bool) -> None:
         """切换保音高模式（变速不变调）。仅 sounddevice 后端生效。"""
         self._pitch_fix = bool(on)
@@ -470,6 +488,7 @@ class AudioEngine:
         frac = (idx - i0).astype(np.float32)[:, None]
         interp = a + (b - a) * frac
         outdata[:] = interp * self._volume
+        self._apply_output_gain(outdata)
         self._pos_frames = pos0 + frames * step
         if self._pos_frames >= self._total_frames:
             self._eof = True
@@ -499,6 +518,18 @@ class AudioEngine:
                 outdata[:n] = self._pv_spill * self._volume
             outdata[n:] = 0.0
             self._pv_spill = np.empty((0, self._ch), dtype=np.float32)
+        self._apply_output_gain(outdata)
+
+    def _apply_output_gain(self, outdata: np.ndarray) -> None:
+        """对输出缓冲施加响度增益与声道平衡（原地修改）。"""
+        if self._gain != 1.0:
+            outdata *= self._gain
+        if self._ch > 1 and abs(self._balance) > 1e-6:
+            b = self._balance
+            if b <= 0:
+                outdata[:, 1] *= (1.0 + b)
+            else:
+                outdata[:, 0] *= (1.0 - b)
 
     # ------------------------------------------------------------------
     # 文件信息

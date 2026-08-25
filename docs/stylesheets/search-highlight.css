@@ -1,0 +1,14 @@
+/* 亮色主题 */
+[data-md-color-scheme="default"] {
+  --md-typeset-mark-color: rgb(255, 130, 130);
+}
+
+/* 暗色主题 */
+[data-md-color-scheme="slate"] {
+  --md-typeset-mark-color: rgb(255, 255, 130);
+}
+
+/* 文字颜色 */
+mark[data-md-highlight] {
+  color: #474747;
+}
