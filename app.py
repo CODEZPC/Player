@@ -57,7 +57,7 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.5.1")
+        self.root.title("Player PRO V1.5.2")
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(1380, 600)
         self.root.resizable(True, True)
@@ -676,8 +676,8 @@ class LrcPlayerApp:
                  font=self.button_font_sm).pack(expand=True)
 
         self._build_adv_slider(
-            adv_frame, "歌词偏移", -10.0, 10.0, 0.0,
-            lambda v: f"{v:+.1f}s", "_lrc_offset_var",
+            adv_frame, "歌词偏移", -60, 60, 0,
+            lambda v: f"{v*10}ms", "_lrc_offset_var",
             "_lrc_offset_scale", "_lrc_offset_val",
             self._on_lrc_offset_changed, "lrc")
         self._build_adv_slider(
@@ -787,7 +787,7 @@ class LrcPlayerApp:
         scale.bind("<ButtonPress-1>",
                    lambda e, k=key, d=default: self._on_adv_press(e, k, d))
         scale.bind("<ButtonRelease-1>", self._on_adv_release)
-        val = tk.Label(row, text=fmt(default), width=8, bg=BG_COLOR,
+        val = tk.Label(row, text=fmt(default), width=6, bg=BG_COLOR,
                        fg=FG_COLOR, font=self.info_font, anchor="e")
         val.pack(side="right", padx=(10, 0))
         setattr(self, val_attr, val)
@@ -811,9 +811,9 @@ class LrcPlayerApp:
     def _reset_adv(self, key: str | None) -> None:
         """重置指定高级参数为默认值（仅当前正在调整的那一项）。"""
         if key == "lrc":
-            self.lrc_offset = 0.0
-            self._lrc_offset_var.set(0.0)
-            self._lrc_offset_val.config(text="+0.0s")
+            self.lrc_offset = 0
+            self._lrc_offset_var.set(0)
+            self._lrc_offset_val.config(text="0ms")
             self._sync_lyrics(self._current_time())
         elif key == "balance":
             self._balance_var.set(0.0)
@@ -826,12 +826,16 @@ class LrcPlayerApp:
             self._update_vol_preview()
 
     def _on_lrc_offset_changed(self, value: str) -> None:
-        """歌词偏移：正值=歌词延后，负值=歌词提前（步进 0.1s）。"""
-        v = round(float(value) / 0.1) * 0.1
-        v = max(-10.0, min(10.0, v))
+        """歌词偏移：正值=歌词延后，负值=歌词提前（步进 10ms）。"""
+        v = round(float(value) / 1) * 1
+        v = max(-60, min(60, v))
         self._lrc_offset_var.set(v)
         self.lrc_offset = v
-        self._lrc_offset_val.config(text=f"{v:+.1f}s")
+        "#FF5555""#C8C8C8"
+        r = int(0xC8 + (0xFF - 0xC8) * abs(v / 60))
+        g = int(0xC8 + (0x55 - 0xC8) * abs(v / 60))
+        b = int(0xC8 + (0x55 - 0xC8) * abs(v / 60))
+        self._lrc_offset_val.config(text=f"{v*10}ms", fg="#{:02x}{:02x}{:02x}".format(r, g, b))
         self._sync_lyrics(self._current_time())
 
     def _on_balance_changed(self, value: str) -> None:
@@ -852,7 +856,17 @@ class LrcPlayerApp:
         v = max(0.0, min(2.0, v))
         self._gain_var.set(v)
         self.engine.set_gain(v)
-        self._gain_val.config(text=f"{v:.2f}x")
+        "#FFD54F""#6D6D6D""#C8C8C8"
+        p = v - 1
+        if p <= 0:
+            r = int(0xC8 + (0x6D - 0xC8) * abs(p))
+            g = int(0xC8 + (0x6D - 0xC8) * abs(p))
+            b = int(0xC8 + (0x6D - 0xC8) * abs(p))
+        else:
+            r = int(0xC8 + (0xFF - 0xC8) * abs(p))
+            g = int(0xC8 + (0xD5 - 0xC8) * abs(p))
+            b = int(0xC8 + (0x4F - 0xC8) * abs(p))
+        self._gain_val.config(text=f"{v:.2f}x", fg="#{:02x}{:02x}{:02x}".format(r, g, b))
         self._update_vol_preview()  # 增益变化同步音量显示
 
     # ==================================================================
@@ -1920,7 +1934,7 @@ class LrcPlayerApp:
         """根据当前播放时间更新高亮歌词行（考虑歌词偏移）。"""
         if not self.lrc_times:
             return
-        lookup = current_time - self.lrc_offset  # 正值偏移 → 歌词延后
+        lookup = current_time - self.lrc_offset / 100  # 正值偏移 → 歌词延后
         index = bisect_right(self.lrc_times, lookup) - 1
         if index != self.current_lrc_index:
             self.current_lrc_index = index
