@@ -381,8 +381,8 @@ class AudioEngine:
     # ------------------------------------------------------------------
 
     def set_speed(self, speed: float) -> None:
-        """设置倍速（0.1 ~ 3.0）。pygame 后端不支持，忽略。"""
-        self._speed = max(0.1, min(3.0, float(speed)))
+        """设置倍速（0.01 ~ 10.0）。pygame 后端不支持，忽略。"""
+        self._speed = max(0.01, min(10.0, float(speed)))
         if self.backend == "sounddevice" and self._pitch_fix and self._sf:
             with self._lock:
                 self._pv = PhaseVocoder(self._ch, 1.0 / self._speed)
@@ -414,8 +414,8 @@ class AudioEngine:
         return self._balance
 
     def set_gain(self, gain: float) -> None:
-        """设置响度增益（0 ~ 2，1 为原始音量）。仅 sounddevice 后端生效。"""
-        self._gain = max(0.0, min(2.0, float(gain)))
+        """设置响度增益（0 ~ 3，1 为原始音量）。仅 sounddevice 后端生效。"""
+        self._gain = max(0.0, min(3.0, float(gain)))
 
     def get_gain(self) -> float:
         """当前响度增益。"""

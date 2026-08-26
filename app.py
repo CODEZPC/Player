@@ -21,6 +21,7 @@ from utils import (
     bind_tooltip,
     resource_path,
 )
+from console import PlayerConsole
 
 
 # ===========================================================================
@@ -57,7 +58,7 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.5.2")
+        self.root.title("Player PRO V1.6.0")
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(1380, 600)
         self.root.resizable(True, True)
@@ -144,6 +145,10 @@ class LrcPlayerApp:
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
         self._setup_keyboard_shortcuts()
+
+        # 控制台（创建后隐藏，点击「控制台」按钮显示）
+        self.console = PlayerConsole(self)
+        self.console.win.withdraw()
 
     # ==================================================================
     # 字体 & 样式
@@ -669,6 +674,13 @@ class LrcPlayerApp:
         self._adv_cancel_row.pack(fill="x")
         tk.Label(self._adv_cancel_row, text="高级功能", bg=BG_COLOR,
                  fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
+        self._console_btn = tk.Button(
+            self._adv_cancel_row, text="控制台",
+            command=self._toggle_console,
+            bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.button_font_sm,
+            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
+            relief="flat", padx=6, pady=2)
+        self._console_btn.pack(side="right")
 
         # 蓝色重置条（拖动任一高级滑块时覆盖标题行）
         self._adv_reset = tk.Frame(adv_frame, bg="#1F3A8A", height=36)
@@ -766,6 +778,11 @@ class LrcPlayerApp:
         self.engine.set_pitch_fix(on)
         self._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
 
+    def _toggle_console(self) -> None:
+        """打开/关闭控制台窗口。"""
+        if getattr(self, "console", None) is not None:
+            self.console.toggle()
+
     def _build_adv_slider(self, parent, title, from_, to, default, fmt,
                           var_attr, scale_attr, val_attr, on_change,
                           key) -> None:
@@ -831,12 +848,17 @@ class LrcPlayerApp:
         v = max(-60, min(60, v))
         self._lrc_offset_var.set(v)
         self.lrc_offset = v
-        "#FF5555""#C8C8C8"
-        r = int(0xC8 + (0xFF - 0xC8) * abs(v / 60))
-        g = int(0xC8 + (0x55 - 0xC8) * abs(v / 60))
-        b = int(0xC8 + (0x55 - 0xC8) * abs(v / 60))
-        self._lrc_offset_val.config(text=f"{v*10}ms", fg="#{:02x}{:02x}{:02x}".format(r, g, b))
+        self._lrc_offset_val.config(text=f"{v * 10}ms",
+                                    fg=self._lrc_offset_color(v))
         self._sync_lyrics(self._current_time())
+
+    def _lrc_offset_color(self, v: float) -> str:
+        """歌词偏移数值颜色：随偏移量增大由灰转红（警示）。"""
+        p = min(1.0, abs(v) / 60.0)
+        r = int(0xC8 + (0xFF - 0xC8) * p)
+        g = int(0xC8 + (0x55 - 0xC8) * p)
+        b = int(0xC8 + (0x55 - 0xC8) * p)
+        return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
     def _on_balance_changed(self, value: str) -> None:
         """声道平衡：-1 全左，0 居中，+1 全右（仅 sounddevice）。"""
@@ -856,8 +878,12 @@ class LrcPlayerApp:
         v = max(0.0, min(2.0, v))
         self._gain_var.set(v)
         self.engine.set_gain(v)
-        "#FFD54F""#6D6D6D""#C8C8C8"
-        p = v - 1
+        self._gain_val.config(text=f"{v:.2f}x", fg=self._gain_color(v))
+        self._update_vol_preview()  # 增益变化同步音量显示
+
+    def _gain_color(self, v: float) -> str:
+        """增益数值颜色：低于 1 偏灰，高于 1 偏黄（警示提升）。"""
+        p = max(-1.0, min(1.0, v - 1))
         if p <= 0:
             r = int(0xC8 + (0x6D - 0xC8) * abs(p))
             g = int(0xC8 + (0x6D - 0xC8) * abs(p))
@@ -866,8 +892,7 @@ class LrcPlayerApp:
             r = int(0xC8 + (0xFF - 0xC8) * abs(p))
             g = int(0xC8 + (0xD5 - 0xC8) * abs(p))
             b = int(0xC8 + (0x4F - 0xC8) * abs(p))
-        self._gain_val.config(text=f"{v:.2f}x", fg="#{:02x}{:02x}{:02x}".format(r, g, b))
-        self._update_vol_preview()  # 增益变化同步音量显示
+        return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
     # ==================================================================
     # 专辑封面
@@ -1256,10 +1281,14 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _scan_folder(self) -> None:
-        """扫描文件夹：子线程执行枚举与元数据收集，主线程实时显示进度，不卡界面。"""
+        """GUI：选择文件夹后启动后台扫描。"""
         folder = filedialog.askdirectory(title="选择歌曲文件夹")
         if not folder:
             return
+        self._start_scan(folder)
+
+    def _start_scan(self, folder: str) -> None:
+        """启动文件夹后台扫描（GUI/控制台共用入口）。"""
         self.audio_root = folder
 
         # 置空列表，显示扫描占位（列表操作在主线程，保证 UI 不冻结）
@@ -1585,17 +1614,18 @@ class LrcPlayerApp:
         )
         if not path:
             return
-        self._load_audio_file(path)
-        self._auto_load_lrc(path)
-
-    def _load_audio_file(self, path: str) -> None:
-        """加载音频文件到引擎。"""
-        if not self.engine.ready:
-            return
-        success = self.engine.load(path)
-        if not success:
+        if not self._load_audio_file(path):
             messagebox.showerror("加载音频", "无法加载音频文件。")
             return
+        self._auto_load_lrc(path)
+
+    def _load_audio_file(self, path: str) -> bool:
+        """加载音频文件到引擎。成功返回 True。"""
+        if not self.engine.ready:
+            return False
+        success = self.engine.load(path)
+        if not success:
+            return False
         self.audio_path = path
         self._sync_song_list_selection(path)
         self.duration = self.engine.get_duration(path)
@@ -1603,6 +1633,8 @@ class LrcPlayerApp:
         self._reset_playback_state()
         self._update_info()
         self._update_cover(path)
+        self._update_controls_state()
+        return True
 
     def _sync_song_list_selection(self, path: str) -> None:
         """若打开的文件在歌曲列表中，同步选中状态。"""
