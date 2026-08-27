@@ -7,6 +7,9 @@
   song pause / song stop
   set volume / set mode / set rate / set lrc-offset / set balance
   set loudness / set rate-keep；set <obj> reset / set reset
+  app topmost/floatlayer/exit
+  interlude add/clear/insert/remove/move（<song> 视为 <序号|歌名>）
+  console clear / console exit
 """
 
 import os
@@ -47,6 +50,15 @@ class PlayerConsole:
         "  set loudness <0~3>                响度增益（0.01 步进）\n"
         "  set rate-keep <true/false>        保音高\n"
         "  set <obj> reset / set reset       重置单项 / 全部重置\n"
+        "  app topmost <true/false>          窗口置顶开关\n"
+        "  app floatlayer                    开关歌词浮层\n"
+        "  app exit                          退出程序\n"
+        "  interlude add <song...>           添加多首到插播\n"
+        "  interlude clear                   清空插播\n"
+        "  interlude insert <a> <b>          把 a 插入到插播中 b 之前\n"
+        "  interlude remove <song>           从插播移除一首\n"
+        "  interlude move <song> <change|to|top|bottom> [num]  移动插播位置\n"
+        "  console clear / console exit      清空输出 / 关闭控制台\n"
         "  help                              显示本帮助\n"
         "Tab 补全指令"
     )
@@ -188,7 +200,21 @@ class PlayerConsole:
             return self._cmd_song(parts)
         if head == "set":
             return self._cmd_set(parts)
+        if head == "app":
+            return self._cmd_app(parts)
+        if head == "interlude":
+            return self._cmd_interlude(parts)
+        if head == "console":
+            return self._cmd_console(parts)
+        oth = self.other(head)
+        if oth:
+            return oth
         return f"未知指令: {head}（输入 help 查看）"
+
+    def other(self, cmd: str) -> str:
+        if cmd == "hello":
+            return "hello!"
+        return None
 
     # ------------------------------------------------------------------
     # open
@@ -497,6 +523,221 @@ class PlayerConsole:
         return self._cmd_set(["set", obj, defaults[obj]])
 
     # ------------------------------------------------------------------
+    # app
+    # ------------------------------------------------------------------
+
+    def _cmd_app(self, parts: list) -> str:
+        """app topmost / floatlayer / exit。"""
+        if len(parts) < 2:
+            return "用法: app <topmost|floatlayer|exit>"
+        sub = parts[1].lower()
+        app = self.app
+
+        if sub == "topmost":
+            if len(parts) < 3:
+                return "用法: app topmost <true|false>"
+            on = _parse_bool(parts[2])
+            if on is None:
+                return "参数错误: topmost ∈ {true, false, 1, 0, on, off}"
+            app.always_on_top = on
+            app.root.attributes("-topmost", on)
+            app.topmost_btn.config(text="置顶: 开" if on else "置顶: 关")
+            return f"置顶: {'开' if on else '关'}"
+
+        if sub == "floatlayer":
+            if app._lyric_overlay is not None:
+                app._close_lyric_overlay()
+                return "已关闭歌词浮层"
+            if not app.audio_path:
+                return "未加载歌曲，无法打开歌词浮层"
+            app._open_lyric_overlay()
+            return "已打开歌词浮层"
+
+        if sub == "exit":
+            app.on_close()
+            return ""  # 窗口已销毁，不再输出
+
+        return f"未知 app 子指令: {sub}"
+
+    # ------------------------------------------------------------------
+    # interlude
+    # ------------------------------------------------------------------
+
+    def _cmd_interlude(self, parts: list) -> str:
+        """interlude add/clear/insert/remove/move（<song> 视为 <序号|歌名>）。"""
+        if len(parts) < 2:
+            return "用法: interlude <add|clear|insert|remove|move> [...]"
+        sub = parts[1].lower()
+        app = self.app
+
+        if sub == "add":
+            if len(parts) < 3:
+                return "用法: interlude add <song1> [song2 ...]"
+            added = 0
+            for ref in parts[2:]:
+                r = self._resolve_song(ref)
+                if isinstance(r, str):
+                    return r
+                _idx, item = r
+                app.interlude_items.append(dict(item))
+                added += 1
+            self._refresh_interlude()
+            return (f"已添加 {added} 首到插播"
+                    f"（共 {len(app.interlude_items)} 首）")
+
+        if sub == "clear":
+            n = len(app.interlude_items)
+            app.interlude_items.clear()
+            self._refresh_interlude()
+            return f"已清空插播（{n} 首）"
+
+        if sub == "insert":
+            if len(parts) < 4:
+                return "用法: interlude insert <song1> <song2>（song1 插到 song2 之前）"
+            r1 = self._resolve_song(parts[2])
+            if isinstance(r1, str):
+                return r1
+            r2 = self._resolve_song(parts[3])
+            if isinstance(r2, str):
+                return r2
+            _i1, item1 = r1
+            _i2, item2 = r2
+            pos = self._find_in_interlude(item2)
+            if pos is None:
+                return "song2 不在插播队列中"
+            app.interlude_items.insert(pos, dict(item1))
+            self._refresh_interlude()
+            return (f"已把 {self._show_name(item1)} 插入到 "
+                    f"{self._show_name(item2)} 之前（第 {pos + 1} 位）")
+
+        if sub == "remove":
+            if len(parts) < 3:
+                return "用法: interlude remove <song>"
+            r = self._resolve_song(parts[2])
+            if isinstance(r, str):
+                return r
+            _idx, item = r
+            pos = self._find_in_interlude(item)
+            if pos is None:
+                return "该歌曲不在插播队列中"
+            del app.interlude_items[pos]
+            self._refresh_interlude()
+            return f"已从插播移除: {self._show_name(item)}"
+
+        if sub == "move":
+            if len(parts) < 4:
+                return "用法: interlude move <song> <change|to|top|bottom> [num]"
+            r = self._resolve_song(parts[2])
+            if isinstance(r, str):
+                return r
+            _idx, item = r
+            cur = self._find_in_interlude(item)
+            if cur is None:
+                return "该歌曲不在插播队列中"
+            mode = parts[3].lower()
+            n = len(app.interlude_items)
+            try:
+                num = int(parts[4]) if len(parts) > 4 else 0
+            except ValueError:
+                return "参数错误: num 需要整数"
+            if mode == "change":
+                new = cur + num
+            elif mode == "to":
+                new = num - 1  # 目标位（1 起）
+            elif mode == "top":
+                new = 0
+            elif mode == "bottom":
+                new = n - 1
+            else:
+                return "参数错误: move 模式 ∈ {change, to, top, bottom}"
+            new = max(0, min(n - 1, new))
+            if new == cur:
+                return "位置未变化"
+            items = app.interlude_items
+            it = items.pop(cur)
+            items.insert(new, it)
+            self._refresh_interlude()
+            return f"已把 {self._show_name(item)} 移动到第 {new + 1} 位"
+
+        return f"未知 interlude 子指令: {sub}"
+
+    def _resolve_song(self, ref: str):
+        """解析 <song>（num|name）为主列表 (索引, item)。
+
+        数字 → 主列表 1 起序号；名字 → 不含扩展名的文件名精确/前缀匹配。
+        唯一 → 返回 (idx, item)；否则返回错误提示字符串。
+        """
+        app = self.app
+        if not app.audio_items:
+            return "歌曲列表为空"
+        try:
+            val = int(ref)
+        except ValueError:
+            val = None
+        if val is not None:
+            idx = val - 1
+            if idx < 0 or idx >= len(app.audio_items):
+                return f"序号超出范围（1~{len(app.audio_items)}）"
+            return idx, app.audio_items[idx]
+
+        q = ref.strip().lower()
+        items = app.audio_items
+
+        def base(it: dict) -> str:
+            raw = it.get("display") or it.get("path") or ""
+            return os.path.splitext(os.path.basename(raw))[0].lower()
+
+        exact = [i for i, it in enumerate(items) if base(it) == q]
+        hits = exact if exact else [i for i, it in enumerate(items)
+                                    if base(it).startswith(q)]
+        if len(hits) == 1:
+            return hits[0], items[hits[0]]
+        if not hits:
+            return f"未找到: {q}"
+        cands = "\n".join(f"  {n}. {items[i].get('display') or ''}"
+                          for n, i in enumerate(hits, 1))
+        return (f"“{q}” 匹配到 {len(hits)} 首，请用序号或更精确的名字：\n"
+                f"{cands}")
+
+    def _find_in_interlude(self, item: dict) -> int | None:
+        """在插播队列中按 path 查找歌曲位置，找不到返回 None。"""
+        target = item.get("path")
+        for i, it in enumerate(self.app.interlude_items):
+            if it.get("path") == target:
+                return i
+        return None
+
+    def _refresh_interlude(self) -> None:
+        """刷新插播列表显示与按钮状态。"""
+        self.app._refresh_interlude_list()
+        self.app._refresh_il_buttons()
+
+    @staticmethod
+    def _show_name(item: dict) -> str:
+        """歌曲显示名（文件名）。"""
+        return os.path.basename(item.get("display")
+                                or item.get("path") or "")
+
+    # ------------------------------------------------------------------
+    # console
+    # ------------------------------------------------------------------
+
+    def _cmd_console(self, parts: list) -> str:
+        """console clear / exit。"""
+        if len(parts) < 2:
+            return "用法: console <clear|exit>"
+        sub = parts[1].lower()
+        if sub == "clear":
+            self.output.config(state="normal")
+            self.output.delete("1.0", "end")
+            self.output.config(state="disabled")
+            return "输出区已清空"
+        if sub == "exit":
+            self._hide()
+            return "控制台已关闭"
+        return f"未知 console 子指令: {sub}"
+
+    # ------------------------------------------------------------------
     # Tab 补全
     # ------------------------------------------------------------------
 
@@ -524,7 +765,8 @@ class PlayerConsole:
         words = text.split()
         n = len(words) if text.strip() else 0
         if n <= 1:
-            return [w for w in ("open", "play", "song", "set", "help")
+            return [w for w in ("app", "console", "help", "interlude",
+                                "open", "play", "set", "song")
                     if w.startswith(token)]
         if words[0] == "song" and n == 2:
             return [w for w in ("step", "time", "change", "pause", "stop")
@@ -532,6 +774,15 @@ class PlayerConsole:
         if words[0] == "set" and n == 2:
             return [w for w in ("volume", "mode", "rate", "lrc-offset",
                                 "balance", "loudness", "rate-keep", "reset")
+                    if w.startswith(token)]
+        if words[0] == "app" and n == 2:
+            return [w for w in ("topmost", "floatlayer", "exit")
+                    if w.startswith(token)]
+        if words[0] == "interlude" and n == 2:
+            return [w for w in ("add", "clear", "insert", "remove", "move")
+                    if w.startswith(token)]
+        if words[0] == "console" and n == 2:
+            return [w for w in ("clear", "exit")
                     if w.startswith(token)]
         return []
 

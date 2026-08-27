@@ -52,7 +52,7 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac"}
 class LrcPlayerApp:
     """歌词播放器主应用。"""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, initial_file: str | None = None) -> None:
         self.root = root
         try:
             self.root.iconbitmap(resource_path("MP.ico"))
@@ -149,6 +149,22 @@ class LrcPlayerApp:
         # 控制台（创建后隐藏，点击「控制台」按钮显示）
         self.console = PlayerConsole(self)
         self.console.win.withdraw()
+
+        if initial_file and os.path.isfile(initial_file):
+            if self._load_audio_file(initial_file):
+                self._auto_load_lrc(initial_file)
+                self._play()   # 自动开始播放
+
+    def handle_external_file(self, path: str) -> None:
+        """外部进程打开文件时调用的入口（主线程执行）。"""
+        if not os.path.exists(path):
+            return
+        if self._load_audio_file(path):
+            self._auto_load_lrc(path)
+            self._play()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     # ==================================================================
     # 字体 & 样式
