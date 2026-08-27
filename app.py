@@ -32,7 +32,7 @@ BG_COLOR = "#23272E"
 FG_COLOR = "#C8C8C8"
 ACCENT_COLOR = "#6FA3FF"
 SUBTLE_COLOR = "#3A3F46"
-BUTTON_WIDTH = 11
+BUTTON_WIDTH = 10
 TICK_INTERVAL_MS = 10
 
 PLAY_MODES = [
@@ -58,9 +58,23 @@ class LrcPlayerApp:
             self.root.iconbitmap(resource_path("MP.ico"))
         except Exception:
             pass  # 图标文件缺失时不阻塞启动
-        self.root.title("Player PRO V1.6.0")
+        # ---- 屏幕适配：屏幕 <1366x768 时整体缩小，避免溢出 ----
+        self.screen_w = self.root.winfo_screenwidth()
+        self.screen_h = self.root.winfo_screenheight()
+        self.small_screen = self.screen_w < 1366 or self.screen_h < 768
+        base_scale = min(1.0, self.screen_w / 1366.0, self.screen_h / 768.0)
+        if self.small_screen:
+            # 小屏：基础比例上再缩小 15%（×0.85），下限 0.65
+            self.ui_scale = max(0.65, base_scale * 0.85)
+        else:
+            self.ui_scale = 1.0
+
+        title = "Player PRO V1.6.2"
+        if self.small_screen:
+            title += " 缩小兼容模式"
+        self.root.title(title)
         self.root.configure(bg=BG_COLOR)
-        self.root.minsize(1380, 600)
+        self.root.minsize(self._px(1380), self._px(600))
         self.root.resizable(True, True)
 
         # ---- 音频引擎 ----
@@ -116,17 +130,17 @@ class LrcPlayerApp:
         self._adv_dragging = False
         self._adv_active: str | None = None
 
-        # ---- 字体 ----
-        self.title_font = self._pick_font("汉仪文黑-85W", 18)
-        self.lyric_font = self._pick_font("汉仪文黑-85W", 13)
-        self.info_font = self._pick_font("Jetbrains Mono", 11)
-        self.list_font = self._pick_font("汉仪文黑-85W", 11)
-        self.button_font = self._pick_font("汉仪文黑-85W", 12)
-        self.button_font_sm = self._pick_font("汉仪文黑-85W", 10)
-        self.overlay_name_font = self._pick_font("汉仪文黑-85W", 20)
-        self.overlay_artist_font = self._pick_font("汉仪文黑-85W", 14)
-        self.overlay_lyric_big_font = self._pick_font("汉仪文黑-85W", 24)
-        self.overlay_lyric_small_font = self._pick_font("汉仪文黑-85W", 13)
+        # ---- 字体（小屏按 ui_scale 缩放）----
+        self.title_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
+        self.lyric_font = self._pick_font("汉仪文黑-85W", self._font_size(13))
+        self.info_font = self._pick_font("Jetbrains Mono", self._font_size(11))
+        self.list_font = self._pick_font("汉仪文黑-85W", self._font_size(11))
+        self.button_font = self._pick_font("汉仪文黑-85W", self._font_size(12))
+        self.button_font_sm = self._pick_font("汉仪文黑-85W", self._font_size(10))
+        self.overlay_name_font = self._pick_font("汉仪文黑-85W", self._font_size(20))
+        self.overlay_artist_font = self._pick_font("汉仪文黑-85W", self._font_size(14))
+        self.overlay_lyric_big_font = self._pick_font("汉仪文黑-85W", self._font_size(24))
+        self.overlay_lyric_small_font = self._pick_font("汉仪文黑-85W", self._font_size(13))
 
         # ---- 构建 ----
         self._configure_style()
@@ -169,6 +183,14 @@ class LrcPlayerApp:
     # ==================================================================
     # 字体 & 样式
     # ==================================================================
+
+    def _px(self, v: int, min_px: int = 0) -> int:
+        """按 ui_scale 缩放像素尺寸（可设下限，如操作栏最小 260px）。"""
+        return max(min_px, int(round(v * self.ui_scale)))
+
+    def _font_size(self, n: int) -> int:
+        """按 ui_scale 缩放字号（下限 8，避免过小）。"""
+        return max(8, int(round(n * self.ui_scale)))
 
     def _pick_font(self, family: str, size: int, weight: str = "normal") -> tkfont.Font:
         """查找可用字体，降级到系统默认。"""
@@ -213,7 +235,8 @@ class LrcPlayerApp:
     def _build_ui(self) -> None:
         """左右双栏布局：左侧主控区，右侧封面+插播列表+按钮区。"""
         outer = tk.Frame(self.root, bg=BG_COLOR)
-        outer.pack(fill="both", expand=True, padx=18, pady=8)
+        outer.pack(fill="both", expand=True,
+                   padx=self._px(18), pady=self._px(8))
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=0)
         outer.rowconfigure(0, weight=1)
@@ -226,7 +249,8 @@ class LrcPlayerApp:
         self._build_button_rows(left_col)
 
         # 拖拽取消条（初始隐藏，拖动进度条时显示）
-        self._cancel_frame = tk.Frame(left_col, bg="#6B1010", height=40)
+        self._cancel_frame = tk.Frame(left_col, bg="#6B1010",
+                                      height=self._px(40))
         self._cancel_label = tk.Label(
             self._cancel_frame, text="拖动到此处以取消",
             bg="#6B1010", fg="#FF5555", font=self.title_font)
@@ -238,14 +262,14 @@ class LrcPlayerApp:
         self._build_bottom_panels(self.bottom_frame)
 
         # ---- 右栏（固定宽度；子控件为 pack，须用 pack_propagate 保持定宽）----
-        right_col = tk.Frame(outer, bg=BG_COLOR, width=260)
-        right_col.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        right_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(260))
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(self._px(12), 0))
         right_col.pack_propagate(False)
         self._build_right_column(right_col)
 
-        # ---- 操作区（固定宽度：倍速 / 音量 / 高级功能）----
-        op_col = tk.Frame(outer, bg=BG_COLOR, width=340)
-        op_col.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
+        # ---- 操作区（固定宽度：倍速 / 音量 / 高级功能；小屏优先缩短，最小 260px）----
+        op_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(340, 260))
+        op_col.grid(row=0, column=2, sticky="nsew", padx=(self._px(12), 0))
         op_col.pack_propagate(False)  # 子控件为 pack，须用 pack_propagate 保持定宽
         self._build_operation_area(op_col)
 
@@ -254,16 +278,17 @@ class LrcPlayerApp:
 
     def _build_status_bar(self) -> None:
         """窗口底部状态栏：程序状态、音频信息、音量、列表统计。"""
-        bar = tk.Frame(self.root, bg=SUBTLE_COLOR, height=24)
+        bar = tk.Frame(self.root, bg=SUBTLE_COLOR, height=self._px(24))
         bar.pack(side="bottom", fill="x")
         bar.pack_propagate(False)
 
-        status_font = tkfont.Font(family="Segoe UI", size=10)
+        status_font = tkfont.Font(family="Segoe UI", size=self._font_size(10))
         lbl_cfg = dict(bg=SUBTLE_COLOR, fg=FG_COLOR, font=status_font,
                        anchor="w", padx=6)
 
         # 程序状态 + 文字进度条（w=210）
-        prog_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=210, height=24)
+        prog_frame = tk.Frame(bar, bg=SUBTLE_COLOR,
+                              width=self._px(210), height=self._px(24))
         prog_frame.pack(side="left")
         prog_frame.pack_propagate(False)
         self._prog_var = tk.StringVar(value="就绪")
@@ -274,7 +299,8 @@ class LrcPlayerApp:
         status_sep(bar)
 
         # 音频设备（w=260，显示输出设备名）
-        audio_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=260, height=24)
+        audio_frame = tk.Frame(bar, bg=SUBTLE_COLOR,
+                               width=self._px(260), height=self._px(24))
         audio_frame.pack(side="left")
         audio_frame.pack_propagate(False)
         self._audio_var = tk.StringVar(value=self._read_audio_info())
@@ -285,7 +311,8 @@ class LrcPlayerApp:
         status_sep(bar)
 
         # 歌曲列表统计（w=130）
-        list_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=130, height=24)
+        list_frame = tk.Frame(bar, bg=SUBTLE_COLOR,
+                              width=self._px(130), height=self._px(24))
         list_frame.pack(side="left")
         list_frame.pack_propagate(False)
         self._liststat_var = tk.StringVar(value="共 0 首")
@@ -296,13 +323,27 @@ class LrcPlayerApp:
         status_sep(bar)
 
         # 插播统计（w=85）
-        il_frame = tk.Frame(bar, bg=SUBTLE_COLOR, width=85, height=24)
+        il_frame = tk.Frame(bar, bg=SUBTLE_COLOR,
+                            width=self._px(85), height=self._px(24))
         il_frame.pack(side="left")
         il_frame.pack_propagate(False)
         self._ilst_var = tk.StringVar(value="插播: 0")
         il_lbl = tk.Label(il_frame, textvariable=self._ilst_var, **lbl_cfg)
         il_lbl.pack(fill="both", expand=True)
         bind_tooltip(il_lbl, self._ilst_var, self, status_font)
+
+        # 小屏：状态栏右侧黄色提示当前分辨率
+        if self.small_screen:
+            small_frame = tk.Frame(bar, bg=SUBTLE_COLOR,
+                                   width=self._px(150), height=self._px(24))
+            small_frame.pack(side="right")
+            small_frame.pack_propagate(False)
+            self._smallscr_var = tk.StringVar(
+                value=f"小屏 {self.screen_w}x{self.screen_h}")
+            small_lbl = tk.Label(small_frame, textvariable=self._smallscr_var,
+                                 bg=SUBTLE_COLOR, fg="#FFD54F",
+                                 font=status_font, anchor="e", padx=6)
+            small_lbl.pack(fill="both", expand=True)
 
         # 初始刷新
         self._refresh_status_bar()
@@ -364,8 +405,8 @@ class LrcPlayerApp:
             activebackground=ACCENT_COLOR,
             activeforeground=BG_COLOR,
             relief="flat",
-            padx=10,
-            pady=6,
+            padx=self._px(8),
+            pady=self._px(5),
         )
 
         # ---- 第一行 ----
@@ -378,20 +419,20 @@ class LrcPlayerApp:
 
         self.prev_btn = tk.Button(
             row1, text="上一曲", command=self._prev_track, **btn_cfg)
-        self.prev_btn.pack(side="left", padx=(8, 0))
+        self.prev_btn.pack(side="left", padx=(self._px(6), 0))
 
         self.play_pause_btn = tk.Button(
             row1, text="播放", command=self._toggle_play_pause, **btn_cfg)
-        self.play_pause_btn.pack(side="left", padx=(8, 0))
+        self.play_pause_btn.pack(side="left", padx=(self._px(6), 0))
 
         self.next_btn = tk.Button(
             row1, text="下一曲", command=self._next_track, **btn_cfg)
-        self.next_btn.pack(side="left", padx=(8, 0))
+        self.next_btn.pack(side="left", padx=(self._px(6), 0))
 
         mode_label = PLAY_MODES[self.play_mode_index][0]
         self.mode_btn = tk.Button(
             row1, text=f"模式: {mode_label}", command=self._toggle_play_mode, **btn_cfg)
-        self.mode_btn.pack(side="left", padx=(8, 0))
+        self.mode_btn.pack(side="left", padx=(self._px(6), 0))
 
         # ---- 第二行 ----
         row2 = tk.Frame(self._btn_container, bg=BG_COLOR)
@@ -403,19 +444,19 @@ class LrcPlayerApp:
 
         self.back_10s_btn = tk.Button(
             row2, text="后退10s", command=self._seek_back_10s, **btn_cfg)
-        self.back_10s_btn.pack(side="left", padx=(8, 0))
+        self.back_10s_btn.pack(side="left", padx=(self._px(6), 0))
 
         self.stop_btn = tk.Button(
             row2, text="停止", command=self._stop, **btn_cfg)
-        self.stop_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn.pack(side="left", padx=(self._px(6), 0))
 
         self.forward_10s_btn = tk.Button(
             row2, text="前进10s", command=self._seek_forward_10s, **btn_cfg)
-        self.forward_10s_btn.pack(side="left", padx=(8, 0))
+        self.forward_10s_btn.pack(side="left", padx=(self._px(6), 0))
 
         self.topmost_btn = tk.Button(
             row2, text="置顶: 关", command=self._toggle_topmost, **btn_cfg)
-        self.topmost_btn.pack(side="left", padx=(8, 0))
+        self.topmost_btn.pack(side="left", padx=(self._px(6), 0))
 
     def _build_progress_bar(self, parent: tk.Frame) -> None:
         """进度条 + 右侧时间标签。"""
@@ -491,8 +532,8 @@ class LrcPlayerApp:
 
         # 列宽策略：第 0 列（文件名/专辑）弹性伸缩，右边三栏定宽
         info_outer.columnconfigure(0, weight=1)
-        # 右边三栏的固定列宽（像素）
-        _FIXED_COL_WIDTHS = {1: 120, 2: 100, 3: 160}
+        # 右边三栏的固定列宽（像素，按 ui_scale 缩放）
+        _FIXED_COL_WIDTHS = {1: self._px(120), 2: self._px(100), 3: self._px(160)}
 
         self.song_info_labels: dict[str, tk.StringVar] = {}
         self._song_info_val_widgets: dict[str, tk.Label] = {}
@@ -520,8 +561,8 @@ class LrcPlayerApp:
 
             # 右边三栏固定宽度，超出裁剪
             if col > 0:
-                w = _FIXED_COL_WIDTHS.get(col, 75)
-                seg.config(width=w, height=22)
+                w = _FIXED_COL_WIDTHS.get(col, self._px(75))
+                seg.config(width=w, height=self._px(22))
                 seg.pack_propagate(False)
 
             # 悬停显示完整文本
@@ -588,8 +629,9 @@ class LrcPlayerApp:
         self.interlude_list.bind("<<ListboxSelect>>",
                                 lambda e: self._on_interlude_select())
 
-        # ---- 专辑封面（固定 220×220，与图片尺寸一致，避免灰边）----
-        cover_frame = tk.Frame(parent, bg=BG_COLOR, height=220, width=220)
+        # ---- 专辑封面（固定 220×220，与图片尺寸一致，避免灰边；小屏缩放）----
+        cover_frame = tk.Frame(parent, bg=BG_COLOR,
+                               height=self._px(220), width=self._px(220))
         cover_frame.pack(side="bottom", fill="x", pady=(0, 8))
         cover_frame.pack_propagate(False)
         self.cover_label = tk.Label(
@@ -645,7 +687,7 @@ class LrcPlayerApp:
         self._speed_preview.pack(side="right", padx=(10, 0))
 
         # 拖拽条（拖动时覆盖标题行）：左半取消（红）/ 右半重置（蓝）
-        self._speed_drag_bar = tk.Frame(speed_frame, height=36)
+        self._speed_drag_bar = tk.Frame(speed_frame, height=self._px(36))
         self._speed_cancel_part = tk.Frame(self._speed_drag_bar, bg="#6B1010")
         self._speed_cancel_part.pack(side="left", fill="both", expand=True)
         tk.Label(self._speed_cancel_part, text="取消",
@@ -699,7 +741,8 @@ class LrcPlayerApp:
         self._console_btn.pack(side="right")
 
         # 蓝色重置条（拖动任一高级滑块时覆盖标题行）
-        self._adv_reset = tk.Frame(adv_frame, bg="#1F3A8A", height=36)
+        self._adv_reset = tk.Frame(adv_frame, bg="#1F3A8A",
+                                   height=self._px(36))
         tk.Label(self._adv_reset, text="重置", bg="#1F3A8A", fg="#6FA3FF",
                  font=self.button_font_sm).pack(expand=True)
 
@@ -921,7 +964,7 @@ class LrcPlayerApp:
             self._refresh_overlay_header()
             return
         data = extract_cover_art(path)
-        photo = cover_to_tk_image(data) if data else None
+        photo = cover_to_tk_image(data, self._px(220)) if data else None
         if photo:
             self._cover_photo = photo
             self.cover_label.config(image=photo, text="")
@@ -1317,12 +1360,12 @@ class LrcPlayerApp:
         self._clear_song_info()
         self._update_controls_state()
 
-        # 显示底部面板 + 首次扫描调整窗口尺寸并锁定最小宽度
+        # 显示底部面板 + 首次扫描调整窗口尺寸并锁定最小宽度（小屏按比例缩放）
         self.bottom_frame.pack(fill="both", expand=True, pady=(6, 0))
         if not self._first_scan_done:
             self._first_scan_done = True
-            self.root.geometry("1380x600")
-            self.root.minsize(1380, 600)
+            self.root.geometry(f"{self._px(1380)}x{self._px(600)}")
+            self.root.minsize(self._px(1380), self._px(600))
 
         # 启动后台扫描线程
         self._bg_cache_gen += 1
