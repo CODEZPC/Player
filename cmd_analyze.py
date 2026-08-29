@@ -15,7 +15,7 @@ def send_to_existing(action: str, data: str = "") -> bool:
     """尝试连接已有实例，发送指令（OPEN 或 SHOW）。成功返回 True。"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
+        sock.settimeout(0.5)  # 本机 loopback：0.5s 足够判定；避免无实例时挂满超时
         sock.connect((IPC_HOST, IPC_PORT))
         payload = f"{action}|{data}".encode("utf-8")
         sock.sendall(payload)
@@ -74,35 +74,21 @@ def _start_ipc_listener(app_instance: LrcPlayerApp) -> None:
 
 def run_app(root: tk.Tk, initial_file: str | None = None,
             splash: tk.Toplevel | None = None) -> None:
-    """应用启动入口（处理单实例与文件打开）。
+    """应用启动入口。
 
     root 由调用方（main.py）创建并已隐藏（withdraw）；
     splash 为启动画面（Toplevel，可空）。
+    单实例检查已由 main.py 在启动画面期间并行完成，这里不再重复。
     """
-    # 1. 有文件参数：尝试发给已有实例
-    if initial_file:
-        if send_to_existing("OPEN", initial_file):
-            print(f"已将文件发送至已运行的播放器: {initial_file}")
-            _close_splash(splash)
-            root.destroy()
-            return
-    else:
-        # 2. 无参数（双击 exe / 从菜单启动）：尝试唤醒已有实例
-        if send_to_existing("SHOW", ""):
-            print("已唤醒已运行的播放器。")
-            _close_splash(splash)
-            root.destroy()
-            return
-
-    # 3. 没有已有实例，启动新应用
+    # 1. 构建主应用
     app = LrcPlayerApp(root, initial_file=initial_file)
 
-    # 4. 关闭启动画面，显示主窗口
+    # 2. 关闭启动画面，显示主窗口
     _close_splash(splash)
     root.deiconify()
     root.lift()
 
-    # 5. 启动 IPC 服务，让后续进程能找到本实例
+    # 3. 启动 IPC 服务，让后续进程能找到本实例
     _start_ipc_listener(app)
 
     root.protocol("WM_DELETE_WINDOW", app.on_close)
