@@ -69,7 +69,7 @@ class LrcPlayerApp:
         else:
             self.ui_scale = 1.0
 
-        title = "Player PRO V1.6.2"
+        title = "Player PRO V1.6.4"
         if self.small_screen:
             title += " 缩小兼容模式"
         self.root.title(title)
@@ -127,6 +127,7 @@ class LrcPlayerApp:
         self.play_mode_index = 0
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
         self._speed_dragging = False
+        self._pitch_dragging = False
         self._adv_dragging = False
         self._adv_active: str | None = None
 
@@ -362,9 +363,25 @@ class LrcPlayerApp:
                        lambda e: (self._toggle_fullscreen(), "break")[1])
 
     def _toggle_fullscreen(self) -> None:
-        """切换全屏状态。"""
-        state = not self.root.attributes("-fullscreen")
+        """切换全屏状态。
+
+        Windows 上 Tk 进入全屏会自动置顶（-topmost），但退出全屏不会自动恢复，
+        导致窗口残留置顶状态。因此进入全屏前记录置顶状态，退出时恢复并同步按钮。
+        """
+        state = not bool(self.root.attributes("-fullscreen"))
+        if state:
+            # 进入全屏：记录原置顶状态
+            self._saved_fullscreen_topmost = bool(
+                self.root.attributes("-topmost"))
         self.root.attributes("-fullscreen", state)
+        if not state:
+            # 退出全屏：恢复进入全屏前的置顶状态，避免错误置顶
+            prev = getattr(self, "_saved_fullscreen_topmost",
+                           self.always_on_top)
+            self.root.attributes("-topmost", prev)
+            self.always_on_top = bool(prev)
+            self.topmost_btn.config(
+                text="置顶: 开" if prev else "置顶: 关")
 
     def _build_header(self, parent: tk.Frame) -> None:
         """顶部：当前歌词行 + 音视频信息行。"""
@@ -699,6 +716,38 @@ class LrcPlayerApp:
                  bg="#1F3A8A", fg="#6FA3FF",
                  font=self.button_font_sm).pack(expand=True)
 
+        # ---- 音高区（移调：变调不变速，±12 半音）----
+        pitch_frame = tk.Frame(parent, bg=BG_COLOR)
+        pitch_frame.pack(side="top", fill="x", pady=(0, 18))
+
+        # 第一行：标题（拖动音高滑块时重置条覆盖区）
+        self._pitch_cancel_row = tk.Frame(pitch_frame, bg=BG_COLOR)
+        self._pitch_cancel_row.pack(fill="x")
+        tk.Label(self._pitch_cancel_row, text="音高（LAB）", bg=BG_COLOR,
+                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
+
+        # 蓝色重置条（拖动音高滑块时覆盖标题行）
+        self._pitch_reset = tk.Frame(pitch_frame, bg="#1F3A8A",
+                                     height=self._px(36))
+        tk.Label(self._pitch_reset, text="重置", bg="#1F3A8A", fg="#6FA3FF",
+                 font=self.button_font_sm).pack(expand=True)
+
+        # 第二行：滑块 + 数值（数值在右侧）
+        pitch_row = tk.Frame(pitch_frame, bg=BG_COLOR)
+        pitch_row.pack(fill="x", pady=(2, 0))
+        self._pitch_var = tk.DoubleVar(value=0.0)
+        self._pitch_scale = ttk.Scale(
+            pitch_row, style="LRC.Horizontal.TScale", orient="horizontal",
+            from_=-12, to=12, variable=self._pitch_var,
+            command=self._on_pitch_changed)
+        self._pitch_scale.pack(side="left", fill="x", expand=True)
+        self._pitch_scale.bind("<ButtonPress-1>", self._on_pitch_press)
+        self._pitch_scale.bind("<ButtonRelease-1>", self._on_pitch_release)
+        self._pitch_preview = tk.Label(
+            pitch_row, text="0", width=6, bg=BG_COLOR, fg=FG_COLOR,
+            font=self.info_font, anchor="e")
+        self._pitch_preview.pack(side="right", padx=(10, 0))
+
         # ---- 音量区（无取消，拖动实时生效）----
         vol_frame = tk.Frame(parent, bg=BG_COLOR)
         vol_frame.pack(side="top", fill="x")
@@ -836,6 +885,46 @@ class LrcPlayerApp:
         on = not self.engine.get_pitch_fix()
         self.engine.set_pitch_fix(on)
         self._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
+
+    def _on_pitch_press(self, _event: tk.Event) -> None:
+        """音高滑块拖动开始：显示蓝色重置条覆盖标题行。"""
+        if not self.engine.ready or not self.audio_path:
+            return
+        if self.engine.backend != "sounddevice":
+            return
+        self._pitch_dragging = True
+        self._pitch_reset.place(in_=self._pitch_cancel_row,
+                                relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _on_pitch_changed(self, value: str) -> None:
+        """音高移调拖动中：吸附到整数半音并实时生效。"""
+        if not self._pitch_dragging:
+            return
+        v = int(round(float(value)))
+        v = max(-12, min(12, v))
+        self._pitch_var.set(v)
+        self.engine.set_pitch_shift(v)
+        self._pitch_preview.config(text=f"{v:+d}",
+                                   fg=self._pitch_color(v))
+
+    def _on_pitch_release(self, _event: tk.Event) -> None:
+        """音高滑块拖动结束：松手在重置条内则重置为 0，否则保持当前值。"""
+        if not self._pitch_dragging:
+            return
+        self._pitch_dragging = False
+        self._pitch_reset.place_forget()
+        if self._is_pointer_in_cancel(self._pitch_reset):
+            self._pitch_var.set(0)
+            self.engine.set_pitch_shift(0)
+            self._pitch_preview.config(text="+0", fg=FG_COLOR)
+
+    def _pitch_color(self, v: int) -> str:
+        """音高移调数值颜色：偏离 0 越大越偏黄（警示）。"""
+        p = min(1.0, abs(v) / 12.0)
+        r = int(0xC8 + (0xFF - 0xC8) * p)
+        g = int(0xC8 + (0xD5 - 0xC8) * p)
+        b = int(0xC8 + (0x4F - 0xC8) * p)
+        return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
     def _toggle_console(self) -> None:
         """打开/关闭控制台窗口。"""
@@ -1235,8 +1324,8 @@ class LrcPlayerApp:
             btn.config(state="disabled")
 
     def _disable_op_controls(self) -> None:
-        """非 sounddevice 后端时禁用倍速/保音高/平衡/增益控件（音量保留）。"""
-        for w in (self._speed_scale, self._pitch_btn,
+        """非 sounddevice 后端时禁用倍速/保音高/音高/平衡/增益控件（音量保留）。"""
+        for w in (self._speed_scale, self._pitch_btn, self._pitch_scale,
                   self._balance_scale, self._gain_scale):
             try:
                 w.config(state="disabled")
@@ -1258,8 +1347,8 @@ class LrcPlayerApp:
                   self.seek_scale):
             w.config(state=state)
 
-        # 倍速/保音高/平衡/增益：仅 sounddevice 后端可用
-        op_widgets = (self._speed_scale, self._pitch_btn,
+        # 倍速/保音高/音高/平衡/增益：仅 sounddevice 后端可用
+        op_widgets = (self._speed_scale, self._pitch_btn, self._pitch_scale,
                       self._balance_scale, self._gain_scale)
         if self.engine.backend == "sounddevice":
             for w in op_widgets:

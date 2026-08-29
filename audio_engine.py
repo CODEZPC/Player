@@ -197,6 +197,7 @@ class AudioEngine:
         self._balance = 0.0   # 声道平衡：-1 全左 ~ +1 全右
         self._gain = 1.0      # 响度增益（前置放大）：0 ~ 2
         self._pitch_fix = False
+        self._pitch_shift = 0.0  # 音高移调（半音，-12 ~ +12，0=原始；变调不变速）
         self._pv: PhaseVocoder | None = None
         self._pv_spill: np.ndarray = np.empty((0, 2), dtype=np.float32)
 
@@ -273,8 +274,10 @@ class AudioEngine:
                     self._eof = False
                     self._paused = False
                     self._pv_spill = np.empty((0, self._ch), dtype=np.float32)
-                    self._pv = (PhaseVocoder(self._ch, 1.0 / self._speed)
-                                if self._pitch_fix else None)
+                    self._pv = (PhaseVocoder(self._ch, self._pv_factor())
+                                if (self._pitch_fix
+                                    or abs(self._pitch_shift) > 1e-9)
+                                else None)
                     self._stream = sd.OutputStream(
                         samplerate=self._sr, channels=self._ch,
                         dtype="float32", callback=self._callback,
@@ -383,14 +386,46 @@ class AudioEngine:
     def set_speed(self, speed: float) -> None:
         """设置倍速（0.01 ~ 10.0）。pygame 后端不支持，忽略。"""
         self._speed = max(0.01, min(10.0, float(speed)))
-        if self.backend == "sounddevice" and self._pitch_fix and self._sf:
+        if (self.backend == "sounddevice" and self._sf
+                and (self._pitch_fix or abs(self._pitch_shift) > 1e-9)):
             with self._lock:
-                self._pv = PhaseVocoder(self._ch, 1.0 / self._speed)
+                self._pv = PhaseVocoder(self._ch, self._pv_factor())
                 self._pv_spill = np.empty((0, self._ch), dtype=np.float32)
 
     def get_speed(self) -> float:
         """当前倍速。"""
         return self._speed
+
+    def set_pitch_shift(self, semitones: float) -> None:
+        """设置音高移调（-12 ~ +12 半音，0=原始；变调不变速）。
+
+        仅 sounddevice 后端生效。移调非 0 时强制进入相位声码器链路，
+        即使未开「保音高」也保持速度不变（读侧重采样改音高 + PV 补偿）。
+        """
+        self._pitch_shift = max(-12.0, min(12.0, float(semitones)))
+        if self.backend == "sounddevice" and self._sf:
+            with self._lock:
+                self._pv = (PhaseVocoder(self._ch, self._pv_factor())
+                            if (self._pitch_fix
+                                or abs(self._pitch_shift) > 1e-9)
+                            else None)
+                self._pv_spill = np.empty((0, self._ch), dtype=np.float32)
+
+    def get_pitch_shift(self) -> float:
+        """当前音高移调（半音）。"""
+        return self._pitch_shift
+
+    def _pitch_ratio(self) -> float:
+        """移调比例：2^(半音/12)。"""
+        return 2.0 ** (self._pitch_shift / 12.0)
+
+    def _pv_factor(self) -> float:
+        """相位声码器因子：ratio / speed（移调 + 倍速组合）。
+
+        读取步长 = ratio（音高 ×ratio），PV factor = ratio/speed：
+        速度 = 源前进/输出 = (need×ratio)/(need×factor) = speed。
+        """
+        return self._pitch_ratio() / self._speed
 
     def set_volume(self, volume: float) -> None:
         """设置音量（0.0 ~ 1.0）。"""
@@ -426,8 +461,10 @@ class AudioEngine:
         self._pitch_fix = bool(on)
         if self.backend == "sounddevice" and self._sf:
             with self._lock:
-                self._pv = (PhaseVocoder(self._ch, 1.0 / self._speed)
-                            if self._pitch_fix else None)
+                self._pv = (PhaseVocoder(self._ch, self._pv_factor())
+                            if (self._pitch_fix
+                                or abs(self._pitch_shift) > 1e-9)
+                            else None)
                 self._pv_spill = np.empty((0, self._ch), dtype=np.float32)
 
     def get_pitch_fix(self) -> bool:
@@ -446,7 +483,8 @@ class AudioEngine:
             return
         try:
             with self._lock:
-                if self._pitch_fix and self._pv is not None:
+                if (self._pitch_fix or abs(self._pitch_shift) > 1e-9) \
+                        and self._pv is not None:
                     self._callback_pitch(outdata, frames)
                 else:
                     self._callback_simple(outdata, frames)
@@ -466,6 +504,24 @@ class AudioEngine:
                            dtype=np.float32)
             data = np.concatenate([data, pad], axis=0)
         return data
+
+    def _read_resampled(self, start: float, count: int, step: float
+                        ) -> np.ndarray:
+        """从源位置 start 以步长 step 重采样读取 count 帧（线性插值，不足补零）。"""
+        if self._sf is None or count <= 0:
+            return np.zeros((count, self._ch), dtype=np.float32)
+        if start >= self._total_frames:
+            return np.zeros((count, self._ch), dtype=np.float32)
+        idx = start + np.arange(count, dtype=np.float64) * step
+        i0 = np.minimum(idx.astype(np.int64), self._total_frames - 1)
+        i1 = np.minimum(i0 + 1, self._total_frames - 1)
+        lo = int(np.floor(idx[0])) if count else 0
+        hi = int(np.max(i1)) + 1
+        chunk = self._read_range(lo, hi - lo)
+        rel0 = i0 - lo
+        rel1 = i1 - lo
+        frac = (idx - i0).astype(np.float32)[:, None]
+        return chunk[rel0] + (chunk[rel1] - chunk[rel0]) * frac
 
     def _callback_simple(self, outdata: np.ndarray, frames: int) -> None:
         """简单变速：线性插值重采样（音高随速度变化）。"""
@@ -494,14 +550,19 @@ class AudioEngine:
             self._eof = True
 
     def _callback_pitch(self, outdata: np.ndarray, frames: int) -> None:
-        """保音高变速：输入经相位声码器伸缩后再输出。"""
+        """变调不变速（含倍速）：读取时按移调比例重采样，再经相位声码器补偿速度。
+
+        读取步长 = ratio（音高 ×ratio），need = frames×speed/ratio 帧；
+        PV factor = ratio/speed，输出 need×factor = frames 帧 → 速度 = speed。
+        """
         if self._pos_frames >= self._total_frames:
             self._eof = True
             outdata.fill(0.0)
             return
-        need = int(np.ceil(frames * self._speed))
-        chunk = self._read_range(int(self._pos_frames), need)
-        self._pos_frames += need
+        ratio = self._pitch_ratio()
+        need = int(np.ceil(frames * self._speed / ratio))
+        chunk = self._read_resampled(self._pos_frames, need, ratio)
+        self._pos_frames += need * ratio
         stretched = self._pv.process(chunk)
         if self._pv_spill.size:
             self._pv_spill = np.concatenate([self._pv_spill, stretched],

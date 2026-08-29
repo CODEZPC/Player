@@ -49,6 +49,7 @@ class PlayerConsole:
         "  set balance <-1~1>                声道平衡（0.01 步进）\n"
         "  set loudness <0~3>                响度增益（0.01 步进）\n"
         "  set rate-keep <true/false>        保音高\n"
+        "  set pitch <-12~12>                音高移调（半音，变调不变速）\n"
         "  set <obj> reset / set reset       重置单项 / 全部重置\n"
         "  app topmost <true/false>          窗口置顶开关\n"
         "  app floatlayer                    开关歌词浮层\n"
@@ -410,7 +411,7 @@ class PlayerConsole:
         if obj == "reset":
             outs = [self._cmd_set([parts[0], o, "reset"])
                     for o in ("volume", "mode", "rate", "lrc-offset",
-                              "balance", "loudness", "rate-keep")]
+                              "balance", "loudness", "rate-keep", "pitch")]
             return "已重置全部:\n" + "\n".join(outs)
 
         if len(parts) < 3:
@@ -505,6 +506,18 @@ class PlayerConsole:
             app._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
             return f"保音高: {'开' if on else '关'}"
 
+        if obj == "pitch":
+            try:
+                t = int(round(float(parts[2])))
+            except ValueError:
+                return "参数错误: pitch 需要 -12~12 的整数"
+            t = max(-12, min(12, t))
+            app.engine.set_pitch_shift(t)
+            app._pitch_var.set(t)
+            app._pitch_preview.config(text=f"{t:+d}",
+                                      fg=app._pitch_color(t))
+            return f"音高: {t:+d} 半音"
+
         return f"未知 set 对象: {obj}（输入 help 查看）"
 
     def _set_reset_one(self, obj: str) -> str:
@@ -517,6 +530,7 @@ class PlayerConsole:
             "balance": "0",
             "loudness": "1.0",
             "rate-keep": "false",
+            "pitch": "0",
         }
         if obj not in defaults:
             return f"未知 set 对象: {obj}（输入 help 查看）"
@@ -773,7 +787,8 @@ class PlayerConsole:
                     if w.startswith(token)]
         if words[0] == "set" and n == 2:
             return [w for w in ("volume", "mode", "rate", "lrc-offset",
-                                "balance", "loudness", "rate-keep", "reset")
+                                "balance", "loudness", "rate-keep", "pitch",
+                                "reset")
                     if w.startswith(token)]
         if words[0] == "app" and n == 2:
             return [w for w in ("topmost", "floatlayer", "exit")
