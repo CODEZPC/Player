@@ -63,17 +63,17 @@ class SplashWindow(tk.Toplevel):
             self._icon_photo = photo  # 防止被 GC
         else:
             tk.Label(self, text="♪",
-                     font=tkfont.Font(family="Segoe UI", size=42),
+                     font=tkfont.Font(family="Jetbrains mono", size=42),
                      fg=SPLASH_ACCENT, bg=SPLASH_BG).pack(pady=(30, 0))
 
         # 应用名
         tk.Label(self, text=app_name,
-                 font=tkfont.Font(family="Segoe UI", size=24, weight="bold"),
+                 font=tkfont.Font(family="Jetbrains mono", size=24, weight="bold"),
                  fg=SPLASH_FG, bg=SPLASH_BG).pack()
 
         # 版本号
         tk.Label(self, text=f"V{version}\n启动中……",
-                 font=tkfont.Font(family="Segoe UI", size=11),
+                 font=tkfont.Font(family="Jetbrains mono", size=11),
                  fg=SPLASH_ACCENT, bg=SPLASH_BG).pack(pady=(2, 20))
 
         # 加载进度条（不定模式，滚动动画）
@@ -95,12 +95,6 @@ class SplashWindow(tk.Toplevel):
         self._bar.pack(pady=(0, 14))
         self._bar.start(25)
 
-        # 底部状态文字
-        self._status_var = tk.StringVar(value="正在加载…")
-        tk.Label(self, textvariable=self._status_var,
-                 font=tkfont.Font(family="Segoe UI", size=10),
-                 fg=SPLASH_MUTED, bg=SPLASH_BG).pack(side="bottom", pady=14)
-
     def _load_icon(self) -> ImageTk.PhotoImage | None:
         """加载 MP.ico 并缩放到 72x72；失败返回 None。"""
         if not _HAS_PIL:
@@ -115,11 +109,6 @@ class SplashWindow(tk.Toplevel):
     # ---------------------------------------------------------------
     # 对外接口
     # ---------------------------------------------------------------
-
-    def set_status(self, text: str) -> None:
-        """更新底部状态文本（可选，供调用方在预热阶段提示）。"""
-        if self._status_var is not None:
-            self._status_var.set(text)
 
     def close(self) -> None:
         """停止动画并销毁启动画面（幂等，容错已销毁的 Tcl 对象）。"""
