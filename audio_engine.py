@@ -295,8 +295,10 @@ class AudioEngine:
         if not self._ready:
             return
         if self.backend == "sounddevice":
-            if start > 0:
-                self.seek(start)
+            # 统一走 seek：同时重置播放位置与 EOF 标记（含 start=0）。
+            # 否则上一曲自然结束后 _pos_frames 停在末尾、_eof 仍为 True，
+            # start=0 时不会重置，回调直接输出静音（表现为"点击播放无反应"）。
+            self.seek(start)
             self._paused = False
             if self._stream and not self._stream.active:
                 self._stream.start()

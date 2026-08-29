@@ -20,6 +20,8 @@ from utils import (
     status_sep,
     bind_tooltip,
     resource_path,
+    APP_NAME,
+    APP_VERSION,
 )
 from console import PlayerConsole
 
@@ -69,7 +71,7 @@ class LrcPlayerApp:
         else:
             self.ui_scale = 1.0
 
-        title = "Player PRO V1.6.4"
+        title = f"{APP_NAME} V{APP_VERSION}"
         if self.small_screen:
             title += " 缩小兼容模式"
         self.root.title(title)

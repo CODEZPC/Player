@@ -72,25 +72,55 @@ def _start_ipc_listener(app_instance: LrcPlayerApp) -> None:
     threading.Thread(target=listener, daemon=True).start()
 
 
-def run_app(initial_file: str | None = None) -> None:
-    """应用启动入口（处理单实例与文件打开）。"""
+def run_app(root: tk.Tk, initial_file: str | None = None,
+            splash: tk.Toplevel | None = None) -> None:
+    """应用启动入口（处理单实例与文件打开）。
+
+    root 由调用方（main.py）创建并已隐藏（withdraw）；
+    splash 为启动画面（Toplevel，可空）。
+    """
     # 1. 有文件参数：尝试发给已有实例
     if initial_file:
         if send_to_existing("OPEN", initial_file):
             print(f"已将文件发送至已运行的播放器: {initial_file}")
+            _close_splash(splash)
+            root.destroy()
             return
     else:
         # 2. 无参数（双击 exe / 从菜单启动）：尝试唤醒已有实例
         if send_to_existing("SHOW", ""):
             print("已唤醒已运行的播放器。")
+            _close_splash(splash)
+            root.destroy()
             return
 
     # 3. 没有已有实例，启动新应用
-    root = tk.Tk()
     app = LrcPlayerApp(root, initial_file=initial_file)
 
-    # 4. 启动 IPC 服务，让后续进程能找到本实例
+    # 4. 关闭启动画面，显示主窗口
+    _close_splash(splash)
+    root.deiconify()
+    root.lift()
+
+    # 5. 启动 IPC 服务，让后续进程能找到本实例
     _start_ipc_listener(app)
 
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
+
+
+def _close_splash(splash: tk.Toplevel | None) -> None:
+    """关闭启动画面（幂等，容错已销毁的 Tcl 对象）。
+
+    优先调用 SplashWindow.close()（会先停动画再销毁）；
+    对不含 close 方法的通用 Toplevel 直接 destroy。
+    """
+    if splash is None:
+        return
+    if hasattr(splash, "close"):
+        splash.close()
+    else:
+        try:
+            splash.destroy()
+        except tk.TclError:
+            pass
