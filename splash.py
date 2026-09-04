@@ -72,8 +72,8 @@ class SplashWindow(tk.Toplevel):
                  fg=SPLASH_FG, bg=SPLASH_BG).pack()
 
         # 版本号
-        tk.Label(self, text=f"V{version}\n启动中……",
-                 font=tkfont.Font(family="Jetbrains mono", size=11),
+        tk.Label(self, text=f"V{version}\n请稍后……",
+                 font=tkfont.Font(family="Jetbrains mono", size=14),
                  fg=SPLASH_ACCENT, bg=SPLASH_BG).pack(pady=(2, 20))
 
         # 加载进度条（不定模式，滚动动画）

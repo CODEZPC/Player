@@ -88,6 +88,13 @@ class LrcPlayerApp:
         self.duration: float | None = None
 
         # ---- 歌曲列表 ----
+        # 多文件夹模型：folder_tabs 保存各已加载文件夹的扫描结果（缓存）；
+        # audio_items / audio_root 恒指向"当前选中文件夹"，其余代码无需感知多文件夹。
+        self.folder_tabs: list[dict] = []          # 每项 {path,title,items,status}
+        self.active_folder_index: int | None = None
+        self._folder_scan_gen: dict[str, int] = {}  # path -> 该文件夹扫描世代
+        self._folder_hover_index: int | None = None
+        self._folder_title: str | None = None        # 当前选中文件夹显示标题
         self.audio_items: list[dict[str, str | int | None]] = []
         self.audio_root: str | None = None
         self.current_song_index: int | None = None
@@ -367,23 +374,30 @@ class LrcPlayerApp:
     def _toggle_fullscreen(self) -> None:
         """切换全屏状态。
 
-        Windows 上 Tk 进入全屏会自动置顶（-topmost），但退出全屏不会自动恢复，
-        导致窗口残留置顶状态。因此进入全屏前记录置顶状态，退出时恢复并同步按钮。
+        Windows 上 Tk 进入全屏会自动置顶（-topmost），但退出全屏不会自动去掉。
+        修复要点（覆盖"未开置顶也莫名置顶"等场景）：
+        - 以 always_on_top（用户意图）为准记录/恢复，而非读取实际 -topmost，
+          避免把 Windows 残留的置顶误记为用户意图；
+        - 用户在全屏期间通过按钮/控制台改动置顶时（_topmost_edited_in_fullscreen），
+          退出后尊重其最新意图，而不是被还原成进入前的旧状态；
+        - 退出全屏时把实际 -topmost 强制同步回 always_on_top，杜绝残留置顶。
         """
         state = not bool(self.root.attributes("-fullscreen"))
         if state:
-            # 进入全屏：记录原置顶状态
-            self._saved_fullscreen_topmost = bool(
-                self.root.attributes("-topmost"))
+            # 进入全屏：记录用户当前的置顶意图，并复位"全屏期间改过置顶"标记
+            self._saved_fullscreen_topmost = self.always_on_top
+            self._topmost_edited_in_fullscreen = False
         self.root.attributes("-fullscreen", state)
         if not state:
-            # 退出全屏：恢复进入全屏前的置顶状态，避免错误置顶
-            prev = getattr(self, "_saved_fullscreen_topmost",
-                           self.always_on_top)
-            self.root.attributes("-topmost", prev)
-            self.always_on_top = bool(prev)
+            # 退出全屏：全屏期间改过则保留最新选择，否则恢复进入前意图
+            if not getattr(self, "_topmost_edited_in_fullscreen", False):
+                self.always_on_top = bool(
+                    getattr(self, "_saved_fullscreen_topmost",
+                            self.always_on_top))
+            # 始终把实际置顶同步为用户意图，杜绝残留
+            self.root.attributes("-topmost", self.always_on_top)
             self.topmost_btn.config(
-                text="置顶: 开" if prev else "置顶: 关")
+                text="置顶: 开" if self.always_on_top else "置顶: 关")
 
     def _build_header(self, parent: tk.Frame) -> None:
         """顶部：当前歌词行 + 音视频信息行。"""
@@ -508,22 +522,34 @@ class LrcPlayerApp:
         time_label.pack(side="right")
 
     def _build_bottom_panels(self, parent: tk.Frame) -> None:
-        """底部纵向布局：上方歌曲列表（全宽），下方歌曲信息条（全宽）+ 播放按钮。"""
+        """底部纵向布局：中部（左=文件夹列表 + 右=歌曲列表）+ 歌曲信息条。"""
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
         parent.rowconfigure(1, weight=0)
         parent.rowconfigure(2, weight=0)
 
-        # ---- 歌曲列表（全宽，占据大部分高度）----
-        list_panel = tk.Frame(parent, bg=BG_COLOR)
-        list_panel.grid(row=0, column=0, sticky="nsew")
+        # ---- 中部：左=文件夹面板（新增，定宽），右=歌曲面板（可伸缩）----
+        middle = tk.Frame(parent, bg=BG_COLOR)
+        middle.grid(row=0, column=0, sticky="nsew")
+        middle.columnconfigure(1, weight=1)
+        middle.rowconfigure(0, weight=1)
 
-        list_label = tk.Label(
-            list_panel, text="歌曲列表", bg=BG_COLOR, fg=FG_COLOR,
+        # 左侧文件夹面板
+        folder_panel = tk.Frame(middle, bg=BG_COLOR, width=self._px(170, 120))
+        folder_panel.grid(row=0, column=0, sticky="nsew", padx=(0, self._px(8)))
+        folder_panel.pack_propagate(False)
+        self._build_folder_panel(folder_panel)
+
+        # 右侧歌曲面板
+        song_panel = tk.Frame(middle, bg=BG_COLOR)
+        song_panel.grid(row=0, column=1, sticky="nsew")
+
+        self._songlist_label = tk.Label(
+            song_panel, text="歌曲列表", bg=BG_COLOR, fg=FG_COLOR,
             font=self.list_font, anchor="w")
-        list_label.pack(anchor="w")
+        self._songlist_label.pack(anchor="w")
 
-        list_inner = tk.Frame(list_panel, bg=BG_COLOR)
+        list_inner = tk.Frame(song_panel, bg=BG_COLOR)
         list_inner.pack(fill="both", expand=True)
 
         self.song_list = tk.Listbox(
@@ -589,6 +615,240 @@ class LrcPlayerApp:
 
         # 初始化空列表
         self._refresh_song_list()
+
+    def _build_folder_panel(self, parent: tk.Frame) -> None:
+        """左侧文件夹面板：标题 + 文件夹 Listbox + 悬浮删除(×)按钮。
+
+        每个文件夹一行；鼠标悬浮到某行时该行右端显示 ×，点击删除该文件夹
+        （正在播放其中的歌曲时保留播放，仅移除列表条目）。
+        """
+        tk.Label(parent, text="文件夹", bg=BG_COLOR, fg=FG_COLOR,
+                 font=self.list_font, anchor="w").pack(anchor="w")
+
+        inner = tk.Frame(parent, bg=BG_COLOR)
+        inner.pack(fill="both", expand=True, pady=(2, 0))
+
+        self.folder_list = tk.Listbox(
+            inner,
+            bg=BG_COLOR, fg=FG_COLOR, font=self.list_font,
+            selectbackground=ACCENT_COLOR, selectforeground=BG_COLOR,
+            highlightthickness=0, relief="flat", activestyle="none",
+            exportselection=False,
+        )
+        self.folder_list.pack(side="left", fill="both", expand=True)
+        fsb = ttk.Scrollbar(inner, command=self.folder_list.yview,
+                            style="LRC.Vertical.TScrollbar")
+        fsb.pack(side="right", fill="y")
+        self.folder_list.config(yscrollcommand=fsb.set)
+
+        self.folder_list.bind("<<ListboxSelect>>", self._on_folder_select)
+        self.folder_list.bind("<Motion>", self._on_folder_motion)
+        self.folder_list.bind("<Leave>", self._on_folder_leave)
+
+        # 悬浮「×」删除按钮：作为 parent 子控件，按 Listbox 行坐标 place
+        self._folder_del_btn = tk.Button(
+            parent, text="×", command=self._remove_hover_folder,
+            bg=SUBTLE_COLOR, fg="#FF7777",
+            activebackground="#6B1010", activeforeground="#FF5555",
+            relief="flat", bd=0, padx=0, pady=0, font=self.button_font_sm)
+        self._folder_del_btn.place_forget()
+        self._folder_hover_index = None
+        self._refresh_folder_list()
+
+    # ==================================================================
+    # 多文件夹：刷新 / 添加 / 选中 / 删除
+    # ==================================================================
+
+    def _refresh_folder_list(self) -> None:
+        """重建文件夹列表显示，并同步高亮当前选中项。"""
+        self.folder_list.delete(0, "end")
+        for tab in self.folder_tabs:
+            title = tab.get("title") or os.path.basename(tab.get("path") or "")
+            self.folder_list.insert("end", title)
+        if self.active_folder_index is not None:
+            self.folder_list.selection_clear(0, "end")
+            self.folder_list.selection_set(self.active_folder_index)
+            try:
+                self.folder_list.see(self.active_folder_index)
+            except tk.TclError:
+                pass
+        self._folder_del_btn.place_forget()
+        self._folder_hover_index = None
+
+    def _on_folder_select(self, _event: tk.Event | None = None) -> None:
+        """文件夹列表选中变化 → 切换右侧显示的歌曲列表。"""
+        sel = self.folder_list.curselection()
+        if not sel:
+            return
+        self._select_folder_by_index(sel[0])
+
+    def _on_folder_motion(self, event: tk.Event) -> None:
+        """鼠标在文件夹列表移动：定位所在行，在行右端显示 ×。"""
+        if not self.folder_tabs:
+            return
+        try:
+            idx = self.folder_list.nearest(event.y)
+        except tk.TclError:
+            return
+        if idx < 0 or idx >= len(self.folder_tabs):
+            self._folder_del_btn.place_forget()
+            self._folder_hover_index = None
+            return
+        self._folder_hover_index = idx
+        try:
+            bbox = self.folder_list.bbox(idx)
+        except tk.TclError:
+            bbox = None
+        if not bbox:
+            self._folder_del_btn.place_forget()
+            return
+        _x, y, _w, h = bbox
+        btn = self._folder_del_btn
+        btn.place(in_=self.folder_list, relx=1.0, x=-self._px(22),
+                  y=y, width=self._px(18), height=h)
+        btn.lift()
+
+    def _on_folder_leave(self, _event: tk.Event | None = None) -> None:
+        """鼠标离开文件夹列表：隐藏 ×。"""
+        self._folder_del_btn.place_forget()
+        self._folder_hover_index = None
+
+    def _remove_hover_folder(self) -> None:
+        """删除当前悬浮行对应的文件夹（正在播放其中的歌曲时保留播放）。"""
+        idx = self._folder_hover_index
+        self._folder_del_btn.place_forget()
+        self._folder_hover_index = None
+        if idx is None:
+            return
+        if 0 <= idx < len(self.folder_tabs):
+            self._remove_folder_by_index(idx)
+
+    def _update_songlist_title(self) -> None:
+        """更新右侧歌曲列表标题：显示当前选中文件夹名。"""
+        lbl = getattr(self, "_songlist_label", None)
+        if lbl is None:
+            return
+        if (self.active_folder_index is not None
+                and 0 <= self.active_folder_index < len(self.folder_tabs)):
+            name = self.folder_tabs[self.active_folder_index].get("title") \
+                or os.path.basename(
+                    self.folder_tabs[self.active_folder_index].get("path")
+                    or "")
+            lbl.config(text=f"歌曲列表 - {name}")
+        else:
+            lbl.config(text="歌曲列表")
+
+    def _add_folder(self, folder: str) -> str:
+        """把文件夹加入多文件夹列表并选中（若已存在仅选中缓存，不重扫）。
+
+        返回提示文本。GUI「打开文件夹」与控制台 open <文件夹> 共用。
+        """
+        folder = os.path.abspath(os.path.expanduser(folder))
+        if not os.path.isdir(folder):
+            return "路径不存在或不是文件夹"
+        key = os.path.normcase(os.path.abspath(folder))
+        for i, tab in enumerate(self.folder_tabs):
+            if os.path.normcase(os.path.abspath(
+                    tab.get("path") or "")) == key:
+                self._select_folder_by_index(i)
+                return f"文件夹已在列表中，已切到: {os.path.basename(folder)}"
+        tab = {
+            "path": folder,
+            "title": os.path.basename(folder) or folder,
+            "items": [],
+            "status": "loading",
+        }
+        self.folder_tabs.append(tab)
+        self._refresh_folder_list()
+        self._select_folder_by_index(len(self.folder_tabs) - 1)
+        self._ensure_bottom_shown()
+        self._start_folder_scan(len(self.folder_tabs) - 1)
+        return f"已添加并开始扫描文件夹: {folder}"
+
+    def _ensure_bottom_shown(self) -> None:
+        """显示底部面板；首次加载时展开窗口并锁定最小宽度（小屏按比例缩放）。"""
+        self.bottom_frame.pack(fill="both", expand=True, pady=(6, 0))
+        if not self._first_scan_done:
+            self._first_scan_done = True
+            self.root.geometry(f"{self._px(1380)}x{self._px(600)}")
+            self.root.minsize(self._px(1380), self._px(600))
+
+    def _select_folder_by_index(self, index: int) -> None:
+        """切换当前选中文件夹：把其缓存结果挂到 audio_items 并刷新右侧列表。"""
+        if index < 0 or index >= len(self.folder_tabs):
+            return
+        self.active_folder_index = index
+        tab = self.folder_tabs[index]
+        self.audio_root = tab.get("path")
+        self.audio_items = tab.get("items") or []
+        self._folder_title = tab.get("title")
+        self._refresh_folder_list()
+        self._update_songlist_title()
+
+        # 若正在播放的歌在当前文件夹里：定位高亮；否则清空列表选中态
+        playing_path = self.audio_path
+        found = None
+        if playing_path:
+            for i, it in enumerate(self.audio_items):
+                if it.get("path") == playing_path:
+                    found = i
+                    break
+        if found is not None:
+            self.current_song_index = found
+            self.viewed_song_index = found
+            self._refresh_song_list()
+            self.song_list.selection_set(found)
+            self.song_list.see(found)
+            self._show_song_info_for_index(found)
+        else:
+            self.current_song_index = None
+            self.viewed_song_index = None
+            self.song_list.selection_clear(0, "end")
+            self._clear_song_info()
+            self._refresh_song_list()
+        # 缓存结果中若有未读取时长的项，补起后台时长缓存
+        if self.audio_items and any(
+                it.get("duration") is None for it in self.audio_items):
+            self._start_bg_cache()
+        self._update_controls_state()
+        self._refresh_status_bar()
+
+    def _remove_folder_by_index(self, index: int) -> None:
+        """移除文件夹（仅移除列表条目；若正在播放其中的歌曲则保留播放）。"""
+        if index < 0 or index >= len(self.folder_tabs):
+            return
+        was_active = (self.active_folder_index == index)
+        removed = self.folder_tabs.pop(index)
+        path = removed.get("path")
+        if path:  # 中止该文件夹进行中的扫描
+            self._folder_scan_gen.pop(os.path.normcase(path), None)
+            self._folder_scan_gen.pop(path, None)
+
+        if self.active_folder_index is not None:
+            if self.active_folder_index == index:
+                self.active_folder_index = None
+            elif self.active_folder_index > index:
+                self.active_folder_index -= 1
+
+        self._refresh_folder_list()
+
+        if not was_active:
+            return
+        # 删除的是当前选中文件夹：切到相邻文件夹，或全部清空（播放仍保留）
+        if self.folder_tabs:
+            self._select_folder_by_index(min(index, len(self.folder_tabs) - 1))
+        else:
+            self.active_folder_index = None
+            self.audio_root = None
+            self.audio_items = []
+            self.current_song_index = None
+            self.viewed_song_index = None
+            self.song_list.selection_clear(0, "end")
+            self._clear_song_info()
+            self._refresh_song_list()
+            self._update_songlist_title()
+            self._update_controls_state()
+            self._refresh_status_bar()
 
     # ==================================================================
     # 右侧栏：封面 + 插播列表 + 按钮区
@@ -1403,7 +1663,10 @@ class LrcPlayerApp:
 
     def _refresh_status_bar(self) -> None:
         """刷新状态栏所有字段（主线程安全）。"""
-        # 歌曲统计
+        # 状态栏可能在 UI 构建中途被调用（_refresh_song_list），此时控件尚未创建
+        if not hasattr(self, "_liststat_var") or not hasattr(self, "_ilst_var"):
+            return
+        # 歌曲统计（仅当前选中文件夹）
         if self.audio_items:
             total = len(self.audio_items)
             cur = (self.current_song_index or 0) + 1 if self.current_song_index is not None else 0
@@ -1431,51 +1694,55 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _scan_folder(self) -> None:
-        """GUI：选择文件夹后启动后台扫描。"""
+        """GUI：「打开文件夹」→ 追加到多文件夹列表并扫描（同路径仅切换缓存）。"""
         folder = filedialog.askdirectory(title="选择歌曲文件夹")
         if not folder:
             return
-        self._start_scan(folder)
+        self._add_folder(folder)
 
-    def _start_scan(self, folder: str) -> None:
-        """启动文件夹后台扫描（GUI/控制台共用入口）。"""
-        self.audio_root = folder
+    def _start_folder_scan(self, index: int) -> None:
+        """启动 folder_tabs[index] 的后台扫描。
 
-        # 置空列表，显示扫描占位（列表操作在主线程，保证 UI 不冻结）
-        self.audio_items = []
-        self.current_song_index = None
-        self.viewed_song_index = None
-        self.song_list.selection_clear(0, "end")
-        self.song_list.delete(0, "end")
-        self.song_list.insert("end", "正在扫描文件夹...")
-        self._clear_song_info()
-        self._update_controls_state()
+        per-folder 世代（self._folder_scan_gen[path]），允许多个文件夹并发扫描；
+        文件夹被删除时其世代条目移除，进行中的扫描自动退出。
+        """
+        if index < 0 or index >= len(self.folder_tabs):
+            return
+        tab = self.folder_tabs[index]
+        folder = tab.get("path")
+        if not folder:
+            return
+        tab["status"] = "loading"
+        gen = self._folder_scan_gen.get(folder, 0) + 1
+        self._folder_scan_gen[folder] = gen
 
-        # 显示底部面板 + 首次扫描调整窗口尺寸并锁定最小宽度（小屏按比例缩放）
-        self.bottom_frame.pack(fill="both", expand=True, pady=(6, 0))
-        if not self._first_scan_done:
-            self._first_scan_done = True
-            self.root.geometry(f"{self._px(1380)}x{self._px(600)}")
-            self.root.minsize(self._px(1380), self._px(600))
+        # 若该文件夹是当前选中：右侧歌曲列表显示扫描占位
+        if index == self.active_folder_index:
+            self.audio_items = []
+            self.current_song_index = None
+            self.viewed_song_index = None
+            self.song_list.selection_clear(0, "end")
+            self.song_list.delete(0, "end")
+            self.song_list.insert("end", "正在扫描文件夹...")
+            self._clear_song_info()
+            self._update_controls_state()
+            self._prog_var.set(
+                f"正在扫描文件夹... {os.path.basename(folder)}")
 
-        # 启动后台扫描线程
-        self._bg_cache_gen += 1
-        gen = self._bg_cache_gen
-        self._prog_var.set("正在扫描文件夹...")
         threading.Thread(
             target=self._scan_thread, args=(folder, gen), daemon=True
         ).start()
 
     def _scan_thread(self, folder: str, generation: int) -> None:
-        """后台扫描线程：先枚举音频文件路径，再逐个读取元数据，实时上报进度。"""
-        # 阶段一：枚举音频文件路径（仅列目录，较快），期间只更新"已发现 N 个"
+        """后台扫描线程：先枚举音频路径，再读元数据；per-folder 世代过期则退出。"""
+        # 阶段一：枚举音频文件路径
         audio_paths: list[str] = []
         try:
             for root_dir, _, files in os.walk(folder):
-                if generation != self._bg_cache_gen:
+                if self._folder_scan_gen.get(folder) != generation:
                     return
                 for name in files:
-                    if generation != self._bg_cache_gen:
+                    if self._folder_scan_gen.get(folder) != generation:
                         return
                     if os.path.splitext(name)[1].lower() not in AUDIO_EXTENSIONS:
                         continue
@@ -1486,14 +1753,14 @@ class LrcPlayerApp:
                             0, lambda c=n: self._prog_var.set(f"正在扫描... {c} 个"))
         except Exception:
             pass
-        if generation != self._bg_cache_gen:
+        if self._folder_scan_gen.get(folder) != generation:
             return
         total = len(audio_paths)
 
-        # 阶段二：逐个读取元数据 + 匹配 LRC，实时显示百分比进度
+        # 阶段二：读元数据 + 匹配 LRC，实时进度
         items: list[dict[str, str | int | None]] = []
         for i, path in enumerate(audio_paths):
-            if generation != self._bg_cache_gen:
+            if self._folder_scan_gen.get(folder) != generation:
                 return
             lrc_path = self._find_lrc_for_audio(path)
             track_number, album_name, artist_name = self._get_metadata(path)
@@ -1512,21 +1779,47 @@ class LrcPlayerApp:
                 self.root.after(
                     0, lambda d=done, t=tot: self._set_scan_progress(d, t))
 
-        if generation != self._bg_cache_gen:
+        if self._folder_scan_gen.get(folder) != generation:
             return
         items.sort(key=self._song_sort_key)
-        self.root.after(0, lambda: self._apply_scan_result(items, generation))
+        self.root.after(
+            0, lambda: self._apply_folder_scan(folder, items, generation))
 
-    def _apply_scan_result(self, items: list, generation: int) -> None:
-        """主线程：应用扫描结果，刷新列表，启动后台时长缓存。"""
-        if generation != self._bg_cache_gen:
+    def _apply_folder_scan(self, folder: str, items: list,
+                           generation: int) -> None:
+        """主线程：把某文件夹扫描结果写入对应 tab（缓存）；若为当前选中则刷新列表。"""
+        if self._folder_scan_gen.get(folder) != generation:
             return
-        self.audio_items = items
-        self._refresh_song_list()
-        self._update_controls_state()  # 有列表后启用上一曲/下一曲
+        # 按 path 定位 tab（删除后索引会变，不能直接用传入索引）
+        key = os.path.normcase(os.path.abspath(folder))
+        tab_index = None
+        for i, tab in enumerate(self.folder_tabs):
+            if os.path.normcase(os.path.abspath(
+                    tab.get("path") or "")) == key:
+                tab_index = i
+                break
+        if tab_index is None:
+            return
+        tab = self.folder_tabs[tab_index]
+        tab["items"] = items
+        tab["status"] = "ready"
 
-        # 启动后台时长缓存（不阻塞主线程）
-        self._scan_total = len(items)
+        if tab_index == self.active_folder_index:
+            self.audio_items = items
+            self.audio_root = folder
+            self.current_song_index = None
+            self.viewed_song_index = None
+            self._refresh_song_list()
+            self._update_controls_state()
+            self._start_bg_cache()
+        self._refresh_folder_list()
+
+    def _start_bg_cache(self) -> None:
+        """启动后台时长缓存（针对当前 audio_items）。
+
+        每次调用 _bg_cache_gen 自增，切换文件夹后旧缓存线程自动退出。
+        """
+        self._scan_total = len(self.audio_items)
         self._scan_done = 0
         self._set_scan_progress(0, self._scan_total)
         self._bg_cache_gen += 1
@@ -1626,10 +1919,19 @@ class LrcPlayerApp:
         return None, album, artist
 
     def _refresh_song_list(self) -> None:
-        """刷新 Listbox 中的歌曲显示。"""
+        """刷新 Listbox 中的歌曲显示（空态文案按当前文件夹状态区分）。"""
         self.song_list.delete(0, "end")
         if not self.audio_items:
-            self.song_list.insert("end", "尚未扫描歌曲")
+            if (self.active_folder_index is not None
+                    and 0 <= self.active_folder_index < len(self.folder_tabs)
+                    and self.folder_tabs[self.active_folder_index].get("status")
+                    == "loading"):
+                self.song_list.insert("end", "正在扫描文件夹...")
+            elif self.folder_tabs:
+                self.song_list.insert("end", "文件夹内暂无歌曲")
+            else:
+                self.song_list.insert("end", "尚未加载文件夹")
+            self._refresh_status_bar()
             return
         for item in self.audio_items:
             self.song_list.insert("end", item.get("display") or "")
@@ -2070,11 +2372,21 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _toggle_topmost(self) -> None:
-        """切换窗口置顶状态。"""
-        self.always_on_top = not self.always_on_top
+        """切换窗口置顶状态（按钮回调）。"""
+        self._set_topmost(not self.always_on_top)
+
+    def _set_topmost(self, on: bool) -> None:
+        """设置窗口置顶状态（按钮/控制台共用入口）。
+
+        全屏时 Windows 会自动置顶；这里把"用户主动改过置顶"记为标记，
+        供退出全屏时决定是否保留（避免被还原成进入全屏前的旧状态）。
+        """
+        self.always_on_top = bool(on)
         self.root.attributes("-topmost", self.always_on_top)
         self.topmost_btn.config(
             text="置顶: 开" if self.always_on_top else "置顶: 关")
+        if bool(self.root.attributes("-fullscreen")):
+            self._topmost_edited_in_fullscreen = True
 
     # ==================================================================
     # 播放状态

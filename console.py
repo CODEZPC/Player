@@ -230,8 +230,7 @@ class PlayerConsole:
             path = path[1:-1]
         path = os.path.abspath(os.path.expanduser(path))
         if os.path.isdir(path):
-            self.app._start_scan(path)
-            return f"已开始扫描文件夹: {path}"
+            return self.app._add_folder(path)
         if os.path.isfile(path):
             if not self.app.engine.ready:
                 return "音频后端不可用"
@@ -553,9 +552,7 @@ class PlayerConsole:
             on = _parse_bool(parts[2])
             if on is None:
                 return "参数错误: topmost ∈ {true, false, 1, 0, on, off}"
-            app.always_on_top = on
-            app.root.attributes("-topmost", on)
-            app.topmost_btn.config(text="置顶: 开" if on else "置顶: 关")
+            app._set_topmost(on)
             return f"置顶: {'开' if on else '关'}"
 
         if sub == "floatlayer":
