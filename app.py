@@ -8,6 +8,7 @@ from bisect import bisect_right
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font as tkfont
 
+import config_store
 from lrc_parser import LrcParser
 from audio_engine import AudioEngine
 from cover_utils import extract_cover_art, cover_to_tk_image
@@ -93,7 +94,9 @@ class LrcPlayerApp:
         self.folder_tabs: list[dict] = []          # 每项 {path,title,items,status}
         self.active_folder_index: int | None = None
         self._folder_scan_gen: dict[str, int] = {}  # path -> 该文件夹扫描世代
+        self._scanning_paths: set[str] = set()     # 正在后台扫描的文件夹(normcase)
         self._folder_hover_index: int | None = None
+        self._folder_del_idx: int | None = None     # × 按钮当前所在行索引
         self._folder_title: str | None = None        # 当前选中文件夹显示标题
         self.audio_items: list[dict[str, str | int | None]] = []
         self.audio_root: str | None = None
@@ -166,6 +169,9 @@ class LrcPlayerApp:
 
         # 未加载歌曲前统一禁用播放相关控件
         self._update_controls_state()
+
+        # 启动恢复：读取 data.json 应用操作栏/模式/置顶，并计划后台恢复文件夹
+        self._load_persisted_state()
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
         self._setup_keyboard_shortcuts()
@@ -650,9 +656,12 @@ class LrcPlayerApp:
             parent, text="×", command=self._remove_hover_folder,
             bg=SUBTLE_COLOR, fg="#FF7777",
             activebackground="#6B1010", activeforeground="#FF5555",
-            relief="flat", bd=0, padx=0, pady=0, font=self.button_font_sm)
+            relief="flat", bd=0, padx=0, pady=0, font=self.list_font)
         self._folder_del_btn.place_forget()
+        self._folder_del_btn.bind("<Enter>", self._on_folder_del_enter)
+        self._folder_del_btn.bind("<Leave>", self._on_folder_del_leave)
         self._folder_hover_index = None
+        self._folder_del_idx = None
         self._refresh_folder_list()
 
     # ==================================================================
@@ -672,8 +681,7 @@ class LrcPlayerApp:
                 self.folder_list.see(self.active_folder_index)
             except tk.TclError:
                 pass
-        self._folder_del_btn.place_forget()
-        self._folder_hover_index = None
+        self._hide_folder_del()
 
     def _on_folder_select(self, _event: tk.Event | None = None) -> None:
         """文件夹列表选中变化 → 切换右侧显示的歌曲列表。"""
@@ -683,7 +691,7 @@ class LrcPlayerApp:
         self._select_folder_by_index(sel[0])
 
     def _on_folder_motion(self, event: tk.Event) -> None:
-        """鼠标在文件夹列表移动：定位所在行，在行右端显示 ×。"""
+        """鼠标在文件夹列表移动：定位所在行，在行右端显示 ×（幂等防闪烁）。"""
         if not self.folder_tabs:
             return
         try:
@@ -691,33 +699,68 @@ class LrcPlayerApp:
         except tk.TclError:
             return
         if idx < 0 or idx >= len(self.folder_tabs):
-            self._folder_del_btn.place_forget()
-            self._folder_hover_index = None
+            self._hide_folder_del()
             return
-        self._folder_hover_index = idx
         try:
             bbox = self.folder_list.bbox(idx)
         except tk.TclError:
             bbox = None
         if not bbox:
-            self._folder_del_btn.place_forget()
+            self._hide_folder_del()
             return
+        # 同一行且按钮已显示 → 不再重复 place（避免鼠标微动时高频重绘闪烁）
+        if (self._folder_hover_index == idx and self._folder_del_idx == idx
+                and self._folder_del_btn.winfo_ismapped()):
+            return
+        self._folder_hover_index = idx
+        self._folder_del_idx = idx
         _x, y, _w, h = bbox
         btn = self._folder_del_btn
+        # y-1 / 高 h+1：Listbox 文本区相对 place 坐标有约 1px 偏移，修正“偏下”
         btn.place(in_=self.folder_list, relx=1.0, x=-self._px(22),
-                  y=y, width=self._px(18), height=h)
+                  y=max(0, y - 1), width=self._px(18), height=h + 1)
         btn.lift()
 
-    def _on_folder_leave(self, _event: tk.Event | None = None) -> None:
-        """鼠标离开文件夹列表：隐藏 ×。"""
-        self._folder_del_btn.place_forget()
-        self._folder_hover_index = None
+    def _on_folder_del_enter(self, _event: tk.Event | None = None) -> None:
+        """鼠标进入 × 按钮：置顶保持可见（避免触发列表 Leave 而闪烁消失）。"""
+        if self._folder_del_btn.winfo_ismapped():
+            self._folder_del_btn.lift()
 
-    def _remove_hover_folder(self) -> None:
+    def _on_folder_del_leave(self, _event: tk.Event | None = None) -> None:
+        """鼠标离开 × 按钮：指针已不在其内则隐藏。"""
+        if self._pointer_in_widget(self._folder_del_btn):
+            return
+        self._hide_folder_del()
+
+    def _pointer_in_widget(self, widget) -> bool:
+        """当前指针是否在某控件区域内。"""
+        try:
+            x = self.root.winfo_pointerx() - widget.winfo_rootx()
+            y = self.root.winfo_pointery() - widget.winfo_rooty()
+            return (0 <= x <= widget.winfo_width()
+                    and 0 <= y <= widget.winfo_height())
+        except Exception:
+            return False
+
+    def _hide_folder_del(self) -> None:
+        """隐藏 × 并清空悬浮行记录（幂等）。"""
+        try:
+            self._folder_del_btn.place_forget()
+        except tk.TclError:
+            pass
+        self._folder_hover_index = None
+        self._folder_del_idx = None
+
+    def _on_folder_leave(self, _event: tk.Event | None = None) -> None:
+        """鼠标离开文件夹列表：若指针仍悬停在 × 上则保留，否则隐藏。"""
+        if self._pointer_in_widget(self._folder_del_btn):
+            return
+        self._hide_folder_del()
+
+    def _remove_hover_folder(self, _event: tk.Event | None = None) -> None:
         """删除当前悬浮行对应的文件夹（正在播放其中的歌曲时保留播放）。"""
         idx = self._folder_hover_index
-        self._folder_del_btn.place_forget()
-        self._folder_hover_index = None
+        self._hide_folder_del()
         if idx is None:
             return
         if 0 <= idx < len(self.folder_tabs):
@@ -751,6 +794,7 @@ class LrcPlayerApp:
             if os.path.normcase(os.path.abspath(
                     tab.get("path") or "")) == key:
                 self._select_folder_by_index(i)
+                self._schedule_config_save()
                 return f"文件夹已在列表中，已切到: {os.path.basename(folder)}"
         tab = {
             "path": folder,
@@ -763,6 +807,7 @@ class LrcPlayerApp:
         self._select_folder_by_index(len(self.folder_tabs) - 1)
         self._ensure_bottom_shown()
         self._start_folder_scan(len(self.folder_tabs) - 1)
+        self._schedule_config_save()
         return f"已添加并开始扫描文件夹: {folder}"
 
     def _ensure_bottom_shown(self) -> None:
@@ -823,6 +868,8 @@ class LrcPlayerApp:
         if path:  # 中止该文件夹进行中的扫描
             self._folder_scan_gen.pop(os.path.normcase(path), None)
             self._folder_scan_gen.pop(path, None)
+            self._scanning_paths.discard(
+                os.path.normcase(os.path.abspath(path)))
 
         if self.active_folder_index is not None:
             if self.active_folder_index == index:
@@ -831,6 +878,7 @@ class LrcPlayerApp:
                 self.active_folder_index -= 1
 
         self._refresh_folder_list()
+        self._schedule_config_save()
 
         if not was_active:
             return
@@ -1050,6 +1098,14 @@ class LrcPlayerApp:
             activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
             relief="flat", padx=6, pady=2)
         self._console_btn.pack(side="right")
+        # 「重置」按钮：位于「控制台」左侧（side=right 后 pack → 更靠左）
+        self._reset_btn = tk.Button(
+            self._adv_cancel_row, text="重置",
+            command=self._toggle_reset,
+            bg=SUBTLE_COLOR, fg="#FF9A9A", font=self.button_font_sm,
+            activebackground="#6B1010", activeforeground="#FF5555",
+            relief="flat", padx=6, pady=2)
+        self._reset_btn.pack(side="right")
 
         # 蓝色重置条（拖动任一高级滑块时覆盖标题行）
         self._adv_reset = tk.Frame(adv_frame, bg="#1F3A8A",
@@ -1110,6 +1166,7 @@ class LrcPlayerApp:
             v = round(float(self._speed_var.get()) / 0.05) * 0.05
             self._speed_var.set(v)
             self.engine.set_speed(v)
+        self._schedule_config_save()
 
     def _pointer_side_in(self, widget) -> str | None:
         """判断指针是否在控件内，并返回所在半区（'left'/'right'/None）。"""
@@ -1130,6 +1187,7 @@ class LrcPlayerApp:
         self._vol_var.set(v)
         self.engine.set_volume(v / 100.0)
         self._update_vol_preview()
+        self._schedule_config_save()
 
     def _update_vol_preview(self) -> None:
         """按音量×增益更新音量数值显示；增益≠1 时显示有效音量并置黄色。"""
@@ -1147,6 +1205,7 @@ class LrcPlayerApp:
         on = not self.engine.get_pitch_fix()
         self.engine.set_pitch_fix(on)
         self._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
+        self._schedule_config_save()
 
     def _on_pitch_press(self, _event: tk.Event) -> None:
         """音高滑块拖动开始：显示蓝色重置条覆盖标题行。"""
@@ -1179,6 +1238,7 @@ class LrcPlayerApp:
             self._pitch_var.set(0)
             self.engine.set_pitch_shift(0)
             self._pitch_preview.config(text="+0", fg=FG_COLOR)
+        self._schedule_config_save()
 
     def _pitch_color(self, v: int) -> str:
         """音高移调数值颜色：偏离 0 越大越偏黄（警示）。"""
@@ -1251,6 +1311,7 @@ class LrcPlayerApp:
             self.engine.set_gain(1.0)
             self._gain_val.config(text="1.00x", fg=FG_COLOR)
             self._update_vol_preview()
+        self._schedule_config_save()
 
     def _on_lrc_offset_changed(self, value: str) -> None:
         """歌词偏移：正值=歌词延后，负值=歌词提前（步进 10ms）。"""
@@ -1261,6 +1322,7 @@ class LrcPlayerApp:
         self._lrc_offset_val.config(text=f"{v * 10}ms",
                                     fg=self._lrc_offset_color(v))
         self._sync_lyrics(self._current_time())
+        self._schedule_config_save()
 
     def _lrc_offset_color(self, v: float) -> str:
         """歌词偏移数值颜色：随偏移量增大由灰转红（警示）。"""
@@ -1279,6 +1341,7 @@ class LrcPlayerApp:
         self._balance_var.set(v)
         self.engine.set_balance(v)
         self._balance_val.config(text=f"{v:+.2f}")
+        self._schedule_config_save()
 
     def _on_gain_changed(self, value: str) -> None:
         """响度增益（前置放大）：1.0 原始，最高 2.0（+6dB，仅 sounddevice）。"""
@@ -1290,6 +1353,7 @@ class LrcPlayerApp:
         self.engine.set_gain(v)
         self._gain_val.config(text=f"{v:.2f}x", fg=self._gain_color(v))
         self._update_vol_preview()  # 增益变化同步音量显示
+        self._schedule_config_save()
 
     def _gain_color(self, v: float) -> str:
         """增益数值颜色：低于 1 偏灰，高于 1 偏黄（警示提升）。"""
@@ -1689,6 +1753,15 @@ class LrcPlayerApp:
         self._prog_var.set("就绪")
         self._refresh_status_bar()
 
+    def _on_scan_finished(self, folder: str) -> None:
+        """主线程：登记某文件夹扫描结束；全部扫描结束则置状态为就绪。"""
+        if folder:
+            self._scanning_paths.discard(
+                os.path.normcase(os.path.abspath(folder)))
+        if not self._scanning_paths:
+            self._prog_var.set("就绪")
+            self._refresh_status_bar()
+
     # ==================================================================
     # 歌曲列表
     # ==================================================================
@@ -1715,6 +1788,7 @@ class LrcPlayerApp:
         tab["status"] = "loading"
         gen = self._folder_scan_gen.get(folder, 0) + 1
         self._folder_scan_gen[folder] = gen
+        self._scanning_paths.add(os.path.normcase(os.path.abspath(folder)))
 
         # 若该文件夹是当前选中：右侧歌曲列表显示扫描占位
         if index == self.active_folder_index:
@@ -1734,6 +1808,17 @@ class LrcPlayerApp:
         ).start()
 
     def _scan_thread(self, folder: str, generation: int) -> None:
+        """后台扫描线程包装：无论正常/过期退出，都在主线程登记该文件夹扫描结束。"""
+        try:
+            self._scan_thread_impl(folder, generation)
+        finally:
+            try:
+                self.root.after(
+                    0, lambda f=folder: self._on_scan_finished(f))
+            except Exception:
+                pass
+
+    def _scan_thread_impl(self, folder: str, generation: int) -> None:
         """后台扫描线程：先枚举音频路径，再读元数据；per-folder 世代过期则退出。"""
         # 阶段一：枚举音频文件路径
         audio_paths: list[str] = []
@@ -1815,13 +1900,12 @@ class LrcPlayerApp:
         self._refresh_folder_list()
 
     def _start_bg_cache(self) -> None:
-        """启动后台时长缓存（针对当前 audio_items）。
+        """启动后台时长缓存（针对当前 audio_items，静默后台，不占用主状态条）。
 
         每次调用 _bg_cache_gen 自增，切换文件夹后旧缓存线程自动退出。
         """
         self._scan_total = len(self.audio_items)
         self._scan_done = 0
-        self._set_scan_progress(0, self._scan_total)
         self._bg_cache_gen += 1
         gen = self._bg_cache_gen
         threading.Thread(
@@ -1841,13 +1925,7 @@ class LrcPlayerApp:
                 item["duration"] = dur
             self.root.after(0, lambda idx=i, d=item.get("duration"):
                            self._on_duration_cached(idx, d))
-            # 更新进度（每 5 首投递一次，避免大列表在消息队列堆积回调）
-            if (i + 1) % 5 == 0 or i + 1 == total:
-                self._scan_done = i + 1
-                self.root.after(0, lambda d=i + 1, t=total:
-                               self._set_scan_progress(d, t))
-        # 全部完成
-        self.root.after(0, self._set_status_ready)
+        # 时长缓存静默后台执行：不再占用主状态条（状态“就绪”由扫描完成统一置位）
 
     def _on_duration_cached(self, index: int, duration: float | None) -> None:
         """主线程回调：更新信息面板中的时长（若仍在查看该歌曲）。"""
@@ -2366,6 +2444,299 @@ class LrcPlayerApp:
         label, mode = PLAY_MODES[self.play_mode_index]
         self.play_mode = mode
         self.mode_btn.config(text=f"模式: {label}")
+        self._schedule_config_save()
+
+    # ==================================================================
+    # 配置持久化（_internal/config/data.json）
+    # ==================================================================
+
+    def _collect_config(self) -> dict:
+        """收集当前操作栏/播放模式/置顶配置。"""
+        try:
+            speed = round(float(self._speed_var.get()), 2)
+        except Exception:
+            speed = 1.0
+        try:
+            volume = int(round(float(self._vol_var.get())))
+        except Exception:
+            volume = 100
+        try:
+            pitch = int(round(float(self._pitch_var.get())))
+        except Exception:
+            pitch = 0
+        return {
+            "speed": speed,
+            "pitch_fix": bool(self.engine.get_pitch_fix()),
+            "pitch_shift": pitch,
+            "volume": volume,
+            "lrc_offset": round(float(self.lrc_offset or 0), 1),
+            "balance": round(float(self.engine.get_balance()), 2),
+            "gain": round(float(self.engine.get_gain()), 2),
+            "play_mode": self.play_mode,
+            "always_on_top": bool(self.always_on_top),
+        }
+
+    def _collect_persist(self) -> dict:
+        """收集完整持久化数据：配置 + 已加载文件夹 + 当前选中文件夹。"""
+        data = {
+            "config": self._collect_config(),
+            "folders": [t.get("path") for t in self.folder_tabs],
+            "active_folder": None,
+        }
+        if (self.active_folder_index is not None
+                and 0 <= self.active_folder_index < len(self.folder_tabs)):
+            data["active_folder"] = self.folder_tabs[
+                self.active_folder_index].get("path")
+        return data
+
+    def _schedule_config_save(self) -> None:
+        """改动即时保存（合并短时间内的多次改动；退出时 on_close 兜底）。"""
+        if getattr(self, "_config_save_pending", False):
+            return
+        self._config_save_pending = True
+        try:
+            self.root.after(250, self._flush_config_save)
+        except Exception:
+            self._flush_config_save()
+
+    def _flush_config_save(self) -> None:
+        """把挂起的配置写入 data.json（幂等）。"""
+        if not getattr(self, "_config_save_pending", False):
+            return
+        self._config_save_pending = False
+        config_store.save(self._collect_persist())
+
+    def _apply_config_values(self, cfg: dict) -> None:
+        """把配置数值应用到引擎与 UI 控件（启动恢复 / 重置默认共用，不触发保存）。"""
+        try:
+            v = float(cfg.get("speed", 1.0))
+            v = max(0.1, min(3.0, v))
+        except Exception:
+            v = 1.0
+        self.engine.set_speed(v)
+        self._speed_var.set(v)
+        self._speed_preview.config(text=f"{v:.2f}x")
+
+        pf = bool(cfg.get("pitch_fix", False))
+        self.engine.set_pitch_fix(pf)
+        self._pitch_btn.config(text="保音高: 开" if pf else "保音高: 关")
+
+        try:
+            ps = int(round(float(cfg.get("pitch_shift", 0))))
+        except Exception:
+            ps = 0
+        ps = max(-12, min(12, ps))
+        self.engine.set_pitch_shift(ps)
+        self._pitch_var.set(ps)
+        self._pitch_preview.config(text=f"{ps:+d}", fg=self._pitch_color(ps))
+
+        try:
+            vol = int(round(float(cfg.get("volume", 100))))
+        except Exception:
+            vol = 100
+        vol = max(0, min(100, vol))
+        self._vol_var.set(vol)
+        self.engine.set_volume(vol / 100.0)
+        self._update_vol_preview()
+
+        try:
+            lo = round(float(cfg.get("lrc_offset", 0)), 1)
+        except Exception:
+            lo = 0.0
+        lo = max(-60.0, min(60.0, lo))
+        self.lrc_offset = lo
+        self._lrc_offset_var.set(lo)
+        self._lrc_offset_val.config(
+            text=f"{int(round(lo * 10))}ms", fg=self._lrc_offset_color(lo))
+
+        try:
+            bal = round(float(cfg.get("balance", 0.0)), 2)
+        except Exception:
+            bal = 0.0
+        bal = max(-1.0, min(1.0, bal))
+        self.engine.set_balance(bal)
+        self._balance_var.set(bal)
+        self._balance_val.config(text=f"{bal:+.2f}")
+
+        try:
+            g = round(float(cfg.get("gain", 1.0)), 2)
+        except Exception:
+            g = 1.0
+        g = max(0.0, min(2.0, g))
+        self.engine.set_gain(g)
+        self._gain_var.set(g)
+        self._gain_val.config(text=f"{g:.2f}x", fg=self._gain_color(g))
+        self._update_vol_preview()
+
+        mode = str(cfg.get("play_mode", "loop_all"))
+        idx = next((i for i, (_, m) in enumerate(PLAY_MODES) if m == mode), 0)
+        self.play_mode_index = idx
+        self.play_mode = PLAY_MODES[idx][1]
+        self.mode_btn.config(text=f"模式: {PLAY_MODES[idx][0]}")
+
+        # 置顶（直接设置，不走 _set_topmost 以免触发保存）
+        top = bool(cfg.get("always_on_top", False))
+        self.always_on_top = top
+        self.root.attributes("-topmost", top)
+        self.topmost_btn.config(text="置顶: 开" if top else "置顶: 关")
+
+    def _load_persisted_state(self) -> None:
+        """启动时读取 data.json：应用配置；计划恢复文件夹（后台自动扫描，跳过缺失）。"""
+        data = config_store.load()
+        self._apply_config_values(data.get("config") or {})
+        self.root.after(0, self._restore_saved_folders)
+
+    def _restore_saved_folders(self) -> None:
+        """恢复上次打开的文件夹：逐个添加并后台扫描；不存在的跳过（不提示）。"""
+        data = config_store.load()
+        folders = data.get("folders") or []
+        active = data.get("active_folder")
+        added = False
+        for fp in folders:
+            if isinstance(fp, str) and os.path.isdir(fp):
+                self._add_folder(fp)   # 内部已做存在性/重复检查
+                added = True
+        if not added:
+            return
+        # 恢复上次选中：优先 active_folder（若仍在列表），否则选中第一个
+        if isinstance(active, str) and active:
+            key = os.path.normcase(os.path.abspath(active))
+            for i, tab in enumerate(self.folder_tabs):
+                if os.path.normcase(os.path.abspath(
+                        tab.get("path") or "")) == key:
+                    self._select_folder_by_index(i)
+                    return
+        if self.folder_tabs:
+            self._select_folder_by_index(0)
+
+    # ==================================================================
+    # 重置：清除配置 / 文件夹 / 播放与插播状态（文件不删除）
+    # ==================================================================
+
+    def _toggle_reset(self) -> None:
+        """点「重置」：弹出全屏覆盖确认框（确认需点 2 次）。"""
+        if getattr(self, "_reset_overlay", None) is not None:
+            return
+        overlay = tk.Frame(self.root, bg=BG_COLOR)
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._reset_overlay = overlay
+        mask = tk.Frame(overlay, bg="#14171C")
+        mask.place(relx=0, rely=0, relwidth=1, relheight=1)
+        mask.bind("<Button-1>", lambda e: self._close_reset_overlay())
+
+        dlg = tk.Frame(overlay, bg=SUBTLE_COLOR, padx=24, pady=20,
+                       highlightthickness=1, highlightbackground=ACCENT_COLOR)
+        dlg.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(dlg, text="重置所有设置", bg=SUBTLE_COLOR, fg=ACCENT_COLOR,
+                 font=self.title_font).pack(pady=(0, 12))
+        tk.Label(dlg,
+                 text="所有配置和打开的文件夹都会被清除\n"
+                      "（文件不会被删除）\n\n是否继续？",
+                 bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.info_font,
+                 justify="center").pack(pady=(0, 16))
+
+        row = tk.Frame(dlg, bg=SUBTLE_COLOR)
+        row.pack()
+        self._reset_confirm_btn = tk.Button(
+            row, text="重置", command=self._on_reset_confirm,
+            bg=BG_COLOR, fg=FG_COLOR, font=self.button_font,
+            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
+            relief="flat", padx=18, pady=5)
+        self._reset_confirm_btn.pack(side="left", padx=8)
+        tk.Button(row, text="取消", command=self._close_reset_overlay,
+                  bg=BG_COLOR, fg=FG_COLOR, font=self.button_font,
+                  activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
+                  relief="flat", padx=18, pady=5).pack(side="left", padx=8)
+        self._reset_confirm_timer = None
+        self._reset_confirm_active = False
+
+    def _on_reset_confirm(self) -> None:
+        """确认按钮：需点 2 次（第二次变红后执行）。"""
+        if self._reset_confirm_active:
+            self._do_reset_all()
+            self._close_reset_overlay()
+            return
+        self._reset_confirm_active = True
+        self._reset_confirm_btn.config(text="确定？再点一次", fg="#FF5555")
+        if self._reset_confirm_timer:
+            self.root.after_cancel(self._reset_confirm_timer)
+        self._reset_confirm_timer = self.root.after(
+            3000, self._reset_reset_confirm)
+
+    def _reset_reset_confirm(self) -> None:
+        """3 秒未二次确认则恢复按钮。"""
+        self._reset_confirm_active = False
+        self._reset_confirm_timer = None
+        if self._reset_confirm_btn is not None:
+            self._reset_confirm_btn.config(text="重置", fg=FG_COLOR)
+
+    def _close_reset_overlay(self) -> None:
+        """关闭重置确认浮层。"""
+        if self._reset_confirm_timer:
+            try:
+                self.root.after_cancel(self._reset_confirm_timer)
+            except Exception:
+                pass
+            self._reset_confirm_timer = None
+        self._reset_confirm_active = False
+        ov = getattr(self, "_reset_overlay", None)
+        if ov is not None:
+            try:
+                ov.destroy()
+            except Exception:
+                pass
+            self._reset_overlay = None
+
+    def _do_reset_all(self) -> None:
+        """执行重置：清除配置、文件夹、当前播放/插播状态（不删除文件）。"""
+        # 关闭歌词浮层
+        if self._lyric_overlay is not None:
+            try:
+                self._close_lyric_overlay()
+            except Exception:
+                pass
+        # 停止播放并清空当前播放上下文
+        try:
+            self.engine.stop()
+        except Exception:
+            pass
+        self.audio_path = None
+        self.lrc_path = None
+        self.duration = None
+        self.lrc_lines.clear()
+        self.lrc_times.clear()
+        self.current_lrc_index = -1
+        self._reset_playback_state()
+        self._refresh_lyric_display()
+        self._clear_song_info()
+        self._show_default_cover()
+        # 清空插播
+        self.interlude_items.clear()
+        self._refresh_interlude_list()
+        self._reset_clear_button()
+        # 清空文件夹（中止扫描）
+        self.folder_tabs.clear()
+        self.active_folder_index = None
+        self.audio_root = None
+        self.audio_items = []
+        self.current_song_index = None
+        self.viewed_song_index = None
+        self._folder_scan_gen.clear()
+        self._refresh_folder_list()
+        self._refresh_song_list()
+        self._update_songlist_title()
+        self._refresh_il_buttons()
+        self._update_controls_state()
+        # 配置恢复默认并持久化（文件夹已空）
+        self._apply_default_config()
+        config_store.save(self._collect_persist())
+        self._refresh_status_bar()
+        self._prog_var.set("已重置")
+
+    def _apply_default_config(self) -> None:
+        """把操作栏/模式/置顶恢复为默认值。"""
+        self._apply_config_values(config_store.DEFAULTS.get("config") or {})
 
     # ==================================================================
     # 置顶
@@ -2387,6 +2758,7 @@ class LrcPlayerApp:
             text="置顶: 开" if self.always_on_top else "置顶: 关")
         if bool(self.root.attributes("-fullscreen")):
             self._topmost_edited_in_fullscreen = True
+        self._schedule_config_save()
 
     # ==================================================================
     # 播放状态
@@ -2516,55 +2888,124 @@ class LrcPlayerApp:
 
         tk.Frame(left, bg=BG_COLOR).pack(expand=True)  # 底部弹性（垂直居中）
 
-        # ---- 右栏：七行歌词（上三/下三小字，中间大字）----
+        # ---- 右栏：歌词（行数随窗口高度动态变化，中间为当前行大字）----
         right = tk.Frame(overlay, bg=BG_COLOR)
         right.grid(row=0, column=1, sticky="nsew")
 
         tk.Frame(right, bg=BG_COLOR).pack(expand=True)  # 顶部弹性空间
-        self._overlay_lyric_vars = []
-        self._overlay_lyric_labels = []
-        lyric_wrap = max(80, int(self.root.winfo_width() * 11 / 20) - 48)
-        for i in range(7):
-            is_middle = (i == 3)
-            var = tk.StringVar(value="")
-            lbl = tk.Label(
-                right, textvariable=var, bg=BG_COLOR,
-                fg=ACCENT_COLOR if is_middle else FG_COLOR,
-                font=(self.overlay_lyric_big_font if is_middle
-                      else self.overlay_lyric_small_font),
-                anchor="w",
-                justify="left",
-                wraplength=lyric_wrap)
-            lbl.pack(fill="x", padx=24,
-                     pady=(10, 10) if is_middle else 6)
-            self._overlay_lyric_vars.append(var)
-            self._overlay_lyric_labels.append(lbl)
+        self._overlay_lyric_frame = tk.Frame(right, bg=BG_COLOR)
+        self._overlay_lyric_frame.pack(fill="x")
         tk.Frame(right, bg=BG_COLOR).pack(expand=True)  # 底部弹性空间
 
-        # 浮层尺寸变化时更新左栏文字换行宽度
+        self._overlay_lyric_wrap = max(
+            80, int(self.root.winfo_width() * 11 / 20) - 48)
+        self._overlay_lyric_vars = []
+        self._overlay_lyric_labels = []
+        self._overlay_row_count = 0
+        self._overlay_rows_timer = None
+        # 初次按当前窗口高度决定行数
+        self._rebuild_overlay_lyric_rows(
+            self._overlay_target_row_count(
+                max(self.root.winfo_height(),
+                    self.root.winfo_screenheight() // 2)))
+
+        # 浮层尺寸变化时更新换行宽度并按高度调整行数（防抖）
         overlay.bind("<Configure>", self._on_overlay_configure)
         # 后创建的两栏 Frame 会盖住先创建的返回按钮，必须提升到最上层
         close_btn.lift()
 
+    def _overlay_target_row_count(self, height: int) -> int:
+        """按窗口高度估算可显示的歌词行数（奇数、中间为当前行、最少 3 行）。"""
+        try:
+            small_ls = int(self.overlay_lyric_small_font.metrics("linespace"))
+            big_ls = int(self.overlay_lyric_big_font.metrics("linespace"))
+        except Exception:
+            small_ls, big_ls = 20, 34
+        row_small = max(1, small_ls + 12)     # 小字行高 + 上下 pady(6+6)
+        middle_row = max(1, big_ls + 20)      # 中间大字行高 + 上下 pady(10+10)
+        avail = max(60, int(height) - 48)     # 上下留边距
+        n = 1 + int(max(0, avail - middle_row) // row_small)
+        if n % 2 == 0:
+            n -= 1
+        return max(3, n - 4)
+
+    def _rebuild_overlay_lyric_rows(self, count: int) -> None:
+        """重建浮层歌词行（行数变化时调用）：中间行大字，其余小字。"""
+        frame = getattr(self, "_overlay_lyric_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        self._overlay_lyric_vars = []
+        self._overlay_lyric_labels = []
+        self._overlay_row_count = count
+        middle = count // 2
+        wrap = getattr(self, "_overlay_lyric_wrap", 0) or max(
+            80, int(self.root.winfo_width() * 11 / 20) - 48)
+        for i in range(count):
+            is_middle = (i == middle)
+            var = tk.StringVar(value="")
+            lbl = tk.Label(
+                frame, textvariable=var, bg=BG_COLOR,
+                fg=ACCENT_COLOR if is_middle else FG_COLOR,
+                font=(self.overlay_lyric_big_font if is_middle
+                      else self.overlay_lyric_small_font),
+                anchor="w", justify="left", wraplength=wrap)
+            lbl.pack(fill="x", padx=24,
+                     pady=(10, 10) if is_middle else 6)
+            self._overlay_lyric_vars.append(var)
+            self._overlay_lyric_labels.append(lbl)
+
     def _on_overlay_configure(self, event: tk.Event) -> None:
-        """浮层尺寸变化时更新左右两栏文字的换行宽度。"""
+        """浮层尺寸变化：更新换行宽度，并按高度防抖调整歌词行数。"""
         left_wrap = max(80, int(event.width * 9 / 20) - 60)
         lyric_wrap = max(80, int(event.width * 11 / 20) - 48)
+        self._overlay_lyric_wrap = lyric_wrap
         if hasattr(self, "_overlay_name_label"):
             self._overlay_name_label.config(wraplength=left_wrap)
             self._overlay_artist_label.config(wraplength=left_wrap)
         for lbl in getattr(self, "_overlay_lyric_labels", []):
             lbl.config(wraplength=lyric_wrap)
+        # 行数随高度变化：防抖 200ms 后重建，避免拖动窗口时频繁重建闪烁
+        timer = getattr(self, "_overlay_rows_timer", None)
+        if timer:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:
+                pass
+        height = event.height
+        self._overlay_rows_timer = self.root.after(
+            200, lambda: self._apply_overlay_rows(height))
+
+    def _apply_overlay_rows(self, height: int) -> None:
+        """按高度计算目标行数；若变化则重建歌词行并刷新内容。"""
+        self._overlay_rows_timer = None
+        if self._lyric_overlay is None:
+            return
+        count = self._overlay_target_row_count(height)
+        if count == getattr(self, "_overlay_row_count", 0):
+            return
+        self._rebuild_overlay_lyric_rows(count)
+        self._update_lyric_overlay()
 
     def _close_lyric_overlay(self) -> None:
         """销毁歌词浮层并清理引用。"""
         if self._lyric_overlay is None:
             return
+        timer = getattr(self, "_overlay_rows_timer", None)
+        if timer:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:
+                pass
+            self._overlay_rows_timer = None
         self._lyric_overlay.destroy()
         self._lyric_overlay = None
         self._overlay_cover_photo = None
         self._overlay_lyric_vars = []
         self._overlay_lyric_labels = []
+        self._overlay_lyric_frame = None
+        self._overlay_row_count = 0
 
     def _refresh_overlay_header(self) -> None:
         """刷新浮层左栏：放大封面、歌曲名、歌手名。"""
@@ -2628,15 +3069,16 @@ class LrcPlayerApp:
         return stem
 
     def _update_lyric_overlay(self) -> None:
-        """刷新浮层右栏七行歌词：中间为当前逐字行，上下为主干歌词。"""
-        if self._lyric_overlay is None or not self._overlay_lyric_vars:
-            return
+        """刷新浮层歌词行：中间为当前逐字行，上下为该行前后主干歌词。"""
         vars_ = self._overlay_lyric_vars
+        if self._lyric_overlay is None or not vars_:
+            return
+        middle = len(vars_) // 2
         for var in vars_:
             var.set("")
         if not self.lrc_lines:
-            vars_[3].set("未加载歌词" if self.lrc_path is None
-                         else "未找到时间轴歌词")
+            vars_[middle].set("未加载歌词" if self.lrc_path is None
+                              else "未找到时间轴歌词")
             return
 
         # 当前行（-1 时按首行处理，与主窗口一致）
@@ -2648,15 +3090,17 @@ class LrcPlayerApp:
         if cur not in stem_indices:
             g += 1  # 逐字中间态属于下一个主干分组
 
-        # 上三行 / 下三行：主干完整歌词（去尾部占位空白）
-        for offset in (-3, -2, -1, 1, 2, 3):
+        # 上下各 middle 行：主干完整歌词（去尾部占位空白）
+        for offset in range(-middle, middle + 1):
+            if offset == 0:
+                continue
             idx = g + offset
             if 0 <= idx < len(stem_indices):
                 text = self.lrc_lines[stem_indices[idx]][1].rstrip(" \u3000")
-                vars_[offset + 3].set(text)
+                vars_[middle + offset].set(text)
 
         # 中间行与现有解析一致（逐字原样）
-        vars_[3].set(self.lrc_lines[cur][1])
+        vars_[middle].set(self.lrc_lines[cur][1])
 
     # ==================================================================
     # 主循环
@@ -2768,5 +3212,6 @@ class LrcPlayerApp:
 
     def on_close(self) -> None:
         """窗口关闭时的清理。"""
+        self._flush_config_save()   # 兜底保存最新配置/文件夹
         self.engine.quit()
         self.root.destroy()

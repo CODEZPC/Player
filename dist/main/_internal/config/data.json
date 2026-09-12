@@ -1,0 +1,19 @@
+{
+  "config": {
+    "speed": 1.0,
+    "pitch_fix": false,
+    "pitch_shift": 0,
+    "volume": 100,
+    "lrc_offset": 12.0,
+    "balance": 0.0,
+    "gain": 1.0,
+    "play_mode": "loop_all",
+    "always_on_top": false
+  },
+  "folders": [
+    "D:\\codefile\\File\\Music\\MSC\\Codelib",
+    "D:\\codefile\\File\\Music\\MSC\\Phigros-OST",
+    "D:\\codefile\\File\\Music\\MSC\\ADOFAI-OST"
+  ],
+  "active_folder": "D:\\codefile\\File\\Music\\MSC\\Codelib"
+}
