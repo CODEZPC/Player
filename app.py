@@ -3242,7 +3242,12 @@ class LrcPlayerApp:
             anchor="center", justify="center")
         self._lyric_bar_label.pack(fill="both", expand=True)
         self._lyric_bar = bar
-        self._enable_lyric_bar_click_through(bar)
+        # 点击穿透须在窗口映射后设置到顶层窗口（延迟一轮事件循环）
+        try:
+            bar.after(0,
+                      lambda b=bar: self._enable_lyric_bar_click_through(b))
+        except Exception:
+            pass
 
     def _enable_lyric_bar_click_through(self, bar: tk.Toplevel) -> None:
         """Windows：为歌词条添加鼠标点击穿透（不遮挡下方窗口的点击操作）。"""
@@ -3250,16 +3255,27 @@ class LrcPlayerApp:
             return
         try:
             import ctypes
+            import ctypes.wintypes as wintypes
             user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(bar.winfo_id()) or bar.winfo_id()
+            user32.GetParent.restype = wintypes.HWND
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            user32.GetWindowLongW.restype = ctypes.c_long
+            user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.SetWindowLongW.restype = ctypes.c_long
+            user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int,
+                                              ctypes.c_long]
+            inner = bar.winfo_id()
+            hwnd = (user32.GetAncestor(inner, 2)      # GA_ROOT 顶层窗口
+                    or user32.GetParent(inner) or inner)
             gwl_exstyle = -20
-            ws_ex_transparent = 0x00000020   # 鼠标穿透
-            ws_ex_layered = 0x00080000       # 与 -alpha 半透明配合
-            ws_ex_noactivate = 0x08000000    # 点击不激活窗口
-            style = user32.GetWindowLongW(hwnd, gwl_exstyle)
+            style = user32.GetWindowLongW(hwnd, gwl_exstyle) & 0xFFFFFFFF
             user32.SetWindowLongW(
                 hwnd, gwl_exstyle,
-                style | ws_ex_transparent | ws_ex_layered | ws_ex_noactivate)
+                style | 0x00000020    # WS_EX_TRANSPARENT 鼠标穿透
+                | 0x00080000          # WS_EX_LAYERED（与 -alpha 配合）
+                | 0x08000000)         # WS_EX_NOACTIVATE 点击不激活
         except Exception:
             pass
 
