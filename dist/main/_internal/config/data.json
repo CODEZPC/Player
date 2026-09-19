@@ -1,21 +1,16 @@
 {
   "config": {
     "speed": 1.0,
-    "pitch_fix": true,
+    "pitch_fix": false,
     "pitch_shift": 0,
     "volume": 100,
     "lrc_offset": 0.0,
     "balance": 0.0,
     "gain": 1.0,
-    "play_mode": "shuffle",
+    "play_mode": "loop_all",
     "always_on_top": false,
-    "lyric_bar": "off"
+    "lyric_bar": "bottom"
   },
-  "folders": [
-    "D:\\codefile\\File\\Music\\MSC\\Codelib",
-    "D:\\codefile\\File\\Music\\MSC\\Phigros-OST",
-    "D:\\codefile\\File\\Music\\MSC\\ADOFAI-OST",
-    "D:\\codefile\\File\\Music\\MSC\\PhiloDeka-OST"
-  ],
-  "active_folder": "D:\\codefile\\File\\Music\\MSC\\Codelib"
+  "folders": [],
+  "active_folder": null
 }

@@ -7,14 +7,10 @@
     "lrc_offset": 0.0,
     "balance": 0.0,
     "gain": 1.0,
-    "play_mode": "single",
+    "play_mode": "loop_all",
     "always_on_top": false,
-    "lyric_bar": "top"
+    "lyric_bar": "bottom"
   },
-  "folders": [
-    "D:\\codefile\\File\\Music\\MSC\\Codelib",
-    "D:\\codefile\\File\\Music\\MSC\\Phigros-OST",
-    "D:\\codefile\\File\\Music\\MSC\\ADOFAI-OST"
-  ],
-  "active_folder": "D:\\codefile\\File\\Music\\MSC\\ADOFAI-OST"
+  "folders": [],
+  "active_folder": null
 }

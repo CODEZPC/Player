@@ -53,6 +53,7 @@ class PlayerConsole:
         "  set <obj> reset / set reset       重置单项 / 全部重置\n"
         "  app topmost <true/false>          窗口置顶开关\n"
         "  app floatlayer                    开关歌词浮层\n"
+        "  app lyricbar <off|top|bottom>     桌面歌词条（关闭/顶部/底部）\n"
         "  app exit                          退出程序\n"
         "  interlude add <song...>           添加多首到插播\n"
         "  interlude clear                   清空插播\n"
@@ -540,7 +541,7 @@ class PlayerConsole:
     def _cmd_app(self, parts: list) -> str:
         """app topmost / floatlayer / exit。"""
         if len(parts) < 2:
-            return "用法: app <topmost|floatlayer|exit>"
+            return "用法: app <topmost|floatlayer|lyricbar|exit>"
         sub = parts[1].lower()
         app = self.app
 
@@ -561,6 +562,16 @@ class PlayerConsole:
                 return "未加载歌曲，无法打开歌词浮层"
             app._open_lyric_overlay()
             return "已打开歌词浮层"
+
+        if sub == "lyricbar":
+            if len(parts) < 3:
+                return "用法: app lyricbar <off|top|bottom>"
+            mode = parts[2].lower()
+            if mode not in ("off", "top", "bottom"):
+                return "参数错误: lyricbar ∈ {off, top, bottom}"
+            app._set_lyric_bar_mode(mode)
+            label = {"off": "关闭", "top": "顶部", "bottom": "底部"}[mode]
+            return f"桌面歌词: {label}"
 
         if sub == "exit":
             app.on_close()
@@ -786,7 +797,7 @@ class PlayerConsole:
                                 "reset")
                     if w.startswith(token)]
         if words[0] == "app" and n == 2:
-            return [w for w in ("topmost", "floatlayer", "exit")
+            return [w for w in ("topmost", "floatlayer", "lyricbar", "exit")
                     if w.startswith(token)]
         if words[0] == "interlude" and n == 2:
             return [w for w in ("add", "clear", "insert", "remove", "move")
