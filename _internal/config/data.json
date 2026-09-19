@@ -4,11 +4,12 @@
     "pitch_fix": false,
     "pitch_shift": 0,
     "volume": 100,
-    "lrc_offset": 12.0,
+    "lrc_offset": 0.0,
     "balance": 0.0,
     "gain": 1.0,
     "play_mode": "loop_all",
-    "always_on_top": false
+    "always_on_top": false,
+    "lyric_bar": "top"
   },
   "folders": [
     "D:\\codefile\\File\\Music\\MSC\\Codelib",

@@ -30,6 +30,7 @@ DEFAULTS: dict = {
         "gain": 1.0,
         "play_mode": "loop_all",
         "always_on_top": False,
+        "lyric_bar": "off",   # 桌面歌词条：off / top / bottom
     },
 }
 

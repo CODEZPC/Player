@@ -77,7 +77,7 @@ class LrcPlayerApp:
             title += " 缩小兼容模式"
         self.root.title(title)
         self.root.configure(bg=BG_COLOR)
-        self.root.minsize(self._px(1380), self._px(600))
+        self.root.minsize(self._px(1280), self._px(660))
         self.root.resizable(True, True)
 
         # ---- 音频引擎 ----
@@ -121,6 +121,15 @@ class LrcPlayerApp:
         self._overlay_cover_photo = None
         self._overlay_lyric_vars: list[tk.StringVar] = []
 
+        # ---- 桌面歌词条（独立置顶小窗，模式 off / top / bottom）----
+        self._lyric_bar: tk.Toplevel | None = None
+        self._lyric_bar_label: tk.Label | None = None
+        self._lyric_bar_var: tk.StringVar | None = None
+        self._lyric_bar_mode = "off"
+        self._lyric_mode_btns: dict[str, tk.Button] = {}
+        self._mode_btns: dict[str, tk.Button] = {}
+        self._topmost_btns: dict[bool, tk.Button] = {}
+
         # ---- 播放状态 ----
         self.is_playing = False
         self.is_paused = False
@@ -154,6 +163,7 @@ class LrcPlayerApp:
         self.overlay_artist_font = self._pick_font("汉仪文黑-85W", self._font_size(14))
         self.overlay_lyric_big_font = self._pick_font("汉仪文黑-85W", self._font_size(24))
         self.overlay_lyric_small_font = self._pick_font("汉仪文黑-85W", self._font_size(13))
+        self.lyric_bar_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
 
         # ---- 构建 ----
         self._configure_style()
@@ -402,8 +412,7 @@ class LrcPlayerApp:
                             self.always_on_top))
             # 始终把实际置顶同步为用户意图，杜绝残留
             self.root.attributes("-topmost", self.always_on_top)
-            self.topmost_btn.config(
-                text="置顶: 开" if self.always_on_top else "置顶: 关")
+            self._refresh_topmost_buttons()
 
     def _build_header(self, parent: tk.Frame) -> None:
         """顶部：当前歌词行 + 音视频信息行。"""
@@ -433,7 +442,7 @@ class LrcPlayerApp:
         info_label.pack(fill="x", pady=(4, 6))
 
     def _build_button_rows(self, parent: tk.Frame) -> None:
-        """两行按钮，每行 5 个。包裹在容器中供取消条覆盖。"""
+        """两行按钮，每行 4 个。包裹在容器中供取消条覆盖。"""
         self._btn_container = tk.Frame(parent, bg=BG_COLOR)
         self._btn_container.pack(fill="x")
         btn_cfg = dict(
@@ -468,11 +477,6 @@ class LrcPlayerApp:
             row1, text="下一曲", command=self._next_track, **btn_cfg)
         self.next_btn.pack(side="left", padx=(self._px(6), 0))
 
-        mode_label = PLAY_MODES[self.play_mode_index][0]
-        self.mode_btn = tk.Button(
-            row1, text=f"模式: {mode_label}", command=self._toggle_play_mode, **btn_cfg)
-        self.mode_btn.pack(side="left", padx=(self._px(6), 0))
-
         # ---- 第二行 ----
         row2 = tk.Frame(self._btn_container, bg=BG_COLOR)
         row2.pack(fill="x", pady=(6, 0))
@@ -492,10 +496,6 @@ class LrcPlayerApp:
         self.forward_10s_btn = tk.Button(
             row2, text="前进10s", command=self._seek_forward_10s, **btn_cfg)
         self.forward_10s_btn.pack(side="left", padx=(self._px(6), 0))
-
-        self.topmost_btn = tk.Button(
-            row2, text="置顶: 关", command=self._toggle_topmost, **btn_cfg)
-        self.topmost_btn.pack(side="left", padx=(self._px(6), 0))
 
     def _build_progress_bar(self, parent: tk.Frame) -> None:
         """进度条 + 右侧时间标签。"""
@@ -815,8 +815,8 @@ class LrcPlayerApp:
         self.bottom_frame.pack(fill="both", expand=True, pady=(6, 0))
         if not self._first_scan_done:
             self._first_scan_done = True
-            self.root.geometry(f"{self._px(1380)}x{self._px(600)}")
-            self.root.minsize(self._px(1380), self._px(600))
+            self.root.geometry(f"{self._px(1280)}x{self._px(660)}")
+            self.root.minsize(self._px(1280), self._px(660))
 
     def _select_folder_by_index(self, index: int) -> None:
         """切换当前选中文件夹：把其缓存结果挂到 audio_items 并刷新右侧列表。"""
@@ -1129,6 +1129,59 @@ class LrcPlayerApp:
             "_gain_scale", "_gain_val",
             self._on_gain_changed, "gain")
 
+        # ---- 选项区：桌面歌词 / 播放模式 / 置顶（无缝按钮组）----
+        opt_frame = tk.Frame(parent, bg=BG_COLOR)
+        opt_frame.pack(side="top", fill="x", pady=(18, 4))
+
+        tk.Label(opt_frame, text="选项", bg=BG_COLOR, fg=ACCENT_COLOR,
+                 font=self.button_font, anchor="w").pack(anchor="w")
+
+        # 桌面歌词：关闭 / 顶部 / 底部
+        box = self._build_option_row(opt_frame, "桌面歌词")
+        for text, mode in (("关闭", "off"), ("顶部", "top"),
+                           ("底部", "bottom")):
+            self._lyric_mode_btns[mode] = self._make_seam_button(
+                box, text, lambda m=mode: self._set_lyric_bar_mode(m))
+        self._refresh_lyric_mode_buttons()
+
+        # 播放模式：关闭（仅一首）/ 列表（列表循环）/ 单曲（单曲循环）/ 随机
+        box = self._build_option_row(opt_frame, "模式")
+        for text, mode in (("关闭", "single"), ("列表", "loop_all"),
+                           ("单曲", "loop_one"), ("随机", "shuffle")):
+            self._mode_btns[mode] = self._make_seam_button(
+                box, text, lambda m=mode: self._set_play_mode(m))
+        self._refresh_mode_buttons()
+
+        # 置顶：开 / 关
+        box = self._build_option_row(opt_frame, "置顶")
+        for text, val in (("开", True), ("关", False)):
+            self._topmost_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self._set_topmost(v))
+        self._refresh_topmost_buttons()
+
+    def _build_option_row(self, parent: tk.Frame, title: str) -> tk.Frame:
+        """「选项」区一行：左侧定宽标签 + 右侧无缝按钮容器（返回容器）。"""
+        row = tk.Frame(parent, bg=BG_COLOR)
+        row.pack(fill="x", pady=(2, 0))
+        tk.Label(row, text=title, bg=BG_COLOR, fg=FG_COLOR,
+                 font=self.list_font, anchor="w",
+                 width=8).pack(side="left")
+        box = tk.Frame(row, bg=BG_COLOR)
+        box.pack(side="right")
+        return box
+
+    def _make_seam_button(self, box: tk.Frame, text: str,
+                          command) -> tk.Button:
+        """创建无缝衔接小按钮（无间距无边框）并 pack 到按钮容器。"""
+        b = tk.Button(
+            box, text=text, command=command,
+            bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.button_font_sm,
+            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
+            relief="flat", bd=0, highlightthickness=0,
+            padx=self._px(8), pady=self._px(2))
+        b.pack(side="left")   # 无缝衔接：按钮之间不留间距
+        return b
+
     def _on_speed_press(self, _event: tk.Event) -> None:
         """倍速拖动开始：拖拽条（左取消/右重置）覆盖标题行。"""
         if not self.engine.ready or not self.audio_path:
@@ -1263,7 +1316,7 @@ class LrcPlayerApp:
         row = tk.Frame(parent, bg=BG_COLOR)
         row.pack(fill="x", pady=(4, 0))
         tk.Label(row, text=title, bg=BG_COLOR, fg=FG_COLOR,
-                 font=self.info_font, width=8, anchor="w").pack(side="left")
+                 font=self.list_font, width=8, anchor="w").pack(side="left")
         var = tk.DoubleVar(value=default)
         setattr(self, var_attr, var)
         scale = ttk.Scale(row, style="LRC.Horizontal.TScale",
@@ -2194,7 +2247,7 @@ class LrcPlayerApp:
         if lrc_path and os.path.exists(lrc_path):
             self._load_lrc_file(lrc_path)
         else:
-            self._clear_lrc()
+            self._apply_placeholder_lrc(path)
         self._refresh_status_bar()
         if autoplay:
             self._play()
@@ -2204,12 +2257,22 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _auto_load_lrc(self, audio_path: str) -> None:
-        """自动查找并加载与音频同目录同名的 .lrc 文件。"""
+        """自动查找并加载与音频同目录同名的 .lrc 文件；缺失时用占位歌词。"""
         candidate = self._find_lrc_for_audio(audio_path)
         if candidate:
             self._load_lrc_file(candidate)
         else:
-            self._clear_lrc()
+            self._apply_placeholder_lrc(audio_path)
+
+    def _apply_placeholder_lrc(self, audio_path: str) -> None:
+        """无歌词文件时的内存占位歌词（[00:00.00]歌曲名），不写盘。"""
+        name = os.path.splitext(os.path.basename(audio_path))[0] or "未命名"
+        self.lrc_lines = [(0.0, name)]
+        self.lrc_times = [0.0]
+        self.current_lrc_index = -1
+        self.lrc_path = None          # 无真实歌词文件
+        self._refresh_lyric_display()
+        self._update_info()
 
     @staticmethod
     def _find_lrc_for_audio(audio_path: str) -> str | None:
@@ -2242,14 +2305,16 @@ class LrcPlayerApp:
         self._update_info()
 
     def _refresh_lyric_display(self) -> None:
-        """刷新歌词显示区。"""
+        """刷新歌词显示区（同时刷新桌面歌词条）。"""
         if not self.lrc_lines:
             self.now_line_var.set(
                 "未加载歌词" if self.lrc_path is None else "未找到时间轴歌词")
             self._update_lyric_overlay()
+            self._update_lyric_bar()
             return
         self.now_line_var.set(self.lrc_lines[0][1])
         self._update_lyric_overlay()
+        self._update_lyric_bar()
 
     # ==================================================================
     # 信息行
@@ -2438,13 +2503,23 @@ class LrcPlayerApp:
     # 播放模式
     # ==================================================================
 
-    def _toggle_play_mode(self) -> None:
-        """切换播放模式。"""
-        self.play_mode_index = (self.play_mode_index + 1) % len(PLAY_MODES)
-        label, mode = PLAY_MODES[self.play_mode_index]
-        self.play_mode = mode
-        self.mode_btn.config(text=f"模式: {label}")
+    def _set_play_mode(self, mode: str) -> None:
+        """直接设置播放模式（选项区按钮 / 控制台 `set mode` 共用）。"""
+        idx = next((i for i, (_, m) in enumerate(PLAY_MODES) if m == mode), 0)
+        self.play_mode_index = idx
+        self.play_mode = PLAY_MODES[idx][1]
+        self._refresh_mode_buttons()
         self._schedule_config_save()
+
+    def _refresh_mode_buttons(self) -> None:
+        """刷新模式按钮组选中态：当前模式高亮（ACCENT 底/深色字）。"""
+        for mode, btn in getattr(self, "_mode_btns", {}).items():
+            active = (mode == self.play_mode)
+            try:
+                btn.config(bg=ACCENT_COLOR if active else SUBTLE_COLOR,
+                           fg=BG_COLOR if active else FG_COLOR)
+            except tk.TclError:
+                pass
 
     # ==================================================================
     # 配置持久化（_internal/config/data.json）
@@ -2474,6 +2549,7 @@ class LrcPlayerApp:
             "gain": round(float(self.engine.get_gain()), 2),
             "play_mode": self.play_mode,
             "always_on_top": bool(self.always_on_top),
+            "lyric_bar": self._lyric_bar_mode,
         }
 
     def _collect_persist(self) -> dict:
@@ -2572,13 +2648,17 @@ class LrcPlayerApp:
         idx = next((i for i, (_, m) in enumerate(PLAY_MODES) if m == mode), 0)
         self.play_mode_index = idx
         self.play_mode = PLAY_MODES[idx][1]
-        self.mode_btn.config(text=f"模式: {PLAY_MODES[idx][0]}")
+        self._refresh_mode_buttons()
 
         # 置顶（直接设置，不走 _set_topmost 以免触发保存）
         top = bool(cfg.get("always_on_top", False))
         self.always_on_top = top
         self.root.attributes("-topmost", top)
-        self.topmost_btn.config(text="置顶: 开" if top else "置顶: 关")
+        self._refresh_topmost_buttons()
+
+        # 桌面歌词条模式（persist=False：不触发保存）
+        self._set_lyric_bar_mode(str(cfg.get("lyric_bar", "off")),
+                                  persist=False)
 
     def _load_persisted_state(self) -> None:
         """启动时读取 data.json：应用配置；计划恢复文件夹（后台自动扫描，跳过缺失）。"""
@@ -2742,23 +2822,28 @@ class LrcPlayerApp:
     # 置顶
     # ==================================================================
 
-    def _toggle_topmost(self) -> None:
-        """切换窗口置顶状态（按钮回调）。"""
-        self._set_topmost(not self.always_on_top)
-
     def _set_topmost(self, on: bool) -> None:
-        """设置窗口置顶状态（按钮/控制台共用入口）。
+        """设置窗口置顶状态（选项区按钮 / 控制台共用入口）。
 
         全屏时 Windows 会自动置顶；这里把"用户主动改过置顶"记为标记，
         供退出全屏时决定是否保留（避免被还原成进入全屏前的旧状态）。
         """
         self.always_on_top = bool(on)
         self.root.attributes("-topmost", self.always_on_top)
-        self.topmost_btn.config(
-            text="置顶: 开" if self.always_on_top else "置顶: 关")
+        self._refresh_topmost_buttons()
         if bool(self.root.attributes("-fullscreen")):
             self._topmost_edited_in_fullscreen = True
         self._schedule_config_save()
+
+    def _refresh_topmost_buttons(self) -> None:
+        """刷新置顶按钮组选中态：当前状态高亮（ACCENT 底/深色字）。"""
+        for val, btn in getattr(self, "_topmost_btns", {}).items():
+            active = (bool(val) == bool(self.always_on_top))
+            try:
+                btn.config(bg=ACCENT_COLOR if active else SUBTLE_COLOR,
+                           fg=BG_COLOR if active else FG_COLOR)
+            except tk.TclError:
+                pass
 
     # ==================================================================
     # 播放状态
@@ -2808,21 +2893,25 @@ class LrcPlayerApp:
             self._update_info()
 
     def _highlight_line(self, index: int) -> None:
-        """高亮指定索引的歌词行，并同步歌词浮层。"""
+        """高亮指定索引的歌词行，并同步歌词浮层与桌面歌词条。"""
         if not self.lrc_lines:
             self.now_line_var.set(
                 "未加载歌词" if self.lrc_path is None else "未找到时间轴歌词")
             self._update_lyric_overlay()
+            self._update_lyric_bar()
             return
         if index < 0:
             self.now_line_var.set(self.lrc_lines[0][1])
             self._update_lyric_overlay()
+            self._update_lyric_bar()
             return
         if index >= len(self.lrc_lines):
             self._update_lyric_overlay()
+            self._update_lyric_bar()
             return
         self.now_line_var.set(self.lrc_lines[index][1])
         self._update_lyric_overlay()
+        self._update_lyric_bar()
 
     # ==================================================================
     # 全窗口歌词浮层（点击封面打开）
@@ -3103,6 +3192,128 @@ class LrcPlayerApp:
         vars_[middle].set(self.lrc_lines[cur][1])
 
     # ==================================================================
+    # 桌面歌词条（独立置顶小窗：关闭 / 顶部 / 底部）
+    # ==================================================================
+
+    def _set_lyric_bar_mode(self, mode: str, persist: bool = True) -> None:
+        """切换桌面歌词条模式（off / top / bottom）。
+
+        persist=False 供启动恢复与重置复用（不触发保存）。
+        """
+        if mode not in ("off", "top", "bottom"):
+            mode = "off"
+        self._lyric_bar_mode = mode
+        if mode == "off":
+            self._destroy_lyric_bar()
+        else:
+            self._ensure_lyric_bar()
+            self._update_lyric_bar()
+        self._refresh_lyric_mode_buttons()
+        if persist:
+            self._schedule_config_save()
+
+    def _refresh_lyric_mode_buttons(self) -> None:
+        """刷新三按钮选中态：当前模式高亮（ACCENT），其余常态。"""
+        for mode, btn in getattr(self, "_lyric_mode_btns", {}).items():
+            active = (mode == self._lyric_bar_mode)
+            try:
+                btn.config(bg=ACCENT_COLOR if active else SUBTLE_COLOR,
+                           fg=BG_COLOR if active else FG_COLOR)
+            except tk.TclError:
+                pass
+
+    def _ensure_lyric_bar(self) -> None:
+        """创建桌面歌词条窗口：无修饰符 + 置顶 + 半透明 + 不占任务栏。"""
+        if self._lyric_bar is not None:
+            return
+        bar = tk.Toplevel(self.root)
+        bar.overrideredirect(True)   # 无窗口修饰符
+        bar.configure(bg=BG_COLOR)
+        for attr, val in (("-topmost", True), ("-alpha", 0.85),
+                          ("-toolwindow", True)):
+            try:
+                bar.attributes(attr, val)
+            except tk.TclError:
+                pass
+        self._lyric_bar_var = tk.StringVar(value="")
+        self._lyric_bar_label = tk.Label(
+            bar, textvariable=self._lyric_bar_var, bg=BG_COLOR,
+            fg=ACCENT_COLOR, font=self.lyric_bar_font,
+            anchor="center", justify="center")
+        self._lyric_bar_label.pack(fill="both", expand=True)
+        self._lyric_bar = bar
+        self._enable_lyric_bar_click_through(bar)
+
+    def _enable_lyric_bar_click_through(self, bar: tk.Toplevel) -> None:
+        """Windows：为歌词条添加鼠标点击穿透（不遮挡下方窗口的点击操作）。"""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(bar.winfo_id()) or bar.winfo_id()
+            gwl_exstyle = -20
+            ws_ex_transparent = 0x00000020   # 鼠标穿透
+            ws_ex_layered = 0x00080000       # 与 -alpha 半透明配合
+            ws_ex_noactivate = 0x08000000    # 点击不激活窗口
+            style = user32.GetWindowLongW(hwnd, gwl_exstyle)
+            user32.SetWindowLongW(
+                hwnd, gwl_exstyle,
+                style | ws_ex_transparent | ws_ex_layered | ws_ex_noactivate)
+        except Exception:
+            pass
+
+    def _destroy_lyric_bar(self) -> None:
+        """销毁桌面歌词条窗口（幂等）。"""
+        bar = self._lyric_bar
+        self._lyric_bar = None
+        self._lyric_bar_label = None
+        if bar is not None:
+            try:
+                bar.destroy()
+            except tk.TclError:
+                pass
+
+    def _current_stem_line_text(self) -> str:
+        """当前播放位置对应的**完整主干行**文本（跳过逐字展开中间态）。"""
+        if not self.lrc_lines:
+            return ("未加载歌词" if self.lrc_path is None
+                    else "未找到时间轴歌词")
+        cur = self.current_lrc_index if self.current_lrc_index >= 0 else 0
+        cur = max(0, min(cur, len(self.lrc_lines) - 1))
+        stem = self._build_lyric_stem(self.lrc_lines)
+        if not stem:
+            return self.lrc_lines[cur][1].rstrip(" \u3000")
+        g = bisect_right(stem, cur) - 1
+        if cur not in stem:
+            g += 1   # 逐字中间态属于下一个主干分组
+        g = max(0, min(g, len(stem) - 1))
+        return self.lrc_lines[stem[g]][1].rstrip(" \u3000")
+
+    def _update_lyric_bar(self) -> None:
+        """刷新歌词条内容与几何：屏幕居中，宽度随歌词实时变化。
+
+        初始宽度为屏幕 1/4；歌词较长时加宽，上限为屏幕全宽。
+        """
+        if self._lyric_bar is None or self._lyric_bar_var is None:
+            return
+        text = self._current_stem_line_text()
+        self._lyric_bar_var.set(text)
+        try:
+            need = self.lyric_bar_font.measure(text) + self._px(40)
+        except Exception:
+            need = 0
+        width = min(self.screen_w, max(self.screen_w // 4, need))
+        height = self.lyric_bar_font.metrics("linespace") + self._px(18)
+        x = (self.screen_w - width) // 2
+        y = 0 if self._lyric_bar_mode == "top" else self.screen_h - height
+        try:
+            self._lyric_bar.geometry(f"{width}x{height}+{x}+{y}")
+            self._lyric_bar.lift()
+        except tk.TclError:
+            pass
+
+    # ==================================================================
     # 主循环
     # ==================================================================
 
@@ -3203,7 +3414,7 @@ class LrcPlayerApp:
         if lrc and os.path.exists(lrc):
             self._load_lrc_file(lrc)
         else:
-            self._clear_lrc()
+            self._apply_placeholder_lrc(path)
         self._play()
 
     # ==================================================================
@@ -3213,5 +3424,6 @@ class LrcPlayerApp:
     def on_close(self) -> None:
         """窗口关闭时的清理。"""
         self._flush_config_save()   # 兜底保存最新配置/文件夹
+        self._destroy_lyric_bar()   # 先销毁独立歌词条小窗
         self.engine.quit()
         self.root.destroy()

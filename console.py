@@ -438,9 +438,7 @@ class PlayerConsole:
             from app import PLAY_MODES
             idx = self.MODE_MAP[name]
             label, mode = PLAY_MODES[idx]
-            app.play_mode_index = idx
-            app.play_mode = mode
-            app.mode_btn.config(text=f"模式: {label}")
+            app._set_play_mode(mode)   # 同步选项区按钮高亮与保存
             return f"模式: {label}"
 
         if obj == "rate":
