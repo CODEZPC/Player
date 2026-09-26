@@ -9,8 +9,13 @@
     "gain": 1.0,
     "play_mode": "loop_all",
     "always_on_top": false,
-    "lyric_bar": "bottom"
+    "lyric_bar": "off",
+    "lyric_alpha": 85,
+    "lyric_width": 25,
+    "lyric_font": 18
   },
-  "folders": [],
-  "active_folder": null
+  "folders": [
+    "D:\\codefile\\File\\Music"
+  ],
+  "active_folder": "D:\\codefile\\File\\Music"
 }

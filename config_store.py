@@ -4,9 +4,10 @@
 {
   "folders": [path, ...],      # 已加载的文件夹（下次启动自动恢复，不存在则跳过）
   "active_folder": path|null,  # 上次选中的文件夹
-  "config": {                  # 右侧操作栏 / 播放模式 / 置顶 配置
+  "config": {                  # 右侧操作栏 / 播放模式 / 置顶 / 桌面歌词条 配置
     "speed", "pitch_fix", "pitch_shift", "volume",
-    "lrc_offset", "balance", "gain", "play_mode", "always_on_top"
+    "lrc_offset", "balance", "gain", "play_mode", "always_on_top",
+    "lyric_bar", "lyric_alpha", "lyric_width", "lyric_font"
   }
 }
 
@@ -30,7 +31,10 @@ DEFAULTS: dict = {
         "gain": 1.0,
         "play_mode": "loop_all",
         "always_on_top": False,
-        "lyric_bar": "off",   # 桌面歌词条：off / top / bottom
+        "lyric_bar": "off",       # 桌面歌词条：off / top / bottom
+        "lyric_alpha": 85,       # 歌词条透明度（30~100 %）
+        "lyric_width": 25,       # 歌词条初始宽度（占屏幕 %）
+        "lyric_font": 18,        # 歌词条字体大小（px）
     },
 }
 

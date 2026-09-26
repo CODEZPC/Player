@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font as tkfont
 
 import config_store
+from operation_panel import OperationPanel
 from lrc_parser import LrcParser
 from audio_engine import AudioEngine
 from cover_utils import extract_cover_art, cover_to_tk_image
@@ -126,9 +127,9 @@ class LrcPlayerApp:
         self._lyric_bar_label: tk.Label | None = None
         self._lyric_bar_var: tk.StringVar | None = None
         self._lyric_bar_mode = "off"
-        self._lyric_mode_btns: dict[str, tk.Button] = {}
-        self._mode_btns: dict[str, tk.Button] = {}
-        self._topmost_btns: dict[bool, tk.Button] = {}
+        self._lyric_bar_alpha = 85        # 歌词条透明度（30~100 %）
+        self._lyric_bar_width_pct = 25    # 歌词条初始宽度（占屏幕 %）
+        self._lyric_bar_font_size = 18    # 歌词条字体大小（px）
 
         # ---- 播放状态 ----
         self.is_playing = False
@@ -147,10 +148,6 @@ class LrcPlayerApp:
         self.always_on_top = False
         self.play_mode_index = 0
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
-        self._speed_dragging = False
-        self._pitch_dragging = False
-        self._adv_dragging = False
-        self._adv_active: str | None = None
 
         # ---- 字体（小屏按 ui_scale 缩放）----
         self.title_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
@@ -163,7 +160,8 @@ class LrcPlayerApp:
         self.overlay_artist_font = self._pick_font("汉仪文黑-85W", self._font_size(14))
         self.overlay_lyric_big_font = self._pick_font("汉仪文黑-85W", self._font_size(24))
         self.overlay_lyric_small_font = self._pick_font("汉仪文黑-85W", self._font_size(13))
-        self.lyric_bar_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
+        self.lyric_bar_font = self._pick_font(
+            "汉仪文黑-85W", self._font_size(self._lyric_bar_font_size))
 
         # ---- 构建 ----
         self._configure_style()
@@ -297,7 +295,8 @@ class LrcPlayerApp:
         op_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(340, 260))
         op_col.grid(row=0, column=2, sticky="nsew", padx=(self._px(12), 0))
         op_col.pack_propagate(False)  # 子控件为 pack，须用 pack_propagate 保持定宽
-        self._build_operation_area(op_col)
+        # 操作区面板（自包含滚动容器 + 倍速/音高/音量/高级/选项，见 operation_panel.py）
+        self.op = OperationPanel(self, op_col)
 
         # ---- 状态栏 ----
         self._build_status_bar()
@@ -412,7 +411,7 @@ class LrcPlayerApp:
                             self.always_on_top))
             # 始终把实际置顶同步为用户意图，杜绝残留
             self.root.attributes("-topmost", self.always_on_top)
-            self._refresh_topmost_buttons()
+            self.op.refresh_topmost_buttons()
 
     def _build_header(self, parent: tk.Frame) -> None:
         """顶部：当前歌词行 + 音视频信息行。"""
@@ -970,456 +969,15 @@ class LrcPlayerApp:
         self.cover_label.bind("<Button-1>", self._open_lyric_overlay)
 
     # ==================================================================
-    # 操作区：倍速 / 音量（文字+滑块，带取消机制）
+    # 操作区（倍速 / 音高 / 音量 / 高级功能 / 选项区）
+    #   V1.7.7 提取至 operation_panel.py（OperationPanel，自包含滚动容器），
+    #   实例见 _build_ui 中的 self.op
     # ==================================================================
-
-    def _build_operation_area(self, parent: tk.Frame) -> None:
-        """右侧操作区：倍速区（含保音高开关） + 音量区 + 高级功能区。
-
-        - 倍速：第一行标题行兼作拖拽区，拖动时覆盖「左取消(红)/右重置(蓝)」条；
-        - 音量：无取消，拖动实时生效；
-        - 高级功能：第一行标题行，拖动任一高级滑块时覆盖蓝色「重置」条，仅重置该项。
-        """
-        # ---- 倍速区 ----
-        speed_frame = tk.Frame(parent, bg=BG_COLOR)
-        speed_frame.pack(side="top", fill="x", pady=(4, 18))
-
-        # 第一行：标题 + 按钮（拖动时的拖拽区）
-        self._speed_cancel_row = tk.Frame(speed_frame, bg=BG_COLOR)
-        self._speed_cancel_row.pack(fill="x")
-        tk.Label(self._speed_cancel_row, text="倍速", bg=BG_COLOR,
-                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
-        self._pitch_btn = tk.Button(
-            self._speed_cancel_row, text="保音高: 关",
-            command=self._toggle_pitch_fix,
-            bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.button_font_sm,
-            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
-            relief="flat", padx=6, pady=2)
-        self._pitch_btn.pack(side="right")
-
-        # 第二行：滑块 + 数值（数值在右侧）
-        slider_row = tk.Frame(speed_frame, bg=BG_COLOR)
-        slider_row.pack(fill="x", pady=(2, 0))
-        self._speed_var = tk.DoubleVar(value=1.0)
-        self._speed_scale = ttk.Scale(
-            slider_row, style="LRC.Horizontal.TScale", orient="horizontal",
-            from_=0.1, to=3.0, variable=self._speed_var,
-            command=self._on_speed_changed)
-        self._speed_scale.pack(side="left", fill="x", expand=True)
-        self._speed_scale.bind("<ButtonPress-1>", self._on_speed_press)
-        self._speed_scale.bind("<ButtonRelease-1>", self._on_speed_release)
-        self._speed_preview = tk.Label(
-            slider_row, text="1.00x", width=6, bg=BG_COLOR, fg=FG_COLOR,
-            font=self.info_font, anchor="e")
-        self._speed_preview.pack(side="right", padx=(10, 0))
-
-        # 拖拽条（拖动时覆盖标题行）：左半取消（红）/ 右半重置（蓝）
-        self._speed_drag_bar = tk.Frame(speed_frame, height=self._px(36))
-        self._speed_cancel_part = tk.Frame(self._speed_drag_bar, bg="#6B1010")
-        self._speed_cancel_part.pack(side="left", fill="both", expand=True)
-        tk.Label(self._speed_cancel_part, text="取消",
-                 bg="#6B1010", fg="#FF5555",
-                 font=self.button_font_sm).pack(expand=True)
-        self._speed_reset_part = tk.Frame(self._speed_drag_bar, bg="#1F3A8A")
-        self._speed_reset_part.pack(side="right", fill="both", expand=True)
-        tk.Label(self._speed_reset_part, text="重置",
-                 bg="#1F3A8A", fg="#6FA3FF",
-                 font=self.button_font_sm).pack(expand=True)
-
-        # ---- 音高区（移调：变调不变速，±12 半音）----
-        pitch_frame = tk.Frame(parent, bg=BG_COLOR)
-        pitch_frame.pack(side="top", fill="x", pady=(0, 18))
-
-        # 第一行：标题（拖动音高滑块时重置条覆盖区）
-        self._pitch_cancel_row = tk.Frame(pitch_frame, bg=BG_COLOR)
-        self._pitch_cancel_row.pack(fill="x")
-        tk.Label(self._pitch_cancel_row, text="音高（LAB）", bg=BG_COLOR,
-                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
-
-        # 蓝色重置条（拖动音高滑块时覆盖标题行）
-        self._pitch_reset = tk.Frame(pitch_frame, bg="#1F3A8A",
-                                     height=self._px(36))
-        tk.Label(self._pitch_reset, text="重置", bg="#1F3A8A", fg="#6FA3FF",
-                 font=self.button_font_sm).pack(expand=True)
-
-        # 第二行：滑块 + 数值（数值在右侧）
-        pitch_row = tk.Frame(pitch_frame, bg=BG_COLOR)
-        pitch_row.pack(fill="x", pady=(2, 0))
-        self._pitch_var = tk.DoubleVar(value=0.0)
-        self._pitch_scale = ttk.Scale(
-            pitch_row, style="LRC.Horizontal.TScale", orient="horizontal",
-            from_=-12, to=12, variable=self._pitch_var,
-            command=self._on_pitch_changed)
-        self._pitch_scale.pack(side="left", fill="x", expand=True)
-        self._pitch_scale.bind("<ButtonPress-1>", self._on_pitch_press)
-        self._pitch_scale.bind("<ButtonRelease-1>", self._on_pitch_release)
-        self._pitch_preview = tk.Label(
-            pitch_row, text="0", width=6, bg=BG_COLOR, fg=FG_COLOR,
-            font=self.info_font, anchor="e")
-        self._pitch_preview.pack(side="right", padx=(10, 0))
-
-        # ---- 音量区（无取消，拖动实时生效）----
-        vol_frame = tk.Frame(parent, bg=BG_COLOR)
-        vol_frame.pack(side="top", fill="x")
-
-        # 第一行：标题
-        vol_title_row = tk.Frame(vol_frame, bg=BG_COLOR)
-        vol_title_row.pack(fill="x")
-        tk.Label(vol_title_row, text="音量", bg=BG_COLOR,
-                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
-
-        # 第二行：滑块 + 数值（数值在右侧）
-        vol_slider_row = tk.Frame(vol_frame, bg=BG_COLOR)
-        vol_slider_row.pack(fill="x", pady=(2, 0))
-        self._vol_var = tk.DoubleVar(value=100.0)
-        self._vol_scale = ttk.Scale(
-            vol_slider_row, style="LRC.Horizontal.TScale", orient="horizontal",
-            from_=0, to=100, variable=self._vol_var,
-            command=self._on_vol_changed)
-        self._vol_scale.pack(side="left", fill="x", expand=True)
-        self._vol_preview = tk.Label(
-            vol_slider_row, text="100%", width=6, bg=BG_COLOR, fg=FG_COLOR,
-            font=self.info_font, anchor="e")
-        self._vol_preview.pack(side="right", padx=(10, 0))
-
-        # ---- 高级功能区：歌词偏移 / 声道平衡 / 响度增益 ----
-        adv_frame = tk.Frame(parent, bg=BG_COLOR)
-        adv_frame.pack(side="top", fill="x", pady=(18, 4))
-
-        # 第一行：标题（拖动任一高级滑块时的拖拽区）
-        self._adv_cancel_row = tk.Frame(adv_frame, bg=BG_COLOR)
-        self._adv_cancel_row.pack(fill="x")
-        tk.Label(self._adv_cancel_row, text="高级功能", bg=BG_COLOR,
-                 fg=ACCENT_COLOR, font=self.button_font).pack(side="left")
-        self._console_btn = tk.Button(
-            self._adv_cancel_row, text="控制台",
-            command=self._toggle_console,
-            bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.button_font_sm,
-            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
-            relief="flat", padx=6, pady=2)
-        self._console_btn.pack(side="right")
-        # 「重置」按钮：位于「控制台」左侧（side=right 后 pack → 更靠左）
-        self._reset_btn = tk.Button(
-            self._adv_cancel_row, text="重置",
-            command=self._toggle_reset,
-            bg=SUBTLE_COLOR, fg="#FF9A9A", font=self.button_font_sm,
-            activebackground="#6B1010", activeforeground="#FF5555",
-            relief="flat", padx=6, pady=2)
-        self._reset_btn.pack(side="right")
-
-        # 蓝色重置条（拖动任一高级滑块时覆盖标题行）
-        self._adv_reset = tk.Frame(adv_frame, bg="#1F3A8A",
-                                   height=self._px(36))
-        tk.Label(self._adv_reset, text="重置", bg="#1F3A8A", fg="#6FA3FF",
-                 font=self.button_font_sm).pack(expand=True)
-
-        self._build_adv_slider(
-            adv_frame, "歌词偏移", -60, 60, 0,
-            lambda v: f"{v*10}ms", "_lrc_offset_var",
-            "_lrc_offset_scale", "_lrc_offset_val",
-            self._on_lrc_offset_changed, "lrc")
-        self._build_adv_slider(
-            adv_frame, "声道平衡", -1.0, 1.0, 0.0,
-            lambda v: f"{v:+.2f}", "_balance_var",
-            "_balance_scale", "_balance_val",
-            self._on_balance_changed, "balance")
-        self._build_adv_slider(
-            adv_frame, "响度增益", 0.0, 2.0, 1.0,
-            lambda v: f"{v:.2f}x", "_gain_var",
-            "_gain_scale", "_gain_val",
-            self._on_gain_changed, "gain")
-
-        # ---- 选项区：桌面歌词 / 播放模式 / 置顶（无缝按钮组）----
-        opt_frame = tk.Frame(parent, bg=BG_COLOR)
-        opt_frame.pack(side="top", fill="x", pady=(18, 4))
-
-        tk.Label(opt_frame, text="选项", bg=BG_COLOR, fg=ACCENT_COLOR,
-                 font=self.button_font, anchor="w").pack(anchor="w")
-
-        # 桌面歌词：关闭 / 顶部 / 底部
-        box = self._build_option_row(opt_frame, "桌面歌词")
-        for text, mode in (("关闭", "off"), ("顶部", "top"),
-                           ("底部", "bottom")):
-            self._lyric_mode_btns[mode] = self._make_seam_button(
-                box, text, lambda m=mode: self._set_lyric_bar_mode(m))
-        self._refresh_lyric_mode_buttons()
-
-        # 播放模式：关闭（仅一首）/ 列表（列表循环）/ 单曲（单曲循环）/ 随机
-        box = self._build_option_row(opt_frame, "模式")
-        for text, mode in (("关闭", "single"), ("列表", "loop_all"),
-                           ("单曲", "loop_one"), ("随机", "shuffle")):
-            self._mode_btns[mode] = self._make_seam_button(
-                box, text, lambda m=mode: self._set_play_mode(m))
-        self._refresh_mode_buttons()
-
-        # 置顶：开 / 关
-        box = self._build_option_row(opt_frame, "置顶")
-        for text, val in (("开", True), ("关", False)):
-            self._topmost_btns[val] = self._make_seam_button(
-                box, text, lambda v=val: self._set_topmost(v))
-        self._refresh_topmost_buttons()
-
-    def _build_option_row(self, parent: tk.Frame, title: str) -> tk.Frame:
-        """「选项」区一行：左侧定宽标签 + 右侧无缝按钮容器（返回容器）。"""
-        row = tk.Frame(parent, bg=BG_COLOR)
-        row.pack(fill="x", pady=(2, 0))
-        tk.Label(row, text=title, bg=BG_COLOR, fg=FG_COLOR,
-                 font=self.list_font, anchor="w",
-                 width=8).pack(side="left")
-        box = tk.Frame(row, bg=BG_COLOR)
-        box.pack(side="right")
-        return box
-
-    def _make_seam_button(self, box: tk.Frame, text: str,
-                          command) -> tk.Button:
-        """创建无缝衔接小按钮（无间距无边框）并 pack 到按钮容器。"""
-        b = tk.Button(
-            box, text=text, command=command,
-            bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.button_font_sm,
-            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
-            relief="flat", bd=0, highlightthickness=0,
-            padx=self._px(8), pady=self._px(2))
-        b.pack(side="left")   # 无缝衔接：按钮之间不留间距
-        return b
-
-    def _on_speed_press(self, _event: tk.Event) -> None:
-        """倍速拖动开始：拖拽条（左取消/右重置）覆盖标题行。"""
-        if not self.engine.ready or not self.audio_path:
-            return
-        self._speed_dragging = True
-        self._speed_drag_bar.place(in_=self._speed_cancel_row,
-                                   relx=0, rely=0, relwidth=1, relheight=1)
-
-    def _on_speed_changed(self, value: str) -> None:
-        """倍速拖动中：仅更新预览（吸附到 0.05 步进），不生效。"""
-        if not self._speed_dragging:
-            return
-        v = round(float(value) / 0.05) * 0.05
-        self._speed_var.set(v)
-        self._speed_preview.config(text=f"{v:.2f}x")
-
-    def _on_speed_release(self, _event: tk.Event) -> None:
-        """倍速拖动结束：左半取消回退 / 右半重置为 1.0x / 其余应用。"""
-        if not self._speed_dragging:
-            return
-        self._speed_dragging = False
-        self._speed_drag_bar.place_forget()
-        side = self._pointer_side_in(self._speed_drag_bar)
-        if side == "left":
-            # 取消：回退到当前生效倍速
-            self._speed_var.set(self.engine.get_speed())
-            self._speed_preview.config(text=f"{self.engine.get_speed():.2f}x")
-        elif side == "right":
-            # 重置：回到默认 1.0x
-            v = 1.0
-            self._speed_var.set(v)
-            self.engine.set_speed(v)
-            self._speed_preview.config(text=f"{v:.2f}x")
-        else:
-            v = round(float(self._speed_var.get()) / 0.05) * 0.05
-            self._speed_var.set(v)
-            self.engine.set_speed(v)
-        self._schedule_config_save()
-
-    def _pointer_side_in(self, widget) -> str | None:
-        """判断指针是否在控件内，并返回所在半区（'left'/'right'/None）。"""
-        try:
-            x = self.root.winfo_pointerx() - widget.winfo_rootx()
-            y = self.root.winfo_pointery() - widget.winfo_rooty()
-            if not (0 <= x <= widget.winfo_width()
-                    and 0 <= y <= widget.winfo_height()):
-                return None
-            return "left" if x < widget.winfo_width() / 2 else "right"
-        except Exception:
-            return None
-
-    def _on_vol_changed(self, value: str) -> None:
-        """音量变化：吸附到整数并实时生效（无取消功能）。"""
-        v = int(round(float(value)))
-        v = max(0, min(100, v))
-        self._vol_var.set(v)
-        self.engine.set_volume(v / 100.0)
-        self._update_vol_preview()
-        self._schedule_config_save()
-
-    def _update_vol_preview(self) -> None:
-        """按音量×增益更新音量数值显示；增益≠1 时显示有效音量并置黄色。"""
-        vol = int(round(float(self._vol_var.get())))
-        gain = (self.engine.get_gain()
-                if self.engine.backend == "sounddevice" else 1.0)
-        if abs(gain - 1.0) < 1e-9:
-            self._vol_preview.config(text=f"{vol}%", fg=FG_COLOR)
-        else:
-            eff = int(round(vol * gain))
-            self._vol_preview.config(text=f"{eff}%", fg="#FFD54F")
-
-    def _toggle_pitch_fix(self) -> None:
-        """切换保音高模式（变速不变调）。"""
-        on = not self.engine.get_pitch_fix()
-        self.engine.set_pitch_fix(on)
-        self._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
-        self._schedule_config_save()
-
-    def _on_pitch_press(self, _event: tk.Event) -> None:
-        """音高滑块拖动开始：显示蓝色重置条覆盖标题行。"""
-        if not self.engine.ready or not self.audio_path:
-            return
-        if self.engine.backend != "sounddevice":
-            return
-        self._pitch_dragging = True
-        self._pitch_reset.place(in_=self._pitch_cancel_row,
-                                relx=0, rely=0, relwidth=1, relheight=1)
-
-    def _on_pitch_changed(self, value: str) -> None:
-        """音高移调拖动中：吸附到整数半音并实时生效。"""
-        if not self._pitch_dragging:
-            return
-        v = int(round(float(value)))
-        v = max(-12, min(12, v))
-        self._pitch_var.set(v)
-        self.engine.set_pitch_shift(v)
-        self._pitch_preview.config(text=f"{v:+d}",
-                                   fg=self._pitch_color(v))
-
-    def _on_pitch_release(self, _event: tk.Event) -> None:
-        """音高滑块拖动结束：松手在重置条内则重置为 0，否则保持当前值。"""
-        if not self._pitch_dragging:
-            return
-        self._pitch_dragging = False
-        self._pitch_reset.place_forget()
-        if self._is_pointer_in_cancel(self._pitch_reset):
-            self._pitch_var.set(0)
-            self.engine.set_pitch_shift(0)
-            self._pitch_preview.config(text="+0", fg=FG_COLOR)
-        self._schedule_config_save()
-
-    def _pitch_color(self, v: int) -> str:
-        """音高移调数值颜色：偏离 0 越大越偏黄（警示）。"""
-        p = min(1.0, abs(v) / 12.0)
-        r = int(0xC8 + (0xFF - 0xC8) * p)
-        g = int(0xC8 + (0xD5 - 0xC8) * p)
-        b = int(0xC8 + (0x4F - 0xC8) * p)
-        return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
     def _toggle_console(self) -> None:
         """打开/关闭控制台窗口。"""
         if getattr(self, "console", None) is not None:
             self.console.toggle()
-
-    def _build_adv_slider(self, parent, title, from_, to, default, fmt,
-                          var_attr, scale_attr, val_attr, on_change,
-                          key) -> None:
-        """构建一行高级参数滑块：左侧标题、中间滑块、右侧数值。
-
-        拖动时在「高级功能」标题行覆盖蓝色重置条，松手在条内则仅重置该项（key 标识）。
-        """
-        row = tk.Frame(parent, bg=BG_COLOR)
-        row.pack(fill="x", pady=(4, 0))
-        tk.Label(row, text=title, bg=BG_COLOR, fg=FG_COLOR,
-                 font=self.list_font, width=8, anchor="w").pack(side="left")
-        var = tk.DoubleVar(value=default)
-        setattr(self, var_attr, var)
-        scale = ttk.Scale(row, style="LRC.Horizontal.TScale",
-                          orient="horizontal", from_=from_, to=to,
-                          variable=var, command=on_change)
-        scale.pack(side="left", fill="x", expand=True)
-        setattr(self, scale_attr, scale)
-        scale.bind("<ButtonPress-1>",
-                   lambda e, k=key, d=default: self._on_adv_press(e, k, d))
-        scale.bind("<ButtonRelease-1>", self._on_adv_release)
-        val = tk.Label(row, text=fmt(default), width=6, bg=BG_COLOR,
-                       fg=FG_COLOR, font=self.info_font, anchor="e")
-        val.pack(side="right", padx=(10, 0))
-        setattr(self, val_attr, val)
-
-    def _on_adv_press(self, _event: tk.Event, key: str, default: float) -> None:
-        """高级滑块拖动开始：记录正在调整的项，显示蓝色重置条。"""
-        self._adv_dragging = True
-        self._adv_active = key
-        self._adv_reset.place(in_=self._adv_cancel_row,
-                              relx=0, rely=0, relwidth=1, relheight=1)
-
-    def _on_adv_release(self, _event: tk.Event) -> None:
-        """高级滑块拖动结束：松手在重置条内则仅重置该项，否则保持当前值。"""
-        if not self._adv_dragging:
-            return
-        self._adv_dragging = False
-        self._adv_reset.place_forget()
-        if self._is_pointer_in_cancel(self._adv_reset):
-            self._reset_adv(self._adv_active)
-
-    def _reset_adv(self, key: str | None) -> None:
-        """重置指定高级参数为默认值（仅当前正在调整的那一项）。"""
-        if key == "lrc":
-            self.lrc_offset = 0
-            self._lrc_offset_var.set(0)
-            self._lrc_offset_val.config(text="0ms", fg=FG_COLOR)
-            self._sync_lyrics(self._current_time())
-        elif key == "balance":
-            self._balance_var.set(0.0)
-            self.engine.set_balance(0.0)
-            self._balance_val.config(text="+0.00")
-        elif key == "gain":
-            self._gain_var.set(1.0)
-            self.engine.set_gain(1.0)
-            self._gain_val.config(text="1.00x", fg=FG_COLOR)
-            self._update_vol_preview()
-        self._schedule_config_save()
-
-    def _on_lrc_offset_changed(self, value: str) -> None:
-        """歌词偏移：正值=歌词延后，负值=歌词提前（步进 10ms）。"""
-        v = round(float(value) / 1) * 1
-        v = max(-60, min(60, v))
-        self._lrc_offset_var.set(v)
-        self.lrc_offset = v
-        self._lrc_offset_val.config(text=f"{v * 10}ms",
-                                    fg=self._lrc_offset_color(v))
-        self._sync_lyrics(self._current_time())
-        self._schedule_config_save()
-
-    def _lrc_offset_color(self, v: float) -> str:
-        """歌词偏移数值颜色：随偏移量增大由灰转红（警示）。"""
-        p = min(1.0, abs(v) / 60.0)
-        r = int(0xC8 + (0xFF - 0xC8) * p)
-        g = int(0xC8 + (0x55 - 0xC8) * p)
-        b = int(0xC8 + (0x55 - 0xC8) * p)
-        return "#{:02x}{:02x}{:02x}".format(r, g, b)
-
-    def _on_balance_changed(self, value: str) -> None:
-        """声道平衡：-1 全左，0 居中，+1 全右（仅 sounddevice）。"""
-        if self.engine.backend != "sounddevice":
-            return
-        v = round(float(value) / 0.05) * 0.05
-        v = max(-1.0, min(1.0, v))
-        self._balance_var.set(v)
-        self.engine.set_balance(v)
-        self._balance_val.config(text=f"{v:+.2f}")
-        self._schedule_config_save()
-
-    def _on_gain_changed(self, value: str) -> None:
-        """响度增益（前置放大）：1.0 原始，最高 2.0（+6dB，仅 sounddevice）。"""
-        if self.engine.backend != "sounddevice":
-            return
-        v = round(float(value) / 0.05) * 0.05
-        v = max(0.0, min(2.0, v))
-        self._gain_var.set(v)
-        self.engine.set_gain(v)
-        self._gain_val.config(text=f"{v:.2f}x", fg=self._gain_color(v))
-        self._update_vol_preview()  # 增益变化同步音量显示
-        self._schedule_config_save()
-
-    def _gain_color(self, v: float) -> str:
-        """增益数值颜色：低于 1 偏灰，高于 1 偏黄（警示提升）。"""
-        p = max(-1.0, min(1.0, v - 1))
-        if p <= 0:
-            r = int(0xC8 + (0x6D - 0xC8) * abs(p))
-            g = int(0xC8 + (0x6D - 0xC8) * abs(p))
-            b = int(0xC8 + (0x6D - 0xC8) * abs(p))
-        else:
-            r = int(0xC8 + (0xFF - 0xC8) * abs(p))
-            g = int(0xC8 + (0xD5 - 0xC8) * abs(p))
-            b = int(0xC8 + (0x4F - 0xC8) * abs(p))
-        return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
     # ==================================================================
     # 专辑封面
@@ -1704,8 +1262,8 @@ class LrcPlayerApp:
 
     def _disable_op_controls(self) -> None:
         """非 sounddevice 后端时禁用倍速/保音高/音高/平衡/增益控件（音量保留）。"""
-        for w in (self._speed_scale, self._pitch_btn, self._pitch_scale,
-                  self._balance_scale, self._gain_scale):
+        for w in (self.op.speed_scale, self.op.pitch_btn, self.op.pitch_scale,
+                  self.op.balance_scale, self.op.gain_scale):
             try:
                 w.config(state="disabled")
             except Exception:
@@ -1727,8 +1285,9 @@ class LrcPlayerApp:
             w.config(state=state)
 
         # 倍速/保音高/音高/平衡/增益：仅 sounddevice 后端可用
-        op_widgets = (self._speed_scale, self._pitch_btn, self._pitch_scale,
-                      self._balance_scale, self._gain_scale)
+        op_widgets = (self.op.speed_scale, self.op.pitch_btn,
+                      self.op.pitch_scale, self.op.balance_scale,
+                      self.op.gain_scale)
         if self.engine.backend == "sounddevice":
             for w in op_widgets:
                 try:
@@ -2508,18 +2067,8 @@ class LrcPlayerApp:
         idx = next((i for i, (_, m) in enumerate(PLAY_MODES) if m == mode), 0)
         self.play_mode_index = idx
         self.play_mode = PLAY_MODES[idx][1]
-        self._refresh_mode_buttons()
+        self.op.refresh_mode_buttons()
         self._schedule_config_save()
-
-    def _refresh_mode_buttons(self) -> None:
-        """刷新模式按钮组选中态：当前模式高亮（ACCENT 底/深色字）。"""
-        for mode, btn in getattr(self, "_mode_btns", {}).items():
-            active = (mode == self.play_mode)
-            try:
-                btn.config(bg=ACCENT_COLOR if active else SUBTLE_COLOR,
-                           fg=BG_COLOR if active else FG_COLOR)
-            except tk.TclError:
-                pass
 
     # ==================================================================
     # 配置持久化（_internal/config/data.json）
@@ -2528,15 +2077,15 @@ class LrcPlayerApp:
     def _collect_config(self) -> dict:
         """收集当前操作栏/播放模式/置顶配置。"""
         try:
-            speed = round(float(self._speed_var.get()), 2)
+            speed = round(float(self.op.speed_var.get()), 2)
         except Exception:
             speed = 1.0
         try:
-            volume = int(round(float(self._vol_var.get())))
+            volume = int(round(float(self.op.vol_var.get())))
         except Exception:
             volume = 100
         try:
-            pitch = int(round(float(self._pitch_var.get())))
+            pitch = int(round(float(self.op.pitch_var.get())))
         except Exception:
             pitch = 0
         return {
@@ -2550,6 +2099,9 @@ class LrcPlayerApp:
             "play_mode": self.play_mode,
             "always_on_top": bool(self.always_on_top),
             "lyric_bar": self._lyric_bar_mode,
+            "lyric_alpha": self._lyric_bar_alpha,
+            "lyric_width": self._lyric_bar_width_pct,
+            "lyric_font": self._lyric_bar_font_size,
         }
 
     def _collect_persist(self) -> dict:
@@ -2590,12 +2142,9 @@ class LrcPlayerApp:
         except Exception:
             v = 1.0
         self.engine.set_speed(v)
-        self._speed_var.set(v)
-        self._speed_preview.config(text=f"{v:.2f}x")
 
         pf = bool(cfg.get("pitch_fix", False))
         self.engine.set_pitch_fix(pf)
-        self._pitch_btn.config(text="保音高: 开" if pf else "保音高: 关")
 
         try:
             ps = int(round(float(cfg.get("pitch_shift", 0))))
@@ -2603,17 +2152,13 @@ class LrcPlayerApp:
             ps = 0
         ps = max(-12, min(12, ps))
         self.engine.set_pitch_shift(ps)
-        self._pitch_var.set(ps)
-        self._pitch_preview.config(text=f"{ps:+d}", fg=self._pitch_color(ps))
 
         try:
             vol = int(round(float(cfg.get("volume", 100))))
         except Exception:
             vol = 100
         vol = max(0, min(100, vol))
-        self._vol_var.set(vol)
         self.engine.set_volume(vol / 100.0)
-        self._update_vol_preview()
 
         try:
             lo = round(float(cfg.get("lrc_offset", 0)), 1)
@@ -2621,9 +2166,6 @@ class LrcPlayerApp:
             lo = 0.0
         lo = max(-60.0, min(60.0, lo))
         self.lrc_offset = lo
-        self._lrc_offset_var.set(lo)
-        self._lrc_offset_val.config(
-            text=f"{int(round(lo * 10))}ms", fg=self._lrc_offset_color(lo))
 
         try:
             bal = round(float(cfg.get("balance", 0.0)), 2)
@@ -2631,8 +2173,6 @@ class LrcPlayerApp:
             bal = 0.0
         bal = max(-1.0, min(1.0, bal))
         self.engine.set_balance(bal)
-        self._balance_var.set(bal)
-        self._balance_val.config(text=f"{bal:+.2f}")
 
         try:
             g = round(float(cfg.get("gain", 1.0)), 2)
@@ -2640,21 +2180,43 @@ class LrcPlayerApp:
             g = 1.0
         g = max(0.0, min(2.0, g))
         self.engine.set_gain(g)
-        self._gain_var.set(g)
-        self._gain_val.config(text=f"{g:.2f}x", fg=self._gain_color(g))
-        self._update_vol_preview()
+
+        # 歌词条参数（透明度 / 默认宽度 / 字体大小）
+        try:
+            la = int(round(float(cfg.get("lyric_alpha", 85))))
+        except Exception:
+            la = 85
+        la = max(30, min(100, la))
+        try:
+            lw = int(round(float(cfg.get("lyric_width", 25))))
+        except Exception:
+            lw = 25
+        lw = max(10, min(100, lw))
+        try:
+            lf = int(round(float(cfg.get("lyric_font", 18))))
+        except Exception:
+            lf = 18
+        lf = max(12, min(30, lf))
+        self._set_lyric_bar_alpha(la, persist=False)
+        self._set_lyric_bar_width(lw, persist=False)
+        self._set_lyric_bar_font_size(lf, persist=False)
+
+        # 控件显示同步（操作区面板）
+        self.op.apply_values(speed=v, pitch_fix=pf, pitch_shift=ps,
+                             volume=vol, lrc_offset=lo, balance=bal, gain=g,
+                             lyric_alpha=la, lyric_width=lw, lyric_font=lf)
 
         mode = str(cfg.get("play_mode", "loop_all"))
         idx = next((i for i, (_, m) in enumerate(PLAY_MODES) if m == mode), 0)
         self.play_mode_index = idx
         self.play_mode = PLAY_MODES[idx][1]
-        self._refresh_mode_buttons()
+        self.op.refresh_mode_buttons()
 
         # 置顶（直接设置，不走 _set_topmost 以免触发保存）
         top = bool(cfg.get("always_on_top", False))
         self.always_on_top = top
         self.root.attributes("-topmost", top)
-        self._refresh_topmost_buttons()
+        self.op.refresh_topmost_buttons()
 
         # 桌面歌词条模式（persist=False：不触发保存）
         self._set_lyric_bar_mode(str(cfg.get("lyric_bar", "off")),
@@ -2830,20 +2392,10 @@ class LrcPlayerApp:
         """
         self.always_on_top = bool(on)
         self.root.attributes("-topmost", self.always_on_top)
-        self._refresh_topmost_buttons()
+        self.op.refresh_topmost_buttons()
         if bool(self.root.attributes("-fullscreen")):
             self._topmost_edited_in_fullscreen = True
         self._schedule_config_save()
-
-    def _refresh_topmost_buttons(self) -> None:
-        """刷新置顶按钮组选中态：当前状态高亮（ACCENT 底/深色字）。"""
-        for val, btn in getattr(self, "_topmost_btns", {}).items():
-            active = (bool(val) == bool(self.always_on_top))
-            try:
-                btn.config(bg=ACCENT_COLOR if active else SUBTLE_COLOR,
-                           fg=BG_COLOR if active else FG_COLOR)
-            except tk.TclError:
-                pass
 
     # ==================================================================
     # 播放状态
@@ -3208,19 +2760,59 @@ class LrcPlayerApp:
         else:
             self._ensure_lyric_bar()
             self._update_lyric_bar()
-        self._refresh_lyric_mode_buttons()
+        self.op.refresh_lyric_mode_buttons()
         if persist:
             self._schedule_config_save()
 
-    def _refresh_lyric_mode_buttons(self) -> None:
-        """刷新三按钮选中态：当前模式高亮（ACCENT），其余常态。"""
-        for mode, btn in getattr(self, "_lyric_mode_btns", {}).items():
-            active = (mode == self._lyric_bar_mode)
+    def _set_lyric_bar_alpha(self, pct: float, persist: bool = True) -> None:
+        """歌词条窗口透明度（30~100%，默认 85）。"""
+        v = int(round(max(30.0, min(100.0, float(pct)))))
+        self._lyric_bar_alpha = v
+        if self._lyric_bar is not None:
             try:
-                btn.config(bg=ACCENT_COLOR if active else SUBTLE_COLOR,
-                           fg=BG_COLOR if active else FG_COLOR)
+                self._lyric_bar.attributes("-alpha", v / 100.0)
             except tk.TclError:
                 pass
+        self._sync_lyric_opt_display("alpha", v)
+        if persist:
+            self._schedule_config_save()
+
+    def _set_lyric_bar_width(self, pct: float, persist: bool = True) -> None:
+        """歌词条初始宽度（占屏幕 10~100%，默认 25）。"""
+        v = int(round(max(10.0, min(100.0, float(pct)))))
+        self._lyric_bar_width_pct = v
+        self._update_lyric_bar()
+        self._sync_lyric_opt_display("width", v)
+        if persist:
+            self._schedule_config_save()
+
+    def _set_lyric_bar_font_size(self, px: float, persist: bool = True) -> None:
+        """歌词条字体大小（12~30 px，默认 18；随小屏缩放）。"""
+        v = int(round(max(12.0, min(30.0, float(px)))))
+        self._lyric_bar_font_size = v
+        try:
+            self.lyric_bar_font.configure(size=self._font_size(v))
+        except tk.TclError:
+            pass
+        self._update_lyric_bar()
+        self._sync_lyric_opt_display("font", v)
+        if persist:
+            self._schedule_config_save()
+
+    def _sync_lyric_opt_display(self, which: str, v: int) -> None:
+        """同步「歌词选项」滑块显示（面板未创建时忽略）。"""
+        op = getattr(self, "op", None)
+        if op is None:
+            return
+        fn = {"alpha": "set_lyric_alpha_display",
+              "width": "set_lyric_width_display",
+              "font": "set_lyric_font_display"}.get(which)
+        if fn is None:
+            return
+        try:
+            getattr(op, fn)(v)
+        except Exception:
+            pass
 
     def _ensure_lyric_bar(self) -> None:
         """创建桌面歌词条窗口：无修饰符 + 置顶 + 半透明 + 不占任务栏。"""
@@ -3229,7 +2821,8 @@ class LrcPlayerApp:
         bar = tk.Toplevel(self.root)
         bar.overrideredirect(True)   # 无窗口修饰符
         bar.configure(bg=BG_COLOR)
-        for attr, val in (("-topmost", True), ("-alpha", 0.85),
+        for attr, val in (("-topmost", True),
+                          ("-alpha", self._lyric_bar_alpha / 100.0),
                           ("-toolwindow", True)):
             try:
                 bar.attributes(attr, val)
@@ -3309,7 +2902,8 @@ class LrcPlayerApp:
     def _update_lyric_bar(self) -> None:
         """刷新歌词条内容与几何：屏幕居中，宽度随歌词实时变化。
 
-        初始宽度为屏幕 1/4；歌词较长时加宽，上限为屏幕全宽。
+        初始宽度为屏幕的「默认宽度」比例（默认 25%）；歌词较长时加宽，
+        上限为屏幕全宽。
         """
         if self._lyric_bar is None or self._lyric_bar_var is None:
             return
@@ -3319,7 +2913,8 @@ class LrcPlayerApp:
             need = self.lyric_bar_font.measure(text) + self._px(40)
         except Exception:
             need = 0
-        width = min(self.screen_w, max(self.screen_w // 4, need))
+        base = int(self.screen_w * self._lyric_bar_width_pct / 100)
+        width = min(self.screen_w, max(base, need))
         height = self.lyric_bar_font.metrics("linespace") + self._px(18)
         x = (self.screen_w - width) // 2
         y = 0 if self._lyric_bar_mode == "top" else self.screen_h - height

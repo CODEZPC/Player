@@ -50,6 +50,9 @@ class PlayerConsole:
         "  set loudness <0~3>                响度增益（0.01 步进）\n"
         "  set rate-keep <true/false>        保音高\n"
         "  set pitch <-12~12>                音高移调（半音，变调不变速）\n"
+        "  set lyric-alpha <30~100>          歌词条透明度(%)\n"
+        "  set lyric-width <10~100>          歌词条默认宽度(占屏%)\n"
+        "  set lyric-font <12~30>            歌词条字体大小(px)\n"
         "  set <obj> reset / set reset       重置单项 / 全部重置\n"
         "  app topmost <true/false>          窗口置顶开关\n"
         "  app floatlayer                    开关歌词浮层\n"
@@ -411,7 +414,8 @@ class PlayerConsole:
         if obj == "reset":
             outs = [self._cmd_set([parts[0], o, "reset"])
                     for o in ("volume", "mode", "rate", "lrc-offset",
-                              "balance", "loudness", "rate-keep", "pitch")]
+                              "balance", "loudness", "rate-keep", "pitch",
+                              "lyric-alpha", "lyric-width", "lyric-font")]
             return "已重置全部:\n" + "\n".join(outs)
 
         if len(parts) < 3:
@@ -428,8 +432,8 @@ class PlayerConsole:
                 return "参数错误: volume 需要 0~100 的数值"
             v = max(0, min(100, v))
             app.engine.set_volume(v / 100.0)
-            app._vol_var.set(v)
-            app._update_vol_preview()
+            app.op.vol_var.set(v)
+            app.op.update_vol_preview()
             return f"音量: {v}%"
 
         if obj == "mode":
@@ -449,8 +453,8 @@ class PlayerConsole:
                 return "参数错误: rate 需要 0.01~10 的数值"
             t = max(0.01, min(10.0, round(t * 100) / 100))
             app.engine.set_speed(t)
-            app._speed_var.set(t)
-            app._speed_preview.config(text=f"{t:.2f}x")
+            app.op.speed_var.set(t)
+            app.op.speed_preview.config(text=f"{t:.2f}x")
             return f"倍速: {t:.2f}x"
 
         if obj == "lrc-offset":
@@ -461,15 +465,15 @@ class PlayerConsole:
             ms = max(-100000, min(100000, ms))
             units = ms / 10.0  # 内部单位：10ms
             app.lrc_offset = units
-            app._lrc_offset_var.set(units)
+            app.op.lrc_offset_var.set(units)
             if abs(ms) < 10000:
                 text = f"{ms}ms"
             elif abs(ms) < 99995:
                 text = f"{(ms / 1000):.2f}s"
             else:
                 text = "MAX"
-            app._lrc_offset_val.config(text=text,
-                                       fg=app._lrc_offset_color(units))
+            app.op.lrc_offset_val.config(text=text,
+                                         fg=app.op.lrc_offset_color(units))
             app._sync_lyrics(app._current_time())
             return f"歌词偏移: {ms:+d}ms"
 
@@ -480,8 +484,8 @@ class PlayerConsole:
                 return "参数错误: balance 需要 -1~1 的数值"
             t = max(-1.0, min(1.0, round(t * 100) / 100))
             app.engine.set_balance(t)
-            app._balance_var.set(t)
-            app._balance_val.config(text=f"{t:+.2f}")
+            app.op.balance_var.set(t)
+            app.op.balance_val.config(text=f"{t:+.2f}")
             return f"声道平衡: {t:+.2f}"
 
         if obj == "loudness":
@@ -491,9 +495,9 @@ class PlayerConsole:
                 return "参数错误: loudness 需要 0~3 的数值"
             t = max(0.0, min(3.0, round(t * 100) / 100))
             app.engine.set_gain(t)
-            app._gain_var.set(t)
-            app._gain_val.config(text=f"{t:.2f}x", fg=app._gain_color(t))
-            app._update_vol_preview()
+            app.op.gain_var.set(t)
+            app.op.gain_val.config(text=f"{t:.2f}x", fg=app.op.gain_color(t))
+            app.op.update_vol_preview()
             return f"响度增益: {t:.2f}x"
 
         if obj == "rate-keep":
@@ -501,7 +505,7 @@ class PlayerConsole:
             if on is None:
                 return "参数错误: rate-keep ∈ {true, false, 1, 0, on, off}"
             app.engine.set_pitch_fix(on)
-            app._pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
+            app.op.pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
             return f"保音高: {'开' if on else '关'}"
 
         if obj == "pitch":
@@ -511,10 +515,37 @@ class PlayerConsole:
                 return "参数错误: pitch 需要 -12~12 的整数"
             t = max(-12, min(12, t))
             app.engine.set_pitch_shift(t)
-            app._pitch_var.set(t)
-            app._pitch_preview.config(text=f"{t:+d}",
-                                      fg=app._pitch_color(t))
+            app.op.pitch_var.set(t)
+            app.op.pitch_preview.config(text=f"{t:+d}",
+                                        fg=app.op.pitch_color(t))
             return f"音高: {t:+d} 半音"
+
+        if obj == "lyric-alpha":
+            try:
+                v = int(round(float(parts[2])))
+            except ValueError:
+                return "参数错误: lyric-alpha 需要 30~100 的数值"
+            v = max(30, min(100, v))
+            app._set_lyric_bar_alpha(v)
+            return f"歌词条透明度: {v}%"
+
+        if obj == "lyric-width":
+            try:
+                v = int(round(float(parts[2])))
+            except ValueError:
+                return "参数错误: lyric-width 需要 10~100 的数值"
+            v = max(10, min(100, v))
+            app._set_lyric_bar_width(v)
+            return f"歌词条默认宽度: {v}%"
+
+        if obj == "lyric-font":
+            try:
+                v = int(round(float(parts[2])))
+            except ValueError:
+                return "参数错误: lyric-font 需要 12~30 的数值"
+            v = max(12, min(30, v))
+            app._set_lyric_bar_font_size(v)
+            return f"歌词条字体: {v}px"
 
         return f"未知 set 对象: {obj}（输入 help 查看）"
 
@@ -529,6 +560,9 @@ class PlayerConsole:
             "loudness": "1.0",
             "rate-keep": "false",
             "pitch": "0",
+            "lyric-alpha": "85",
+            "lyric-width": "25",
+            "lyric-font": "18",
         }
         if obj not in defaults:
             return f"未知 set 对象: {obj}（输入 help 查看）"
@@ -794,6 +828,7 @@ class PlayerConsole:
         if words[0] == "set" and n == 2:
             return [w for w in ("volume", "mode", "rate", "lrc-offset",
                                 "balance", "loudness", "rate-keep", "pitch",
+                                "lyric-alpha", "lyric-width", "lyric-font",
                                 "reset")
                     if w.startswith(token)]
         if words[0] == "app" and n == 2:
