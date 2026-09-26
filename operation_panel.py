@@ -11,6 +11,11 @@
 import tkinter as tk
 from tkinter import ttk
 
+# 「自定义」锚点九宫格按钮文本（3 行 × 3 列，行内/行间无缝）
+LYRIC_ANCHOR_SYMBOLS = {"tl": "↖", "t": "↑", "tr": "↗",
+                        "l": "←", "c": "·", "r": "→",
+                        "bl": "↙", "b": "↓", "br": "↘"}
+
 
 class SmoothScrollFrame(tk.Frame):
     """深色平滑滚动容器：把内容放进 `self.inner` 即可。
@@ -227,8 +232,13 @@ class OperationPanel:
 
         # 选项区按钮组
         self.lyric_mode_btns: dict[str, tk.Button] = {}
+        self.lyric_anchor_btns: dict[str, tk.Button] = {}
         self.mode_btns: dict[str, tk.Button] = {}
         self.topmost_btns: dict[bool, tk.Button] = {}
+
+        # 「歌词选项」行引用（模式变化时控制显隐/重排）
+        self._lyric_mode_row: tk.Frame | None = None
+        self.lyric_anchor_row: tk.Frame | None = None
 
         # 滚动容器（内容不超一屏时滚动条自动隐藏）
         self.scroller = SmoothScrollFrame(
@@ -357,7 +367,7 @@ class OperationPanel:
         self.vol_preview.pack(side="right", padx=(10, 0))
 
     def _build_advanced(self, parent: tk.Frame) -> None:
-        """高级功能区：声道平衡 / 响度增益（含控制台/重置按钮）。"""
+        """高级功能区：声道平衡 / 响度增益（含控制台/重置应用/重置按钮）。"""
         adv_frame = tk.Frame(parent, bg=self.BG_COLOR)
         adv_frame.pack(side="top", fill="x", pady=(18, 4))
 
@@ -366,6 +376,19 @@ class OperationPanel:
         tk.Label(self.adv_cancel_row, text="高级功能", bg=self.BG_COLOR,
                  fg=self.ACCENT_COLOR,
                  font=self.app.button_font).pack(side="left")
+        # 右侧按钮（side="right" 依 pack 顺序从右往左排布）：
+        # 视觉顺序（左→右）= [重置应用] [控制台] [重置]
+        # 区块「重置」：声道平衡/响度增益恢复默认（最右）
+        self.adv_reset_btn = tk.Button(
+            self.adv_cancel_row, text="重置",
+            command=self._on_reset_adv_all,
+            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+            font=self.app.button_font_sm,
+            activebackground=self.ACCENT_COLOR,
+            activeforeground=self.BG_COLOR,
+            relief="flat", padx=6, pady=2)
+        self.adv_reset_btn.pack(side="right")
+        # 控制台
         self.console_btn = tk.Button(
             self.adv_cancel_row, text="控制台",
             command=self.app._toggle_console,
@@ -375,9 +398,9 @@ class OperationPanel:
             activeforeground=self.BG_COLOR,
             relief="flat", padx=6, pady=2)
         self.console_btn.pack(side="right")
-        # 「重置」按钮：位于「控制台」左侧（side=right 后 pack → 更靠左）
+        # 「重置应用」：清全部配置/文件夹/播放状态（确认需点 2 次，最左）
         self.reset_btn = tk.Button(
-            self.adv_cancel_row, text="重置",
+            self.adv_cancel_row, text="重置应用",
             command=self.app._toggle_reset,
             bg=self.SUBTLE_COLOR, fg="#FF9A9A",
             font=self.app.button_font_sm,
@@ -450,7 +473,12 @@ class OperationPanel:
         self.refresh_topmost_buttons()
 
     def _build_lyric_options(self, parent: tk.Frame) -> None:
-        """歌词选项区：歌词偏移 / 桌面歌词 / 透明度 / 默认宽度 / 字体大小。"""
+        """歌词选项区：歌词偏移 / 桌面歌词（锚点与位置）/ 透明度 / 宽度 / 字体。
+
+        桌面歌词关闭时隐藏透明度/默认宽度/字体大小（及锚点与位置）行；
+        自定义模式额外显示锚点九宫格与 X/Y 位置行（见 sync_lyric_custom_rows）。
+        标题行右侧「重置」按钮一键恢复全部歌词选项默认值。
+        """
         lyr_frame = tk.Frame(parent, bg=self.BG_COLOR)
         lyr_frame.pack(side="top", fill="x", pady=(18, 4))
 
@@ -459,6 +487,16 @@ class OperationPanel:
         tk.Label(self.lyric_opt_cancel_row, text="歌词选项",
                  bg=self.BG_COLOR, fg=self.ACCENT_COLOR,
                  font=self.app.button_font).pack(side="left")
+        # 「重置」：全部歌词选项恢复默认（含桌面歌词模式与锚点）
+        self.lyric_reset_btn = tk.Button(
+            self.lyric_opt_cancel_row, text="重置",
+            command=self._on_reset_lyric_all,
+            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+            font=self.app.button_font_sm,
+            activebackground=self.ACCENT_COLOR,
+            activeforeground=self.BG_COLOR,
+            relief="flat", padx=6, pady=2)
+        self.lyric_reset_btn.pack(side="right")
 
         self.lyric_opt_reset = tk.Frame(lyr_frame, bg="#1F3A8A",
                                         height=self._px(36))
@@ -472,13 +510,50 @@ class OperationPanel:
             lambda v: f"{v*10}ms", self._on_lrc_offset_changed, "lrc",
             group="lyric")
 
-        # 桌面歌词：关闭 / 顶部 / 底部
+        # 桌面歌词：关闭 / 顶部 / 底部 / 自定义
         box = self._build_option_row(lyr_frame, "桌面歌词")
         for text, mode in (("关闭", "off"), ("顶部", "top"),
-                           ("底部", "bottom")):
+                           ("底部", "bottom"), ("自定义", "custom")):
             self.lyric_mode_btns[mode] = self._make_seam_button(
                 box, text, lambda m=mode: self.app._set_lyric_bar_mode(m))
+        self._lyric_mode_row = self.lyric_mode_btns["off"].master.master
         self.refresh_lyric_mode_buttons()
+
+        # 锚点（仅自定义模式显示）：3×3 小按钮组右对齐，行内/行间无缝
+        self.lyric_anchor_row = tk.Frame(lyr_frame, bg=self.BG_COLOR)
+        tk.Label(self.lyric_anchor_row, text="锚点", bg=self.BG_COLOR,
+                 fg=self.FG_COLOR, font=self.app.list_font, anchor="w",
+                 width=8).pack(side="left")
+        anchor_box = tk.Frame(self.lyric_anchor_row, bg=self.BG_COLOR)
+        anchor_box.pack(side="right")
+        for row_anchors in (("tl", "t", "tr"), ("l", "c", "r"),
+                            ("bl", "b", "br")):
+            line = tk.Frame(anchor_box, bg=self.BG_COLOR)
+            line.pack(fill="x")            # 行间无缝：不设 pady
+            for a in row_anchors:
+                btn = tk.Button(
+                    line, text=LYRIC_ANCHOR_SYMBOLS[a],
+                    command=lambda x=a: self._on_anchor_click(x),
+                    bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+                    font=self.app.button_font_sm,
+                    activebackground=self.ACCENT_COLOR,
+                    activeforeground=self.BG_COLOR,
+                    relief="flat", bd=0, highlightthickness=0,
+                    width=2, padx=self._px(2), pady=self._px(1))
+                btn.pack(side="left")      # 行内无缝：不设 padx
+                self.lyric_anchor_btns[a] = btn
+
+        # X / Y 位置（仅自定义模式显示；范围随锚点与条尺寸重设）
+        (self.lyric_x_var, self.lyric_x_scale,
+         self.lyric_x_val) = self._build_adv_slider(
+            lyr_frame, "X位置", -100, 100, 0,
+            lambda v: f"{v:+.0f}", self._on_lyric_x_changed, "x",
+            group="lyric")
+        (self.lyric_y_var, self.lyric_y_scale,
+         self.lyric_y_val) = self._build_adv_slider(
+            lyr_frame, "Y位置", -100, 100, 0,
+            lambda v: f"{v:+.0f}", self._on_lyric_y_changed, "y",
+            group="lyric")
 
         # 透明度 / 默认宽度 / 字体大小（作用于桌面歌词条）
         (self.lyric_alpha_var, self.lyric_alpha_scale,
@@ -496,6 +571,9 @@ class OperationPanel:
             lyr_frame, "字体大小", 12, 30, self.app._lyric_bar_font_size,
             lambda v: f"{v:.0f}px", self._on_lyric_font_changed, "font",
             group="lyric")
+
+        # 依当前模式初始化显隐（关闭时隐藏参数行）
+        self.sync_lyric_custom_rows()
 
     def _build_option_row(self, parent: tk.Frame, title: str) -> tk.Frame:
         """「选项」区一行：左侧定宽标签 + 右侧无缝按钮容器（返回容器）。"""
@@ -681,9 +759,14 @@ class OperationPanel:
             if self.app._is_pointer_in_cancel(self.adv_reset):
                 self._reset_adv(self._adv_active)
         else:
+            key = self._lyric_opt_active
             self.lyric_opt_reset.place_forget()
             if self.app._is_pointer_in_cancel(self.lyric_opt_reset):
-                self._reset_lyric_opt(self._lyric_opt_active)
+                self._reset_lyric_opt(key)
+            if key == "width":
+                # 宽度调整完成：重算并刷新 X/Y 范围与数值（拖动中不更新）
+                self.app._finalize_lyric_bar_width()
+            self._lyric_opt_active = None
 
     def _reset_adv(self, key: str | None) -> None:
         """重置指定高级参数为默认值（仅当前正在调整的那一项）。"""
@@ -712,6 +795,34 @@ class OperationPanel:
             self.app._set_lyric_bar_width(25)
         elif key == "font":
             self.app._set_lyric_bar_font_size(18)
+        elif key == "x":
+            self.app._set_lyric_bar_x(0)
+            self.set_lyric_x_display(self.app._lyric_bar_x)
+        elif key == "y":
+            self.app._set_lyric_bar_y(0)
+            self.set_lyric_y_display(self.app._lyric_bar_y)
+
+    def _on_reset_adv_all(self) -> None:
+        """「重置」（高级功能）：声道平衡/响度增益恢复默认。"""
+        self._reset_adv("balance")
+        self._reset_adv("gain")
+
+    def _on_reset_lyric_all(self) -> None:
+        """「重置」（歌词选项）：全部歌词选项恢复默认。
+
+        桌面歌词关闭、锚点回到中间（锚点 setter 同时把 X/Y 归 0），
+        歌词偏移/透明度/默认宽度/字体大小恢复默认；锚点最后设置，
+        以基于最终宽度重算 X/Y 范围。
+        """
+        self.app._set_lyric_bar_mode("off")
+        self._reset_lyric_opt("lrc")
+        self._reset_lyric_opt("alpha")
+        self._reset_lyric_opt("width")
+        self._reset_lyric_opt("font")
+        self.app._set_lyric_bar_anchor("c")
+        # 模式关闭时行隐藏，需显式回写 X/Y 滑块显示
+        self.set_lyric_x_display(self.app._lyric_bar_x)
+        self.set_lyric_y_display(self.app._lyric_bar_y)
 
     def _on_lrc_offset_changed(self, value: str) -> None:
         """歌词偏移：正值=歌词延后，负值=歌词提前（步进 10ms）。"""
@@ -741,16 +852,20 @@ class OperationPanel:
         self.app._set_lyric_bar_alpha(v)
 
     def _on_lyric_width_changed(self, value: str) -> None:
-        """歌词条默认宽度（占屏 10~100%，实时生效）。"""
+        """歌词条默认宽度（占屏 10~100%，拖动中实时生效）。"""
         v = int(round(float(value)))
         v = max(10, min(100, v))
+        if v == self.app._lyric_bar_width_pct:
+            return
         self.set_lyric_width_display(v)
         self.app._set_lyric_bar_width(v)
 
     def _on_lyric_font_changed(self, value: str) -> None:
-        """歌词条字体大小（12~30px，实时生效）。"""
+        """歌词条字体大小（12~30px，拖动中实时生效）。"""
         v = int(round(float(value)))
         v = max(12, min(30, v))
+        if v == self.app._lyric_bar_font_size:
+            return
         self.set_lyric_font_display(v)
         self.app._set_lyric_bar_font_size(v)
 
@@ -771,6 +886,103 @@ class OperationPanel:
         if int(round(float(self.lyric_font_var.get()))) != v:
             self.lyric_font_var.set(v)
         self.lyric_font_val.config(text=f"{v}px")
+
+    # ---- 自定义锚点与 X/Y 位置 ----
+
+    def _on_anchor_click(self, anchor: str) -> None:
+        """选择九宫格锚点：X/Y 位置重置为 (0,0) 并重设滑块范围。"""
+        self.app._set_lyric_bar_anchor(anchor)
+
+    def _on_lyric_x_changed(self, value: str) -> None:
+        """X 位置（px，相对锚点；轻量移动，超范围按缓存范围钳制）。"""
+        v = int(round(float(value)))
+        if v == self.app._lyric_bar_x:
+            return
+        self.app._set_lyric_bar_x(v)
+        self.set_lyric_x_display(self.app._lyric_bar_x)
+
+    def _on_lyric_y_changed(self, value: str) -> None:
+        """Y 位置（px，相对锚点；轻量移动，超范围按缓存范围钳制）。"""
+        v = int(round(float(value)))
+        if v == self.app._lyric_bar_y:
+            return
+        self.app._set_lyric_bar_y(v)
+        self.set_lyric_y_display(self.app._lyric_bar_y)
+
+    def set_lyric_x_display(self, v: int) -> None:
+        """同步 X 位置滑块显示（同值时跳过，避免递归触发）。"""
+        if int(round(float(self.lyric_x_var.get()))) != v:
+            self.lyric_x_var.set(v)
+        self.lyric_x_val.config(text=f"{v:+.0f}")
+
+    def set_lyric_y_display(self, v: int) -> None:
+        """同步 Y 位置滑块显示（同值时跳过，避免递归触发）。"""
+        if int(round(float(self.lyric_y_var.get()))) != v:
+            self.lyric_y_var.set(v)
+        self.lyric_y_val.config(text=f"{v:+.0f}")
+
+    def refresh_lyric_anchor_buttons(self) -> None:
+        """刷新锚点按钮组选中态：当前锚点高亮（ACCENT 底/深色字）。"""
+        cur = self.app._lyric_bar_anchor
+        for a, btn in self.lyric_anchor_btns.items():
+            active = (a == cur)
+            try:
+                btn.config(bg=self.ACCENT_COLOR if active else self.SUBTLE_COLOR,
+                           fg=self.BG_COLOR if active else self.FG_COLOR)
+            except tk.TclError:
+                pass
+
+    def _apply_lyric_xy_ranges(self) -> None:
+        """重设 X/Y 滑块可调范围（取 app 缓存值；本方法不重算范围）。"""
+        xmin, xmax, ymin, ymax = self.app._lyric_bar_xy_ranges()
+        try:
+            self.lyric_x_scale.config(from_=xmin, to=xmax)
+            self.lyric_y_scale.config(from_=ymin, to=ymax)
+        except tk.TclError:
+            pass
+
+    def refresh_lyric_xy_ui(self) -> None:
+        """轻量刷新 X/Y 滑块范围与数值显示（不重排行控件，宽度完成/锚点切换时调用）。"""
+        self._apply_lyric_xy_ranges()
+        self.set_lyric_x_display(self.app._lyric_bar_x)
+        self.set_lyric_y_display(self.app._lyric_bar_y)
+
+    def sync_lyric_custom_rows(self) -> None:
+        """按当前模式刷新「歌词选项」行显隐、锚点高亮与 X/Y 范围。
+
+        - 桌面歌词关闭：隐藏透明度/默认宽度/字体大小（及锚点与位置）行；
+        - 顶部/底部：仅显示三条参数行（锚点与位置行隐藏）；
+        - 自定义：额外显示锚点九宫格与 X/Y 位置行。
+        """
+        mode = self.app._lyric_bar_mode
+        bar_on = (mode != "off")
+        custom = (mode == "custom")
+        order = (
+            (self.lrc_offset_scale.master, (4, 0), True),
+            (self._lyric_mode_row, (2, 0), True),
+            (self.lyric_anchor_row, (2, 0), custom),
+            (self.lyric_x_scale.master, (4, 0), custom),
+            (self.lyric_y_scale.master, (4, 0), custom),
+            (self.lyric_alpha_scale.master, (4, 0), bar_on),
+            (self.lyric_width_scale.master, (4, 0), bar_on),
+            (self.lyric_font_scale.master, (4, 0), bar_on),
+        )
+        for row, _, _ in order:
+            if row is not None:
+                try:
+                    row.pack_forget()
+                except tk.TclError:
+                    pass
+        for row, pady, visible in order:
+            if row is not None and visible:
+                try:
+                    row.pack(fill="x", pady=pady)
+                except tk.TclError:
+                    pass
+        if custom:
+            self.refresh_lyric_xy_ui()
+            self.refresh_lyric_anchor_buttons()
+
     def _on_balance_changed(self, value: str) -> None:
         """声道平衡：-1 全左，0 居中，+1 全右（仅 sounddevice）。"""
         if self.app.engine.backend != "sounddevice":

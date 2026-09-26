@@ -56,7 +56,7 @@ class PlayerConsole:
         "  set <obj> reset / set reset       重置单项 / 全部重置\n"
         "  app topmost <true/false>          窗口置顶开关\n"
         "  app floatlayer                    开关歌词浮层\n"
-        "  app lyricbar <off|top|bottom>     桌面歌词条（关闭/顶部/底部）\n"
+        "  app lyricbar <off|top|bottom|custom>   桌面歌词条（关闭/顶部/底部/自定义）\n"
         "  app exit                          退出程序\n"
         "  interlude add <song...>           添加多首到插播\n"
         "  interlude clear                   清空插播\n"
@@ -536,6 +536,7 @@ class PlayerConsole:
                 return "参数错误: lyric-width 需要 10~100 的数值"
             v = max(10, min(100, v))
             app._set_lyric_bar_width(v)
+            app._finalize_lyric_bar_width()   # 调整完成：重算 X/Y 范围与数值
             return f"歌词条默认宽度: {v}%"
 
         if obj == "lyric-font":
@@ -599,12 +600,13 @@ class PlayerConsole:
 
         if sub == "lyricbar":
             if len(parts) < 3:
-                return "用法: app lyricbar <off|top|bottom>"
+                return "用法: app lyricbar <off|top|bottom|custom>"
             mode = parts[2].lower()
-            if mode not in ("off", "top", "bottom"):
-                return "参数错误: lyricbar ∈ {off, top, bottom}"
+            if mode not in ("off", "top", "bottom", "custom"):
+                return "参数错误: lyricbar ∈ {off, top, bottom, custom}"
             app._set_lyric_bar_mode(mode)
-            label = {"off": "关闭", "top": "顶部", "bottom": "底部"}[mode]
+            label = {"off": "关闭", "top": "顶部", "bottom": "底部",
+                     "custom": "自定义"}[mode]
             return f"桌面歌词: {label}"
 
         if sub == "exit":

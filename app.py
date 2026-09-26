@@ -46,6 +46,13 @@ PLAY_MODES = [
     ("随机播放", "shuffle"),
 ]
 
+# 桌面歌词条「自定义」锚点（九宫格）→ 条左上角占 (屏宽-条宽)/(屏高-条高) 的比例
+LYRIC_ANCHOR_FRAC = {
+    "tl": (0.0, 0.0), "t": (0.5, 0.0), "tr": (1.0, 0.0),
+    "l": (0.0, 0.5), "c": (0.5, 0.5), "r": (1.0, 0.5),
+    "bl": (0.0, 1.0), "b": (0.5, 1.0), "br": (1.0, 1.0),
+}
+
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac"}
 
 
@@ -122,7 +129,7 @@ class LrcPlayerApp:
         self._overlay_cover_photo = None
         self._overlay_lyric_vars: list[tk.StringVar] = []
 
-        # ---- 桌面歌词条（独立置顶小窗，模式 off / top / bottom）----
+        # ---- 桌面歌词条（独立置顶小窗，模式 off / top / bottom / custom）----
         self._lyric_bar: tk.Toplevel | None = None
         self._lyric_bar_label: tk.Label | None = None
         self._lyric_bar_var: tk.StringVar | None = None
@@ -130,6 +137,12 @@ class LrcPlayerApp:
         self._lyric_bar_alpha = 85        # 歌词条透明度（30~100 %）
         self._lyric_bar_width_pct = 25    # 歌词条初始宽度（占屏幕 %）
         self._lyric_bar_font_size = 18    # 歌词条字体大小（px）
+        self._lyric_bar_anchor = "c"      # 自定义锚点（九宫格：tl/t/tr/l/c/r/bl/b/br）
+        self._lyric_bar_x = 0             # 自定义 X 偏移（px，相对锚点）
+        self._lyric_bar_y = 0             # 自定义 Y 偏移（px，相对锚点）
+        self._lyric_bar_size = (0, 0)     # 最近一次刷新后的条尺寸 (width, height)
+        self._lyric_bar_text: str | None = None   # 条文本缓存（拖动中免重建主干行）
+        self._lyric_xy_range: tuple[int, int, int, int] | None = None  # X/Y 范围缓存
 
         # ---- 播放状态 ----
         self.is_playing = False
@@ -2099,6 +2112,9 @@ class LrcPlayerApp:
             "play_mode": self.play_mode,
             "always_on_top": bool(self.always_on_top),
             "lyric_bar": self._lyric_bar_mode,
+            "lyric_anchor": self._lyric_bar_anchor,
+            "lyric_x": self._lyric_bar_x,
+            "lyric_y": self._lyric_bar_y,
             "lyric_alpha": self._lyric_bar_alpha,
             "lyric_width": self._lyric_bar_width_pct,
             "lyric_font": self._lyric_bar_font_size,
@@ -2181,7 +2197,21 @@ class LrcPlayerApp:
         g = max(0.0, min(2.0, g))
         self.engine.set_gain(g)
 
-        # 歌词条参数（透明度 / 默认宽度 / 字体大小）
+        # 歌词条参数（锚点 / 位置 / 透明度 / 默认宽度 / 字体大小）
+        an = str(cfg.get("lyric_anchor", "c"))
+        if an not in LYRIC_ANCHOR_FRAC:
+            an = "c"
+        self._set_lyric_bar_anchor(an, persist=False)
+        try:
+            lx = int(round(float(cfg.get("lyric_x", 0))))
+        except Exception:
+            lx = 0
+        try:
+            ly = int(round(float(cfg.get("lyric_y", 0))))
+        except Exception:
+            ly = 0
+        self._set_lyric_bar_x(lx, persist=False)
+        self._set_lyric_bar_y(ly, persist=False)
         try:
             la = int(round(float(cfg.get("lyric_alpha", 85))))
         except Exception:
@@ -2200,6 +2230,7 @@ class LrcPlayerApp:
         self._set_lyric_bar_alpha(la, persist=False)
         self._set_lyric_bar_width(lw, persist=False)
         self._set_lyric_bar_font_size(lf, persist=False)
+        self._finalize_lyric_bar_width()   # 宽度/字号恢复后重算 X/Y 范围
 
         # 控件显示同步（操作区面板）
         self.op.apply_values(speed=v, pitch_fix=pf, pitch_shift=ps,
@@ -2256,7 +2287,7 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _toggle_reset(self) -> None:
-        """点「重置」：弹出全屏覆盖确认框（确认需点 2 次）。"""
+        """点「重置应用」：弹出全屏覆盖确认框（确认需点 2 次）。"""
         if getattr(self, "_reset_overlay", None) is not None:
             return
         overlay = tk.Frame(self.root, bg=BG_COLOR)
@@ -2748,11 +2779,11 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _set_lyric_bar_mode(self, mode: str, persist: bool = True) -> None:
-        """切换桌面歌词条模式（off / top / bottom）。
+        """切换桌面歌词条模式（off / top / bottom / custom）。
 
         persist=False 供启动恢复与重置复用（不触发保存）。
         """
-        if mode not in ("off", "top", "bottom"):
+        if mode not in ("off", "top", "bottom", "custom"):
             mode = "off"
         self._lyric_bar_mode = mode
         if mode == "off":
@@ -2761,6 +2792,7 @@ class LrcPlayerApp:
             self._ensure_lyric_bar()
             self._update_lyric_bar()
         self.op.refresh_lyric_mode_buttons()
+        self._sync_lyric_custom_rows()
         if persist:
             self._schedule_config_save()
 
@@ -2778,26 +2810,124 @@ class LrcPlayerApp:
             self._schedule_config_save()
 
     def _set_lyric_bar_width(self, pct: float, persist: bool = True) -> None:
-        """歌词条初始宽度（占屏幕 10~100%，默认 25）。"""
+        """歌词条初始宽度（占屏幕 10~100%，默认 25）。
+
+        拖动中实时改变条宽；X/Y 范围与数值由拖动完成后的
+        `_finalize_lyric_bar_width` 统一更新（避免逐帧重算卡顿）。
+        """
         v = int(round(max(10.0, min(100.0, float(pct)))))
         self._lyric_bar_width_pct = v
-        self._update_lyric_bar()
+        self._update_lyric_bar(rebuild_text=False)
         self._sync_lyric_opt_display("width", v)
         if persist:
             self._schedule_config_save()
 
     def _set_lyric_bar_font_size(self, px: float, persist: bool = True) -> None:
-        """歌词条字体大小（12~30 px，默认 18；随小屏缩放）。"""
+        """歌词条字体大小（12~30 px，默认 18；随小屏缩放）。
+
+        拖动中实时生效；不重算 X/Y 范围（按约定仅在锚点/宽度变化时计算），
+        也不重排控件行（避免拖动中闪烁）。
+        """
         v = int(round(max(12.0, min(30.0, float(px)))))
         self._lyric_bar_font_size = v
         try:
             self.lyric_bar_font.configure(size=self._font_size(v))
         except tk.TclError:
             pass
-        self._update_lyric_bar()
+        self._update_lyric_bar(rebuild_text=False)
         self._sync_lyric_opt_display("font", v)
         if persist:
             self._schedule_config_save()
+
+    def _set_lyric_bar_anchor(self, anchor: str, persist: bool = True) -> None:
+        """设置自定义锚点（九宫格）：X/Y 重置为 0，并重算滑块范围。"""
+        if anchor not in LYRIC_ANCHOR_FRAC:
+            anchor = "c"
+        self._lyric_bar_anchor = anchor
+        self._lyric_bar_x = 0
+        self._lyric_bar_y = 0
+        self._refresh_lyric_xy_range()
+        self._position_lyric_bar()
+        self._sync_lyric_custom_rows()
+        if persist:
+            self._schedule_config_save()
+
+    def _set_lyric_bar_x(self, px: float, persist: bool = True) -> None:
+        """自定义模式 X 偏移（px，相对锚点）。
+
+        按缓存范围钳制后轻量移动歌词条（不重建文本/不重排行）；
+        范围仅在切换锚点或宽度调整完成时更新。
+        """
+        xmin, xmax, _, _ = self._lyric_bar_xy_ranges()
+        v = int(round(max(float(xmin), min(float(xmax), float(px)))))
+        self._lyric_bar_x = v
+        self._position_lyric_bar()
+        if persist:
+            self._schedule_config_save()
+
+    def _set_lyric_bar_y(self, px: float, persist: bool = True) -> None:
+        """自定义模式 Y 偏移（px，相对锚点）。
+
+        按缓存范围钳制后轻量移动歌词条（不重建文本/不重排行）；
+        范围仅在切换锚点或宽度调整完成时更新。
+        """
+        _, _, ymin, ymax = self._lyric_bar_xy_ranges()
+        v = int(round(max(float(ymin), min(float(ymax), float(px)))))
+        self._lyric_bar_y = v
+        self._position_lyric_bar()
+        if persist:
+            self._schedule_config_save()
+
+    def _refresh_lyric_xy_range(self) -> None:
+        """重算并缓存 X/Y 可调范围（仅切换锚点或宽度调整完成时调用）。
+
+        条宽只按「默认宽度」（屏幕宽 × 宽度%）计算，不考虑歌词变长等
+        实际加宽因素；按约定不做溢出补偿（极端情况下条可部分超出屏幕）。
+        """
+        fx, fy = LYRIC_ANCHOR_FRAC.get(self._lyric_bar_anchor, (0.5, 0.5))
+        w = int(self.screen_w * self._lyric_bar_width_pct / 100)
+        try:
+            h = self.lyric_bar_font.metrics("linespace") + self._px(18)
+        except Exception:
+            h = self._px(40)
+        xpad = max(0, self.screen_w - w)
+        ypad = max(0, self.screen_h - h)
+        self._lyric_xy_range = (
+            int(round(-fx * xpad)), int(round((1.0 - fx) * xpad)),
+            int(round(-fy * ypad)), int(round((1.0 - fy) * ypad)))
+
+    def _lyric_bar_xy_ranges(self) -> tuple[int, int, int, int]:
+        """X/Y 可调范围（缓存值；未计算过时惰性计算一次）。"""
+        if self._lyric_xy_range is None:
+            self._refresh_lyric_xy_range()
+        return self._lyric_xy_range or (0, 0, 0, 0)
+
+    def _finalize_lyric_bar_width(self) -> None:
+        """宽度调整完成：重算 X/Y 范围、钳制并刷新滑块范围与数值。"""
+        self._refresh_lyric_xy_range()
+        xmin, xmax, ymin, ymax = self._lyric_bar_xy_ranges()
+        cx = max(xmin, min(xmax, self._lyric_bar_x))
+        cy = max(ymin, min(ymax, self._lyric_bar_y))
+        if cx != self._lyric_bar_x or cy != self._lyric_bar_y:
+            self._lyric_bar_x = cx
+            self._lyric_bar_y = cy
+            self._position_lyric_bar()
+        op = getattr(self, "op", None)
+        if op is not None:
+            try:
+                op.refresh_lyric_xy_ui()
+            except Exception:
+                pass
+
+    def _sync_lyric_custom_rows(self) -> None:
+        """刷新「歌词选项」区行显隐与锚点/XY 显示（面板未创建时忽略）。"""
+        op = getattr(self, "op", None)
+        if op is None:
+            return
+        try:
+            op.sync_lyric_custom_rows()
+        except Exception:
+            pass
 
     def _sync_lyric_opt_display(self, which: str, v: int) -> None:
         """同步「歌词选项」滑块显示（面板未创建时忽略）。"""
@@ -2899,16 +3029,51 @@ class LrcPlayerApp:
         g = max(0, min(g, len(stem) - 1))
         return self.lrc_lines[stem[g]][1].rstrip(" \u3000")
 
-    def _update_lyric_bar(self) -> None:
-        """刷新歌词条内容与几何：屏幕居中，宽度随歌词实时变化。
+    def _lyric_bar_xy_for(self, width: int, height: int) -> tuple[int, int]:
+        """按当前模式/锚点/偏移计算条坐标（自定义模式不做屏内钳制）。"""
+        xpad = self.screen_w - width
+        ypad = self.screen_h - height
+        if self._lyric_bar_mode == "custom":
+            fx, fy = LYRIC_ANCHOR_FRAC.get(self._lyric_bar_anchor,
+                                           (0.5, 0.5))
+            return (int(round(xpad * fx)) + self._lyric_bar_x,
+                    int(round(ypad * fy)) + self._lyric_bar_y)
+        return xpad // 2, (0 if self._lyric_bar_mode == "top" else ypad)
+
+    def _place_lyric_bar(self, width: int, height: int) -> None:
+        """应用歌词条窗口尺寸与位置（兼容负坐标：超出屏幕时仍可定位）。"""
+        x, y = self._lyric_bar_xy_for(width, height)
+        try:
+            self._lyric_bar.geometry(f"{width}x{height}{x:+d}{y:+d}")
+            self._lyric_bar.lift()
+        except tk.TclError:
+            pass
+
+    def _position_lyric_bar(self) -> None:
+        """轻量移动歌词条（X/Y 拖动专用：不重建文本、不重新测量）。"""
+        if self._lyric_bar is None:
+            return
+        width, height = self._lyric_bar_size
+        if width <= 0 or height <= 0:
+            self._update_lyric_bar()
+            return
+        self._place_lyric_bar(width, height)
+
+    def _update_lyric_bar(self, rebuild_text: bool = True) -> None:
+        """刷新歌词条内容与几何：宽度随歌词实时变化。
 
         初始宽度为屏幕的「默认宽度」比例（默认 25%）；歌词较长时加宽，
-        上限为屏幕全宽。
+        上限为屏幕全宽。位置：顶部/底部模式贴屏幕上下边居中；自定义模式为
+        锚点九宫格基础位置 + X/Y 偏移（锚点处为原点；按约定不做屏内钳制，
+        极端情况下允许部分超出屏幕）。
+        rebuild_text=False：宽度/字体拖动中复用缓存文本（免重建主干行）。
         """
         if self._lyric_bar is None or self._lyric_bar_var is None:
             return
-        text = self._current_stem_line_text()
-        self._lyric_bar_var.set(text)
+        if rebuild_text or self._lyric_bar_text is None:
+            self._lyric_bar_text = self._current_stem_line_text()
+            self._lyric_bar_var.set(self._lyric_bar_text)
+        text = self._lyric_bar_text or ""
         try:
             need = self.lyric_bar_font.measure(text) + self._px(40)
         except Exception:
@@ -2916,13 +3081,8 @@ class LrcPlayerApp:
         base = int(self.screen_w * self._lyric_bar_width_pct / 100)
         width = min(self.screen_w, max(base, need))
         height = self.lyric_bar_font.metrics("linespace") + self._px(18)
-        x = (self.screen_w - width) // 2
-        y = 0 if self._lyric_bar_mode == "top" else self.screen_h - height
-        try:
-            self._lyric_bar.geometry(f"{width}x{height}+{x}+{y}")
-            self._lyric_bar.lift()
-        except tk.TclError:
-            pass
+        self._lyric_bar_size = (width, height)
+        self._place_lyric_bar(width, height)
 
     # ==================================================================
     # 主循环

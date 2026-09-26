@@ -10,12 +10,15 @@
     "play_mode": "loop_all",
     "always_on_top": false,
     "lyric_bar": "off",
+    "lyric_anchor": "c",
+    "lyric_x": 0,
+    "lyric_y": 0,
     "lyric_alpha": 85,
     "lyric_width": 25,
     "lyric_font": 18
   },
   "folders": [
-    "D:\\codefile\\File\\Music"
+    "D:\\codefile\\File\\Music\\MSC"
   ],
-  "active_folder": "D:\\codefile\\File\\Music"
+  "active_folder": "D:\\codefile\\File\\Music\\MSC"
 }
