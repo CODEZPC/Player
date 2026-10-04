@@ -18,8 +18,8 @@
   i 导出（另存为 .lrc，未打轴行以 [00:00.000] 占位）
   j 重做 Y
 
-约定：撤销/重做为全表快照（上限 50 步）；展开逻辑与 LRC-TRANS 一致
-（按空格分词、逐字递增、全角空格填充），原行时间戳复制到其所有子行。
+约定：撤销/重做为全表快照（上限 50 步）；展开逻辑：中文逐字、英文单词
+整体揭示、未揭示部分不补占位（自然拼接），原行时间戳复制到其所有子行。
 """
 
 import os
@@ -31,6 +31,9 @@ from utils import read_text_file
 
 FULLWIDTH_SPACE = "\u3000"
 
+# 英文/数字连续段：作为一个整体揭示单元（含撇号/连字符，如 don't、co-op）
+_ASCII_UNIT_RE = re.compile(r"[A-Za-z0-9'’-]+")
+
 # 行首单时间标签：[mm:ss]、[mm:ss.xx]、[mm:ss.xxx]
 _TIME_LINE_RE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
 
@@ -39,32 +42,52 @@ _TIME_LINE_RE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
 # 纯逻辑辅助（可在无 GUI 环境下单测）
 # ======================================================================
 
-def expand_prefix_lines(text: str) -> list[str]:
-    """把一行歌词按字展开为前缀递增的逐字行（全角空格填充）。
+def _split_units(word: str) -> list[str]:
+    """把空格分隔的词拆为揭示单元。
 
-    与 LRC/LRC-TRANS 工具的输出一致：按空格分词，逐字揭示，
-    未揭示部分用全角空格占位。
+    连续 ASCII 字母/数字（含 ' ’ -）为一个整体单元（英文按单词揭示）；
+    其余字符（中文、标点等）每字符一个单元。
+    """
+    units: list[str] = []
+    pos = 0
+    for m in _ASCII_UNIT_RE.finditer(word):
+        for ch in word[pos:m.start()]:
+            units.append(ch)
+        units.append(m.group())
+        pos = m.end()
+    for ch in word[pos:]:
+        units.append(ch)
+    return units
+
+
+def expand_prefix_lines(text: str) -> list[str]:
+    """把一行歌词展开为逐步揭示的行（与 LRC-TRANS 目标一致的逐字/逐词式）。
+
+    - 中文（等非 ASCII 字符）逐字揭示；英文单词/数字整体揭示；
+    - 未揭示部分**不补占位空格**（行宽随揭示增长，自然拼接）；
+    - 逐步披露顺序：按词序、词内按单元序。
+
+    例：“阿房宫”→[“阿”, “阿房”, “阿房宫”]；“Hello world”→[“Hello”, “Hello world”]。
     """
     words = text.strip().split()
     if not words:
         return []
-    widths = [len(word) for word in words]
-    revealed = [0] * len(words)
-    output: list[str] = []
-    for wi, word in enumerate(words):
-        for _ in word:
-            revealed[wi] += 1
-            parts: list[str] = []
-            for wj, part_word in enumerate(words):
-                count = revealed[wj]
-                if count == 0:
-                    part = FULLWIDTH_SPACE * widths[wj]
-                else:
-                    part = (part_word[:count]
-                            + FULLWIDTH_SPACE * (widths[wj] - count))
-                parts.append(part)
-            output.append(" ".join(parts))
-    return output
+    word_units = [_split_units(w) for w in words]
+
+    def build(last_w: int, last_n: int) -> str:
+        """第 last_w 词揭示前 last_n 个单元，前面词全部揭示。"""
+        parts: list[str] = []
+        for wi in range(last_w + 1):
+            units = word_units[wi]
+            count = last_n if wi == last_w else len(units)
+            parts.append("".join(units[:count]))
+        return " ".join(parts)
+
+    out: list[str] = []
+    for wi, units in enumerate(word_units):
+        for k in range(1, len(units) + 1):
+            out.append(build(wi, k))
+    return out
 
 
 def _norm_text(text: str) -> str:
@@ -165,6 +188,9 @@ class LyricEditor:
         # 歌词文本专用等宽字体（列表与内联编辑统一）
         self.text_font = self.app._pick_font(
             "Jetbrains Mono", self.app._font_size(11))
+        # 顶部预览行字体（与主窗口歌词行同族，小一号）
+        self.preview_font = self.app._pick_font(
+            "汉仪文黑-85W", self.app._font_size(14))
 
         self._build_ui()
 
@@ -179,6 +205,15 @@ class LyricEditor:
         self.frame = tk.Frame(self.parent, bg=self.BG_COLOR,
                               highlightthickness=1,
                               highlightbackground=self.SUBTLE_COLOR)
+
+        # ---- 顶部：当前应显示歌词预览（横跨全宽，汉仪文黑-85W）----
+        self.preview_var = tk.StringVar(value="")
+        self.preview_label = tk.Label(
+            self.frame, textvariable=self.preview_var,
+            bg=self.BG_COLOR, fg=self.FG_COLOR,
+            font=self.preview_font, anchor="w")
+        self.preview_label.pack(fill="x", padx=self._px(8),
+                                pady=(self._px(6), 0))
 
         # ---- 上半：A 时间戳区（左） + B 歌词列表（右）----
         top = tk.Frame(self.frame, bg=self.BG_COLOR)
@@ -403,6 +438,21 @@ class LyricEditor:
         else:
             self.sel_time_var.set("--:--.---")
 
+    def _preview_text_at(self, t: float) -> str:
+        """当前时间 t 在编辑数据中应显示的歌词文本。
+
+        取“已打轴且时间 ≤ t”的行中时间最大的一条的文本（行可乱序，
+        故遍历取最大者）；无匹配（未到任何已打轴行/全部未打轴）返回空串。
+        """
+        best_t: float | None = None
+        best_text = ""
+        for line in self.lines:
+            lt = line["time"]
+            if lt is not None and lt <= t and (best_t is None or lt > best_t):
+                best_t = lt
+                best_text = line["text"]
+        return best_text
+
     # ------------------------------------------------------------------
     # A 区实时刷新
     # ------------------------------------------------------------------
@@ -410,7 +460,9 @@ class LyricEditor:
         if not self.visible:
             return
         try:
-            self.cur_time_var.set(fmt_time(self.app._current_time()))
+            t = self.app._current_time()
+            self.cur_time_var.set(fmt_time(t))
+            self.preview_var.set(self._preview_text_at(t))
         except Exception:
             pass
         self._after_id = self.app.root.after(self.TICK_MS, self._tick)
