@@ -497,6 +497,16 @@ class OperationPanel:
             activeforeground=self.BG_COLOR,
             relief="flat", padx=6, pady=2)
         self.lyric_reset_btn.pack(side="right")
+        # 「编辑歌词」：打开歌词编辑器（叠加在歌曲选择区；位于重置左侧）
+        self.lyric_edit_btn = tk.Button(
+            self.lyric_opt_cancel_row, text="编辑歌词",
+            command=self.app._open_lyric_editor,
+            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+            font=self.app.button_font_sm,
+            activebackground=self.ACCENT_COLOR,
+            activeforeground=self.BG_COLOR,
+            relief="flat", padx=6, pady=2)
+        self.lyric_edit_btn.pack(side="right")
 
         self.lyric_opt_reset = tk.Frame(lyr_frame, bg="#1F3A8A",
                                         height=self._px(36))

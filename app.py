@@ -26,6 +26,7 @@ from utils import (
     APP_VERSION,
 )
 from console import PlayerConsole
+from lyric_editor import LyricEditor
 
 
 # ===========================================================================
@@ -991,6 +992,15 @@ class LrcPlayerApp:
         """打开/关闭控制台窗口。"""
         if getattr(self, "console", None) is not None:
             self.console.toggle()
+
+    def _open_lyric_editor(self) -> None:
+        """打开歌词编辑器（懒创建；面板叠加在歌曲选择区之上）。"""
+        self._ensure_bottom_shown()   # 确保歌曲选择区已显示（编辑器叠加其内）
+        editor = getattr(self, "lyric_editor", None)
+        if editor is None:
+            editor = LyricEditor(self, self.bottom_frame)
+            self.lyric_editor = editor
+        editor.show()
 
     # ==================================================================
     # 专辑封面
