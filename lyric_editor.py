@@ -162,6 +162,9 @@ class LyricEditor:
         # 时间显示专用等宽字体（数字不跳动，宽度可控不截断）
         self.time_font = self.app._pick_font(
             "Jetbrains Mono", self.app._font_size(16))
+        # 歌词文本专用等宽字体（列表与内联编辑统一）
+        self.text_font = self.app._pick_font(
+            "Jetbrains Mono", self.app._font_size(11))
 
         self._build_ui()
 
@@ -200,6 +203,27 @@ class LyricEditor:
         tk.Label(a_col, textvariable=self.sel_time_var, bg=self.BG_COLOR,
                  fg=self.FG_COLOR, font=self.app.info_font, anchor="w").pack(
             anchor="w")
+        # 选中行操作按钮（竖排：跳转 / -0.05s / +0.05s）
+        btn_cfg = dict(bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+                       font=self.app.button_font_sm,
+                       activebackground=self.ACCENT_COLOR,
+                       activeforeground=self.BG_COLOR,
+                       relief="flat", padx=self._px(4), pady=self._px(2))
+        self.jump_btn = tk.Button(a_col, text="跳转",
+                                  command=self.jump_to_line, **btn_cfg)
+        self.jump_btn.pack(fill="x", pady=(self._px(8), 1))
+        self.minus_btn = tk.Button(a_col, text="-0.05s",
+                                   command=lambda: self.nudge_time(-0.05),
+                                   **btn_cfg)
+        self.minus_btn.pack(fill="x", pady=1)
+        self.plus_btn = tk.Button(a_col, text="+0.05s",
+                                  command=lambda: self.nudge_time(0.05),
+                                  **btn_cfg)
+        self.plus_btn.pack(fill="x", pady=1)
+        # 点击后把焦点还给歌词列表（便于继续键盘操作，避免空格双触发）
+        for b in (self.jump_btn, self.minus_btn, self.plus_btn):
+            b.bind("<ButtonRelease-1>",
+                   lambda e: self.listbox.focus_set(), add="+")
 
         b_col = tk.Frame(top, bg=self.BG_COLOR)
         b_col.pack(side="left", fill="both", expand=True,
@@ -208,7 +232,7 @@ class LyricEditor:
         list_inner.pack(fill="both", expand=True)
         self.listbox = tk.Listbox(
             list_inner, bg=self.BG_COLOR, fg=self.FG_COLOR,
-            font=self.app.list_font,
+            font=self.text_font,
             selectbackground=self.ACCENT_COLOR,
             selectforeground=self.BG_COLOR,
             highlightthickness=0, relief="flat", activestyle="none",
@@ -250,6 +274,9 @@ class LyricEditor:
                 activeforeground=self.BG_COLOR,
                 relief="flat", padx=self._px(4), pady=self._px(4))
             b.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
+            # 点击后把焦点还给歌词列表（便于连续打轴/导航）
+            b.bind("<ButtonRelease-1>",
+                   lambda e: self.listbox.focus_set(), add="+")
         for col in range(5):
             btn_grid.columnconfigure(col, weight=1)
 
@@ -421,6 +448,38 @@ class LyricEditor:
         if not self.lines:
             return
         self._select(self.sel + 1)
+
+    def jump_to_line(self) -> None:
+        """跳转：把播放位置跳到选中行时间戳（保持当前播放状态）。
+
+        播放中→继续播放；暂停中→保持暂停（位置已更新）；停止→仅更新
+        进度/时间显示；选中行未打轴（无时间戳）时不响应。
+        """
+        if not (0 <= self.sel < len(self.lines)):
+            return
+        t = self.lines[self.sel]["time"]
+        if t is None:
+            return
+        try:
+            self.app._seek_to(float(t))
+        except Exception:
+            pass
+
+    def nudge_time(self, delta: float) -> None:
+        """微调选中行时间戳（±秒，按毫秒取整防累积误差；下限 0）。
+
+        记入撤销栈（可 Z 回退）；选中行未打轴（无时间戳）时不响应。
+        """
+        if not (0 <= self.sel < len(self.lines)):
+            return
+        t = self.lines[self.sel]["time"]
+        if t is None:
+            return
+        self._push_undo()
+        ms = int(round(t * 1000)) + int(round(delta * 1000))
+        self.lines[self.sel]["time"] = max(0, ms) / 1000.0
+        self._update_row(self.sel)
+        self._update_sel_time()
 
     def delete_line(self) -> None:
         """删除选中行。"""
@@ -596,7 +655,7 @@ class LyricEditor:
         self._editing = True
         self.entry = tk.Entry(
             self.listbox, bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
-            font=self.app.list_font, relief="flat",
+            font=self.text_font, relief="flat",
             highlightthickness=1, highlightbackground=self.ACCENT_COLOR,
             insertbackground=self.FG_COLOR)
         self.entry.insert(0, self.lines[idx]["text"])
