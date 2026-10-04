@@ -319,10 +319,11 @@ class LyricEditor:
     # 显隐
     # ------------------------------------------------------------------
     def show(self) -> None:
-        """打开编辑器：载入当前歌曲歌词并叠加显示。"""
+        """打开编辑器：锁定播放模式并载入当前歌曲歌词叠加显示。"""
         if self.visible:
             return
         self.visible = True
+        self.app._lock_play_mode_single()   # 编辑期间锁定播放模式为「关闭」
         self._load_current()
         self.frame.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.frame.lift()
@@ -335,6 +336,7 @@ class LyricEditor:
         if not self.visible:
             return
         self.visible = False
+        self.app._unlock_play_mode()   # 恢复锁定前的播放模式
         self._cancel_edit()
         self.frame.place_forget()
         self._unbind_keys()

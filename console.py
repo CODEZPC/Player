@@ -443,7 +443,9 @@ class PlayerConsole:
             from app import PLAY_MODES
             idx = self.MODE_MAP[name]
             label, mode = PLAY_MODES[idx]
-            app._set_play_mode(mode)   # 同步选项区按钮高亮与保存
+            # 同步选项区按钮高亮与保存；歌词编辑锁定期间拒绝
+            if not app._set_play_mode(mode):
+                return "歌词编辑中：播放模式已锁定为「关闭」（仅一首）"
             return f"模式: {label}"
 
         if obj == "rate":

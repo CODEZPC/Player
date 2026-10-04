@@ -162,6 +162,8 @@ class LrcPlayerApp:
         self.always_on_top = False
         self.play_mode_index = 0
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
+        self._play_mode_locked = False        # 歌词编辑器打开期间锁定播放模式
+        self._play_mode_saved = self.play_mode  # 锁定前的模式（退出恢复用）
 
         # ---- 字体（小屏按 ui_scale 缩放）----
         self.title_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
@@ -2085,13 +2087,41 @@ class LrcPlayerApp:
     # 播放模式
     # ==================================================================
 
-    def _set_play_mode(self, mode: str) -> None:
-        """直接设置播放模式（选项区按钮 / 控制台 `set mode` 共用）。"""
+    def _set_play_mode(self, mode: str, persist: bool = True,
+                       force: bool = False) -> bool:
+        """直接设置播放模式（选项区按钮 / 控制台 `set mode` 共用）。
+
+        - 歌词编辑器打开期间模式被锁定为「关闭」：非 force 调用直接拒绝
+          （返回 False，选项区按钮同步禁用置灰）；
+        - persist=False 供编辑器临时切换/恢复复用（不触发保存）。
+        返回是否设置成功。
+        """
+        if self._play_mode_locked and not force:
+            return False
         idx = next((i for i, (_, m) in enumerate(PLAY_MODES) if m == mode), 0)
         self.play_mode_index = idx
         self.play_mode = PLAY_MODES[idx][1]
         self.op.refresh_mode_buttons()
-        self._schedule_config_save()
+        if persist:
+            self._schedule_config_save()
+        return True
+
+    def _lock_play_mode_single(self) -> None:
+        """进入歌词编辑：临时锁定播放模式为「关闭」（仅一首，不写入配置）。"""
+        if self._play_mode_locked:
+            return
+        self._play_mode_saved = self.play_mode
+        self._play_mode_locked = True
+        self._set_play_mode("single", persist=False, force=True)
+        self.op.set_mode_buttons_state("disabled")
+
+    def _unlock_play_mode(self) -> None:
+        """退出歌词编辑：恢复锁定前的播放模式并恢复按钮可用。"""
+        if not self._play_mode_locked:
+            return
+        self._play_mode_locked = False
+        self._set_play_mode(self._play_mode_saved, persist=False, force=True)
+        self.op.set_mode_buttons_state("normal")
 
     # ==================================================================
     # 配置持久化（_internal/config/data.json）
@@ -2119,7 +2149,9 @@ class LrcPlayerApp:
             "lrc_offset": round(float(self.lrc_offset or 0), 1),
             "balance": round(float(self.engine.get_balance()), 2),
             "gain": round(float(self.engine.get_gain()), 2),
-            "play_mode": self.play_mode,
+            # 歌词编辑锁定期间不写临时模式（直接关窗口也保留用户原设置）
+            "play_mode": (self._play_mode_saved
+                          if self._play_mode_locked else self.play_mode),
             "always_on_top": bool(self.always_on_top),
             "lyric_bar": self._lyric_bar_mode,
             "lyric_anchor": self._lyric_bar_anchor,
@@ -2373,6 +2405,11 @@ class LrcPlayerApp:
 
     def _do_reset_all(self) -> None:
         """执行重置：清除配置、文件夹、当前播放/插播状态（不删除文件）。"""
+        # 歌词编辑器锁定中先解除（避免退出编辑器时回写旧模式覆盖重置结果）
+        try:
+            self._unlock_play_mode()
+        except Exception:
+            pass
         # 关闭歌词浮层
         if self._lyric_overlay is not None:
             try:

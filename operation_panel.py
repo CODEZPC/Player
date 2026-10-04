@@ -1053,6 +1053,14 @@ class OperationPanel:
             except tk.TclError:
                 pass
 
+    def set_mode_buttons_state(self, state: str) -> None:
+        """设置模式按钮组可用状态（歌词编辑器锁定期间置灰不可点）。"""
+        for btn in self.mode_btns.values():
+            try:
+                btn.config(state=state, disabledforeground="#666C74")
+            except tk.TclError:
+                pass
+
     def refresh_topmost_buttons(self) -> None:
         """刷新置顶按钮组选中态：当前状态高亮（ACCENT 底/深色字）。"""
         for val, btn in self.topmost_btns.items():
