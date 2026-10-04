@@ -182,6 +182,7 @@ class LyricEditor:
         self.visible = False
         self._after_id = None
         self._bind_ids: list[tuple[str, str]] = []
+        self._initial_lines: list[dict] | None = None  # 打开时快照（未更改判定）
         # 时间显示专用等宽字体（数字不跳动，宽度可控不截断）
         self.time_font = self.app._pick_font(
             "Jetbrains Mono", self.app._font_size(16))
@@ -360,6 +361,8 @@ class LyricEditor:
             src = list(self.app.lrc_lines)
         self.lines = [{"text": t, "time": ts} for ts, t in src]
         self.sel = 0 if self.lines else -1
+        # 记录原载入态快照（展开选择/任何编辑均使“未更改”判定失效）
+        self._initial_lines = [dict(d) for d in self.lines]
         self._refresh_list()
         if self.lines and not is_prefix_expanded(
                 [l["text"] for l in self.lines]):
@@ -598,10 +601,15 @@ class LyricEditor:
         self._refresh_list()
 
     def finish(self) -> None:
-        """完成：关闭前询问保存；无歌曲时询问导出。"""
+        """完成：未做更改时直接不保存退出；有更改时关闭前询问保存。"""
         if self._editing:
             return
         if not self.lines:
+            self.hide()
+            return
+        # 内容与打开时一致（含“改过又撤销”）：直接退出，不询问不保存
+        if (self._initial_lines is not None
+                and self.lines == self._initial_lines):
             self.hide()
             return
         audio = self.app.audio_path

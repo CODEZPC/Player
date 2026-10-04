@@ -1,6 +1,3 @@
-[pkg_config]
-numpy = numpy._core.lib.pkgconfig
-
 [array_api]
 numpy = numpy
 

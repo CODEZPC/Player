@@ -7,7 +7,7 @@
     "lrc_offset": 0.0,
     "balance": 0.0,
     "gain": 1.0,
-    "play_mode": "loop_all",
+    "play_mode": "loop_one",
     "always_on_top": false,
     "lyric_bar": "off",
     "lyric_anchor": "c",
