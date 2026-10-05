@@ -238,6 +238,8 @@ class PlayerConsole:
         if os.path.isfile(path):
             if not self.app.engine.ready:
                 return "音频后端不可用"
+            if self.app._track_switch_guard("打开文件"):
+                return "歌词编辑中，已阻止打开文件"
             if not self.app._load_audio_file(path):
                 return f"加载失败: {path}"
             self.app._auto_load_lrc(path)
@@ -278,6 +280,8 @@ class PlayerConsole:
         app = self.app
         if idx < 0 or idx >= len(app.audio_items):
             return "序号超出范围"
+        if app._track_switch_guard():
+            return "歌词编辑中，已阻止切换歌曲"
         app._load_track_by_index(idx, autoplay=True)
         name = app.audio_items[idx].get("display") or ""
         return f"已播放第 {idx + 1} 首: {name}"
@@ -381,6 +385,8 @@ class PlayerConsole:
                     return "参数错误: change 需要整数 t"
             if not app.audio_items:
                 return "歌曲列表为空"
+            if app._track_switch_guard():
+                return "歌词编辑中，已阻止切换歌曲"
             cur = app.current_song_index if app.current_song_index is not None else -1
             idx = (cur + t) % len(app.audio_items)
             app._load_track_by_index(idx, autoplay=True)

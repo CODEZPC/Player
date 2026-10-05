@@ -20,6 +20,8 @@
 
 约定：撤销/重做为全表快照（上限 50 步）；展开逻辑：中文逐字、英文单词
 整体揭示、未揭示部分不补占位（自然拼接），原行时间戳复制到其所有子行。
+零宽字符（BOM/ZWSP 等，常见于网上下载歌词）在载入/解析/展开/编辑时清除，
+避免展开结果出现“空行”（V1.8.5）。
 """
 
 import os
@@ -33,6 +35,14 @@ FULLWIDTH_SPACE = "\u3000"
 
 # 英文/数字连续段：作为一个整体揭示单元（含撇号/连字符，如 don't、co-op）
 _ASCII_UNIT_RE = re.compile(r"[A-Za-z0-9'’-]+")
+
+# 零宽/不可见字符（网上下载的歌词常含此类字符：展开时会成为“空”揭示单元）
+_INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\ufeff]")
+
+
+def strip_invisible(text: str) -> str:
+    """移除零宽字符（ZWSP/ZWNJ/ZWJ/LRM/RLM/BOM），避免展开产生“空行”。"""
+    return _INVISIBLE_RE.sub("", text)
 
 # 行首单时间标签：[mm:ss]、[mm:ss.xx]、[mm:ss.xxx]
 _TIME_LINE_RE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
@@ -69,7 +79,7 @@ def expand_prefix_lines(text: str) -> list[str]:
 
     例：“阿房宫”→[“阿”, “阿房”, “阿房宫”]；“Hello world”→[“Hello”, “Hello world”]。
     """
-    words = text.strip().split()
+    words = strip_invisible(text).strip().split()
     if not words:
         return []
     word_units = [_split_units(w) for w in words]
@@ -91,8 +101,8 @@ def expand_prefix_lines(text: str) -> list[str]:
 
 
 def _norm_text(text: str) -> str:
-    """去除普通/全角空白，用于前缀比较。"""
-    return text.replace(FULLWIDTH_SPACE, "").replace(" ", "").strip()
+    """去除零宽字符与普通/全角空白，用于前缀比较。"""
+    return strip_invisible(text).replace(FULLWIDTH_SPACE, "").replace(" ", "").strip()
 
 
 def is_prefix_expanded(texts: list[str]) -> bool:
@@ -139,7 +149,7 @@ def parse_lines(text: str) -> list[tuple[float | None, str]]:
     """
     out: list[tuple[float | None, str]] = []
     for raw in text.splitlines():
-        line = raw.strip()
+        line = strip_invisible(raw).strip()
         if not line or line.lower().startswith("[offset:"):
             continue
         m = _TIME_LINE_RE.match(line)
@@ -159,7 +169,7 @@ class LyricEditor:
     """歌词编辑器面板（自包含；app.lyric_editor 为实例）。"""
 
     UNDO_LIMIT = 50           # 撤销快照上限
-    TICK_MS = 100             # A 区当前时间刷新间隔
+    TICK_MS = 8             # A 区当前时间刷新间隔
 
     def __init__(self, app, parent: tk.Frame) -> None:
         # 延迟导入：app 在本模块导入时尚未定义这些常量
@@ -359,7 +369,9 @@ class LyricEditor:
         src: list[tuple[float, str]] = []
         if self.app.lrc_lines and self.app.lrc_path is not None:
             src = list(self.app.lrc_lines)
-        self.lines = [{"text": t, "time": ts} for ts, t in src]
+        # 清理零宽字符（BOM/ZWSP 等；残留会在展开时成为“空行”，V1.8.5）
+        self.lines = [{"text": strip_invisible(t), "time": ts}
+                      for ts, t in src]
         self.sel = 0 if self.lines else -1
         # 记录原载入态快照（展开选择/任何编辑均使“未更改”判定失效）
         self._initial_lines = [dict(d) for d in self.lines]
@@ -750,7 +762,7 @@ class LyricEditor:
         if not self._editing or self.entry is None:
             return
         idx = self._edit_index
-        text = self.entry.get()
+        text = strip_invisible(self.entry.get())
         self._editing = False
         try:
             self.entry.destroy()

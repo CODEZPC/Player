@@ -164,6 +164,7 @@ class LrcPlayerApp:
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
         self._play_mode_locked = False        # 歌词编辑器打开期间锁定播放模式
         self._play_mode_saved = self.play_mode  # 锁定前的模式（退出恢复用）
+        self._status_hint_timer = None        # 状态栏临时提示定时器（V1.8.5）
 
         # ---- 字体（小屏按 ui_scale 缩放）----
         self.title_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
@@ -213,12 +214,14 @@ class LrcPlayerApp:
         """外部进程打开文件时调用的入口（主线程执行）。"""
         if not os.path.exists(path):
             return
-        if self._load_audio_file(path):
-            self._auto_load_lrc(path)
-            self._play()
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        if self._track_switch_guard("打开文件"):
+            return          # 歌词编辑中：忽略外部打开（状态栏已提示）
+        if self._load_audio_file(path):
+            self._auto_load_lrc(path)
+            self._play()
 
     # ==================================================================
     # 字体 & 样式
@@ -1058,6 +1061,9 @@ class LrcPlayerApp:
         loaded = self.audio_path is not None or bool(self.audio_items)
         for b in (self._btn_a, self._btn_b, self._btn_c):
             b.config(state="normal" if loaded else "disabled")
+        # 歌词编辑期间「播放此首」一并禁用（防止编辑时切歌，V1.8.5）
+        if self._play_mode_locked and self._btn_a.cget("text") == "播放此首":
+            self._btn_a.config(state="disabled")
 
     def _reset_clear_button(self) -> None:
         """将清除按钮恢复为默认状态。"""
@@ -1305,9 +1311,13 @@ class LrcPlayerApp:
 
         for w in (self.play_pause_btn, self.stop_btn,
                   self.back_10s_btn, self.forward_10s_btn,
-                  self.prev_btn, self.next_btn,
                   self.seek_scale):
             w.config(state=state)
+
+        # 上一曲/下一曲：歌词编辑期间一并禁用（防止编辑时切歌，V1.8.5）
+        track_state = "disabled" if self._play_mode_locked else state
+        for w in (self.prev_btn, self.next_btn):
+            w.config(state=track_state)
 
         # 倍速/保音高/音高/平衡/增益：仅 sounddevice 后端可用
         op_widgets = (self.op.speed_scale, self.op.pitch_btn,
@@ -1761,6 +1771,8 @@ class LrcPlayerApp:
 
     def _play_viewed_song(self) -> None:
         """播放当前在信息面板中查看的歌曲。"""
+        if self._track_switch_guard():
+            return
         if self.viewed_song_index is None:
             return
         if self.viewed_song_index < 0 or self.viewed_song_index >= len(self.audio_items):
@@ -1774,6 +1786,8 @@ class LrcPlayerApp:
     def _open_file(self) -> None:
         """打开单个音频文件并自动匹配 LRC。"""
         if not self.engine.ready:
+            return
+        if self._track_switch_guard("打开文件"):
             return
         path = filedialog.askopenfilename(
             title="选择音频文件",
@@ -1816,6 +1830,8 @@ class LrcPlayerApp:
 
     def _load_track_by_index(self, index: int, autoplay: bool = True) -> None:
         """按索引加载并播放歌曲列表中的曲目。"""
+        if self._track_switch_guard():
+            return
         if index < 0 or index >= len(self.audio_items):
             return
         path = self.audio_items[index].get("path")
@@ -2040,11 +2056,64 @@ class LrcPlayerApp:
         self._seek_to(min(self.duration, current + 10.0))
 
     # ==================================================================
+    # 歌词编辑期间的操作锁定（V1.8.5）
+    # ==================================================================
+
+    def _track_switch_guard(self, what: str = "切换歌曲") -> bool:
+        """歌词编辑期间阻止切歌/打开文件：状态栏提示并返回 True（已阻止）。"""
+        if not self._play_mode_locked:
+            return False
+        self._hint_status(f"歌词编辑中，已阻止{what}")
+        return True
+
+    def _hint_status(self, text: str) -> None:
+        """状态栏临时提示（约 2.5 秒后自动恢复「就绪」）。"""
+        try:
+            self._prog_var.set(text)
+        except Exception:
+            return
+        if self._status_hint_timer is not None:
+            try:
+                self.root.after_cancel(self._status_hint_timer)
+            except Exception:
+                pass
+        self._status_hint_timer = self.root.after(2500, self._clear_status_hint)
+
+    def _clear_status_hint(self) -> None:
+        """清除状态栏临时提示（若有）并恢复「就绪」（幂等）。"""
+        if self._status_hint_timer is None:
+            return
+        try:
+            self.root.after_cancel(self._status_hint_timer)
+        except Exception:
+            pass
+        self._status_hint_timer = None
+        self._set_status_ready()
+
+    def _set_edit_lock_buttons(self, locked: bool) -> None:
+        """歌词编辑锁定/解锁：禁用或恢复切歌相关按钮（上下曲/打开文件/播放此首）。"""
+        if locked:
+            for w in (self.prev_btn, self.next_btn, self.open_file_btn):
+                try:
+                    w.config(state="disabled")
+                except Exception:
+                    pass
+        else:
+            try:
+                self.open_file_btn.config(state="normal")
+            except Exception:
+                pass
+            self._update_controls_state()   # 上下曲按“已加载”逻辑恢复
+        self._refresh_il_buttons()          # 「播放此首」按钮同步锁定状态
+
+    # ==================================================================
     # 上一曲 / 下一曲
     # ==================================================================
 
     def _prev_track(self) -> None:
         """切换到上一首歌曲。"""
+        if self._track_switch_guard():
+            return
         if not self.audio_items:
             return
         if self.current_song_index is None:
@@ -2057,6 +2126,8 @@ class LrcPlayerApp:
 
     def _next_track(self) -> None:
         """下一曲：插播优先，否则按播放模式切歌（随机模式下随机选曲）。"""
+        if self._track_switch_guard():
+            return
         if self.interlude_items:
             self._stop()
             self._play_next_interlude()
@@ -2114,6 +2185,7 @@ class LrcPlayerApp:
         self._play_mode_locked = True
         self._set_play_mode("single", persist=False, force=True)
         self.op.set_mode_buttons_state("disabled")
+        self._set_edit_lock_buttons(True)   # 禁用切歌相关按钮（V1.8.5）
 
     def _unlock_play_mode(self) -> None:
         """退出歌词编辑：恢复锁定前的播放模式并恢复按钮可用。"""
@@ -2122,6 +2194,8 @@ class LrcPlayerApp:
         self._play_mode_locked = False
         self._set_play_mode(self._play_mode_saved, persist=False, force=True)
         self.op.set_mode_buttons_state("normal")
+        self._set_edit_lock_buttons(False)  # 恢复切歌相关按钮（V1.8.5）
+        self._clear_status_hint()           # 若有残留提示，立即恢复状态栏
 
     # ==================================================================
     # 配置持久化（_internal/config/data.json）

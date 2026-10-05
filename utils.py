@@ -11,7 +11,7 @@ from tkinter import font as tkfont
 # ===========================================================================
 
 APP_NAME = "Player PRO"
-APP_VERSION = "1.8.4"
+APP_VERSION = "1.8.5"
 
 
 # ===========================================================================
@@ -42,8 +42,12 @@ def format_hms(seconds: float) -> str:
 # ===========================================================================
 
 def read_text_file(path: str) -> str | None:
-    """尝试多种编码读取文本文件内容。"""
-    encodings = ["utf-8", "utf-8-sig", "gbk", "gb18030"]
+    """尝试多种编码读取文本文件内容。
+
+    utf-8-sig 优先：对带 BOM 的 UTF-8 文件自动剥离开头的 BOM 字符
+    （BOM 混入歌词文本会干扰行首时间标签解析与逐字展开，V1.8.5）。
+    """
+    encodings = ["utf-8-sig", "utf-8", "gbk", "gb18030"]
     for enc in encodings:
         try:
             with open(path, "r", encoding=enc) as f:
