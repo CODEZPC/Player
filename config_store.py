@@ -44,12 +44,21 @@ DEFAULTS: dict = {
 
 
 def _base_dir() -> str:
-    """配置根目录：打包为 _MEIPASS（exe 旁 _internal），开发为脚本目录/_internal。"""
-    try:
-        return sys._MEIPASS  # type: ignore[attr-defined]
-    except AttributeError:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "_internal")
+    """配置根目录（`_internal`）。
+
+    - 开发环境：脚本所在目录/_internal；
+    - Nuitka 打包（dist/main）：exe 旁 _internal（sys.argv[0] 目录；V1.8.6；
+      与 utils.resource_path 保持同一策略）；
+    - PyInstaller（旧）：sys._MEIPASS（--add-data 已把 _internal 内容放入其根）。
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return meipass
+    if "__compiled__" in globals():     # Nuitka：exe 旁 _internal
+        return os.path.join(
+            os.path.dirname(os.path.abspath(sys.argv[0])), "_internal")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "_internal")
 
 
 def data_path() -> str:

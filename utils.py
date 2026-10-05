@@ -11,7 +11,7 @@ from tkinter import font as tkfont
 # ===========================================================================
 
 APP_NAME = "Player PRO"
-APP_VERSION = "1.8.5"
+APP_VERSION = "1.8.6"
 
 
 # ===========================================================================
@@ -139,13 +139,36 @@ def bind_tooltip(widget: tk.Widget, text_var: tk.StringVar,
 
 
 # ===========================================================================
-# 资源路径（PyInstaller 兼容）
+# 资源路径（开发 / Nuitka / PyInstaller 兼容）
 # ===========================================================================
 
+def _nuitka_exe_dir() -> str | None:
+    """Nuitka 编译环境：返回 exe 所在目录；未编译（开发）返回 None。
+
+    注意：Nuitka 下不能用于定位 exe 的特征——
+    `sys.executable` 指向内部的 python.exe、`__file__` 为虚拟路径；
+    只有 `sys.argv[0]`（启动时规范化）指向真实 exe（V1.8.6 实测验证）。
+    """
+    if "__compiled__" not in globals():
+        return None
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
 def resource_path(relative_path: str) -> str:
-    """获取资源的绝对路径，兼容开发环境和 PyInstaller 打包后的环境。"""
-    try:
-        base_path = sys._MEIPASS  # type: ignore[attr-defined]
-    except AttributeError:
-        base_path = os.path.abspath(".\\_internal\\")
+    """获取资源的绝对路径，兼容开发环境与打包环境（Nuitka / PyInstaller）。
+
+    - 开发环境：本文件（脚本）所在目录的 `_internal`（不依赖当前工作目录）；
+    - Nuitka 打包（dist/main：exe 旁 `_internal`）：`sys.argv[0]` 目录的 `_internal`；
+    - PyInstaller（旧）：`sys._MEIPASS`（--add-data 已把 _internal 内容放入其根）。
+    """
+    meipass = getattr(sys, "_MEIPASS", None)   # PyInstaller（保留向后兼容）
+    if meipass:
+        base_path = meipass
+    else:
+        exe_dir = _nuitka_exe_dir()            # Nuitka：exe 旁 _internal
+        if exe_dir is not None:
+            base_path = os.path.join(exe_dir, "_internal")
+        else:                                  # 开发环境：脚本目录/_internal
+            base_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "_internal")
     return os.path.join(base_path, relative_path)
