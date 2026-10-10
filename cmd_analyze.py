@@ -1,28 +1,15 @@
-"直接通过打开方式打开程序的解析"
+"""直接通过打开方式打开程序的解析。
+
+IPC 约定（V1.8.7）：服务端 socket 由 main.py 最早期经 `ipc.create_server()`
+绑定并传入 `run_app(ipc_server=...)`；本模块负责主窗口就绪后的 accept 循环。
+"""
 
 import os
-import sys
 import socket
 import threading
 import tkinter as tk
 from app import LrcPlayerApp
-
-IPC_PORT = 17345
-IPC_HOST = "127.0.0.1"
-
-
-def send_to_existing(action: str, data: str = "") -> bool:
-    """尝试连接已有实例，发送指令（OPEN 或 SHOW）。成功返回 True。"""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.5)  # 本机 loopback：0.5s 足够判定；避免无实例时挂满超时
-        sock.connect((IPC_HOST, IPC_PORT))
-        payload = f"{action}|{data}".encode("utf-8")
-        sock.sendall(payload)
-        sock.close()
-        return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return False
+from ipc import create_server, send_to_existing  # send_to_existing 保留 re-export
 
 
 def _bring_to_front(window: tk.Tk) -> None:
@@ -34,22 +21,23 @@ def _bring_to_front(window: tk.Tk) -> None:
     window.after(200, lambda: window.attributes("-topmost", False))
 
 
-def _start_ipc_listener(app_instance: LrcPlayerApp) -> None:
-    """在后台线程中启动 IPC 服务端。"""
+def _start_ipc_listener(app_instance: LrcPlayerApp,
+                        server: socket.socket | None = None) -> None:
+    """在后台线程中启动 IPC 服务端（accept 循环）。
+
+    server 为启动最早期（main.py）已绑定的 socket（V1.8.7）——主窗口构建
+    期间到达的通知由 listen backlog 缓存，不会丢失；为 None 时兜底重绑一次
+    （端口被非常规占用等异常情形，失败则无 IPC 静默继续）。
+    """
 
     def listener() -> None:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            server.bind((IPC_HOST, IPC_PORT))
-            server.listen(1)
-            server.settimeout(1.0)
-        except OSError:
-            return  # 端口被占用，说明另一个实例正在运行
+        srv = server if server is not None else create_server()
+        if srv is None:
+            return
 
         while True:
             try:
-                conn, _ = server.accept()
+                conn, _ = srv.accept()
                 data = conn.recv(1024).decode("utf-8")
                 conn.close()
                 if not data:
@@ -67,18 +55,20 @@ def _start_ipc_listener(app_instance: LrcPlayerApp) -> None:
                 continue
             except Exception:
                 break
-        server.close()
+        srv.close()
 
     threading.Thread(target=listener, daemon=True).start()
 
 
 def run_app(root: tk.Tk, initial_file: str | None = None,
-            splash: tk.Toplevel | None = None) -> None:
+            splash: tk.Toplevel | None = None,
+            ipc_server: socket.socket | None = None) -> None:
     """应用启动入口。
 
     root 由调用方（main.py）创建并已隐藏（withdraw）；
-    splash 为启动画面（Toplevel，可空）。
-    单实例检查已由 main.py 在启动画面期间并行完成，这里不再重复。
+    splash 为启动画面（Toplevel，可空）；
+    ipc_server 为 main.py 最早期绑定的 IPC 服务端 socket（V1.8.7；可空，
+    空时兜底重绑）。单实例互斥已在窗口创建前完成，这里只负责接管 accept。
     """
     # 1. 构建主应用
     app = LrcPlayerApp(root, initial_file=initial_file)
@@ -88,8 +78,8 @@ def run_app(root: tk.Tk, initial_file: str | None = None,
     root.deiconify()
     root.lift()
 
-    # 3. 启动 IPC 服务，让后续进程能找到本实例
-    _start_ipc_listener(app)
+    # 3. 启动 IPC accept 循环（复用早前绑定的 socket），进入事件循环
+    _start_ipc_listener(app, ipc_server)
 
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

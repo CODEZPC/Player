@@ -8,7 +8,7 @@
     "balance": 0.0,
     "gain": 1.0,
     "play_mode": "loop_one",
-    "always_on_top": false,
+    "always_on_top": true,
     "lyric_bar": "off",
     "lyric_anchor": "c",
     "lyric_x": 0,

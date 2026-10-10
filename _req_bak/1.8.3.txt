@@ -1,0 +1,28 @@
+歌词编辑状态下锁定播放模式为「关闭」（仅一首）
+
+（原始需求）
+在歌词编辑状态下，锁定播放模式为“关闭”（仅一首）
+
+（设计确认，经询问）
+① 退出歌词编辑器后恢复打开前的播放模式（锁定期间为临时切换，不写入配置）。
+② 锁定表现：选项区模式按钮置灰不可点；控制台 `set mode` 拒绝并提示
+   “歌词编辑中：播放模式已锁定为「关闭」（仅一首）”。
+
+（实现说明）
+① app 端：新增字段 `_play_mode_locked` / `_play_mode_saved`；
+   `_set_play_mode(mode, persist=True, force=False) -> bool` —— 锁定期非 force
+   调用直接拒绝（返回 False）；`_lock_play_mode_single()`（记录原模式 → 锁定 →
+   切「关闭」并置灰按钮）/ `_unlock_play_mode()`（解锁 → 恢复原模式并恢复按钮，
+   幂等）—— 两个均以 `persist=False` 切换（不写 data.json）。
+② `_collect_config` 修正：锁定期间 play_mode 返回 `_play_mode_saved`（临时模式
+   不入库；编辑器开启时直接关主窗口也保留用户原设置）。
+③ `_do_reset_all` 开头先 `_unlock_play_mode()`（避免“重置应用”时退出编辑器
+   回写旧模式覆盖重置结果）。
+④ 面板：`OperationPanel.set_mode_buttons_state(state)` 统一设置模式四键
+   `state`（disabled 时 disabledforeground=#666C74 置灰）；编辑器 `show()`
+   调锁定、`hide()` 调解锁。
+⑤ 控制台：`set mode` 检查 `_set_play_mode` 返回值，锁定期间返回拒绝提示。
+⑥ 版本 1.8.3；验证 27 项自动化断言（打开锁定：模式/高亮/置灰/记录原模式；
+   锁定期间：内部调用/按钮点击/控制台三道入口均拒绝、配置收集为原模式；
+   退出恢复：模式/按钮/高亮/控制台；原本即 single；重置边界解锁；锁定/解锁
+   幂等）+ `python main.py` 冒烟。
