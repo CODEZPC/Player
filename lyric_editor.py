@@ -1,27 +1,30 @@
 """歌词编辑器（V1.8.0 新增模块）—— 打轴制作逐字 / 整行 LRC 歌词。
 
 入口：歌词选项区「编辑歌词」按钮（`app._open_lyric_editor`）；
-面板以 `place` 叠加在歌曲选择区（文件夹列表 / 歌曲列表 / 信息条）之上。
+面板以 `place` 覆盖「封面底边 → 窗口底部」的左栏+右栏区域（V1.8.8；
+不覆盖右侧操作区），顶部预览行横跨全宽。
 
-布局（两栏 + 底部按钮）：
-- A 时间戳区（左窄列）：上方大字=当前播放时间（实时刷新），
-  下方小字=选中行时间戳（未打轴显示 --:--.---）
+布局（上部两栏 + 底部按钮网格）：
+- 顶行：当前应显示歌词预览（横跨全宽）
+- A 时间戳区（左窄列）：上方大字=当前播放时间（实时刷新）；下方「选中行
+  时间戳」**输入框**（M:SS.mmm，可直接输入 1:23.456 / 83.456，回车提交）
+  + 「跳转」按钮
 - B 歌词列表（右侧大区）：单击选中；双击内联编辑（Enter 确认 / Esc 取消）；
   每行显示「时间戳  文本」
-- 底部按钮网格：两行五列（操作名+键位）
+- 底部按钮网格：两行七列（操作名+键位，共 14 项）
 
-十项操作：
-  a 添加行（在选中行上方）   b 上一句 ↑/W   c 打轴 F/J（记录当前播放时间
-  并跳下一行，末行停留覆盖）   d 下一句 ↓/S   e 删除行   f 撤销 Z
-  g 导入（txt/lrc；非逐字型时询问是否按字展开转换）   h 完成 ESC（关闭前
-  询问：有歌曲→保存到同名 .lrc 并刷新主界面；无歌曲→询问是否导出）
-  i 导出（另存为 .lrc，未打轴行以 [00:00.000] 占位）
-  j 重做 Y
+十四项操作（a~n）：
+  a 添加行（在选中行上方）  b 导入（txt/lrc；非逐字型询问是否按字展开）
+  c 上一句 ↑/W  d 打轴 F/J（记录当前播放时间并跳下一行，末行停留覆盖）
+  e 下一句 ↓/S  f -0.05s  g +0.05s（微调选中行时间戳）
+  h 删除行  i 导出（另存为 .lrc，未打轴行以 [00:00.000] 占位）
+  j 撤销 Z  k 完成 ESC（关闭前询问：有歌曲→保存到同名 .lrc 并刷新主界面；
+  无歌曲→询问是否导出）  l 重做 Y  m 上移  n 下移（调整选中行顺序，V1.8.8）
 
 约定：撤销/重做为全表快照（上限 50 步）；展开逻辑：中文逐字、英文单词
 整体揭示、未揭示部分不补占位（自然拼接），原行时间戳复制到其所有子行。
 零宽字符（BOM/ZWSP 等，常见于网上下载歌词）在载入/解析/展开/编辑时清除，
-避免展开结果出现“空行”（V1.8.5）。
+避免展开结果出现“空行”（V1.8.5）。时间戳输入框聚焦期间编辑器快捷键屏蔽。
 """
 
 import os
@@ -161,6 +164,31 @@ def parse_lines(text: str) -> list[tuple[float | None, str]]:
     return out
 
 
+def parse_time_input(text: str) -> float | None:
+    """解析时间戳输入 → 秒；无效返回 None（V1.8.8）。
+
+    接受：纯秒（83.456）与 M:SS.mmm / M:SS（1:23.456）；非负校验，
+    带分钟时秒部分须 < 60（避免“1:90”之类歧义输入）。
+    """
+    s = strip_invisible(str(text)).strip()
+    if not s:
+        return None
+    try:
+        if ":" in s:
+            m_part, s_part = s.split(":", 1)
+            if not m_part or not s_part:
+                return None
+            minutes = int(m_part)
+            seconds = float(s_part)
+            if minutes < 0 or seconds < 0 or seconds >= 60:
+                return None
+            return minutes * 60.0 + seconds
+        value = float(s)
+        return value if value >= 0 else None
+    except ValueError:
+        return None
+
+
 # ======================================================================
 # LyricEditor
 # ======================================================================
@@ -193,6 +221,9 @@ class LyricEditor:
         self._after_id = None
         self._bind_ids: list[tuple[str, str]] = []
         self._initial_lines: list[dict] | None = None  # 打开时快照（未更改判定）
+        self._time_edit_active = False     # 时间戳输入框聚焦中（屏蔽快捷键）
+        self._place_bind_id = None         # root <Configure> 绑定 id（V1.8.8）
+        self._panel_geom: tuple | None = None  # 面板几何缓存（同值跳过 place）
         # 时间显示专用等宽字体（数字不跳动，宽度可控不截断）
         self.time_font = self.app._pick_font(
             "Jetbrains Mono", self.app._font_size(16))
@@ -245,11 +276,19 @@ class LyricEditor:
         tk.Label(a_col, text="选中行时间戳", bg=self.BG_COLOR,
                  fg=self.FG_COLOR, font=self.app.info_font,
                  anchor="w").pack(anchor="w")
+        # 时间戳输入框（V1.8.8：可直接输入 M:SS.mmm 或纯秒；回车提交）
         self.sel_time_var = tk.StringVar(value="--:--.---")
-        tk.Label(a_col, textvariable=self.sel_time_var, bg=self.BG_COLOR,
-                 fg=self.FG_COLOR, font=self.app.info_font, anchor="w").pack(
-            anchor="w")
-        # 选中行操作按钮（竖排：跳转 / -0.05s / +0.05s）
+        self.sel_time_entry = tk.Entry(
+            a_col, textvariable=self.sel_time_var, font=self.text_font,
+            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+            insertbackground=self.FG_COLOR, relief="flat",
+            highlightthickness=0)
+        self.sel_time_entry.pack(fill="x", pady=(self._px(2), 0))
+        self.sel_time_entry.bind("<Return>", self._on_time_enter)
+        self.sel_time_entry.bind("<Escape>", self._on_time_escape)
+        self.sel_time_entry.bind("<FocusIn>", self._on_time_focus_in)
+        self.sel_time_entry.bind("<FocusOut>", self._on_time_focus_out)
+        # 选中行操作按钮（竖排：仅「跳转」；微调按钮已移入底部网格 f/g）
         btn_cfg = dict(bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
                        font=self.app.button_font_sm,
                        activebackground=self.ACCENT_COLOR,
@@ -258,18 +297,9 @@ class LyricEditor:
         self.jump_btn = tk.Button(a_col, text="跳转",
                                   command=self.jump_to_line, **btn_cfg)
         self.jump_btn.pack(fill="x", pady=(self._px(8), 1))
-        self.minus_btn = tk.Button(a_col, text="-0.05s",
-                                   command=lambda: self.nudge_time(-0.05),
-                                   **btn_cfg)
-        self.minus_btn.pack(fill="x", pady=1)
-        self.plus_btn = tk.Button(a_col, text="+0.05s",
-                                  command=lambda: self.nudge_time(0.05),
-                                  **btn_cfg)
-        self.plus_btn.pack(fill="x", pady=1)
         # 点击后把焦点还给歌词列表（便于继续键盘操作，避免空格双触发）
-        for b in (self.jump_btn, self.minus_btn, self.plus_btn):
-            b.bind("<ButtonRelease-1>",
-                   lambda e: self.listbox.focus_set(), add="+")
+        self.jump_btn.bind("<ButtonRelease-1>",
+                           lambda e: self.listbox.focus_set(), add="+")
 
         b_col = tk.Frame(top, bg=self.BG_COLOR)
         b_col.pack(side="left", fill="both", expand=True,
@@ -294,24 +324,28 @@ class LyricEditor:
         self.listbox.bind("<Up>", lambda e: (self.prev_line(), "break")[1])
         self.listbox.bind("<Down>", lambda e: (self.next_line(), "break")[1])
 
-        # ---- 下半：按钮网格（两行五列，操作名+键位）----
+        # ---- 下半：按钮网格（两行七列，操作名+键位；V1.8.8 扩为 14 项）----
         btn_grid = tk.Frame(self.frame, bg=self.BG_COLOR)
         btn_grid.pack(fill="x", padx=self._px(8),
                       pady=(0, self._px(8)))
         ops = (
             ("添加行", self.add_line),
+            ("导入", self.import_file),
             ("上一句 ↑W", self.prev_line),
             ("打轴 FJ", self.stamp),
             ("下一句 ↓S", self.next_line),
+            ("-0.05s", lambda: self.nudge_time(-0.05)),
+            ("+0.05s", lambda: self.nudge_time(0.05)),
             ("删除行", self.delete_line),
-            ("撤销 Z", self.undo),
-            ("导入", self.import_file),
-            ("完成 ESC", self.finish),
             ("导出", self.export_file),
+            ("撤销 Z", self.undo),
+            ("完成 ESC", self.finish),
             ("重做 Y", self.redo),
+            ("上移", self.move_up),
+            ("下移", self.move_down),
         )
         for i, (text, cmd) in enumerate(ops):
-            row, col = divmod(i, 5)
+            row, col = divmod(i, 7)
             b = tk.Button(
                 btn_grid, text=text, command=cmd,
                 bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
@@ -323,22 +357,24 @@ class LyricEditor:
             # 点击后把焦点还给歌词列表（便于连续打轴/导航）
             b.bind("<ButtonRelease-1>",
                    lambda e: self.listbox.focus_set(), add="+")
-        for col in range(5):
+        for col in range(7):
             btn_grid.columnconfigure(col, weight=1)
 
     # ------------------------------------------------------------------
     # 显隐
     # ------------------------------------------------------------------
     def show(self) -> None:
-        """打开编辑器：锁定播放模式并载入当前歌曲歌词叠加显示。"""
+        """打开编辑器：锁定播放模式并载入当前歌曲歌词，覆盖下部区域显示。"""
         if self.visible:
             return
         self.visible = True
         self.app._lock_play_mode_single()   # 编辑期间锁定播放模式为「关闭」
         self._load_current()
-        self.frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._panel_geom = None
+        self._place_panel()   # 封面底边 → 窗口底部（不覆盖操作区，V1.8.8）
         self.frame.lift()
         self._bind_keys()
+        self._bind_place()
         self.listbox.focus_set()
         self._tick()
 
@@ -350,6 +386,7 @@ class LyricEditor:
         self.app._unlock_play_mode()   # 恢复锁定前的播放模式
         self._cancel_edit()
         self.frame.place_forget()
+        self._unbind_place()
         self._unbind_keys()
         if self._after_id is not None:
             try:
@@ -357,6 +394,65 @@ class LyricEditor:
             except Exception:
                 pass
             self._after_id = None
+
+    # ------------------------------------------------------------------
+    # 面板几何（V1.8.8：覆盖“封面底边 → 窗口底部”的左栏+右栏区域）
+    # ------------------------------------------------------------------
+    def _place_panel(self) -> None:
+        """放置面板：顶边=封面底边；右边界=操作区左缘-列间距（不覆盖操作区）。"""
+        app = self.app
+        try:
+            outer = app._outer
+            cover = app.cover_frame
+            op_col = app.op_col
+            y0 = cover.winfo_rooty() - outer.winfo_rooty() + cover.winfo_height()
+            w = op_col.winfo_x() - self._px(12)
+            h = outer.winfo_height() - y0
+        except (AttributeError, tk.TclError):
+            return
+        if w <= 0 or h <= 0:
+            return
+        geom = (0, y0, w, h)
+        if geom == self._panel_geom:
+            return
+        self._panel_geom = geom
+        try:
+            self.frame.place(x=0, y=y0, width=w, height=h)
+        except tk.TclError:
+            pass
+
+    def _bind_place(self) -> None:
+        """窗口尺寸变化时重算面板几何（root <Configure>）。"""
+        try:
+            self._place_bind_id = self.app.root.bind(
+                "<Configure>", self._on_root_configure, add="+")
+        except tk.TclError:
+            self._place_bind_id = None
+
+    def _unbind_place(self) -> None:
+        if self._place_bind_id is not None:
+            try:
+                self.app.root.unbind("<Configure>", self._place_bind_id)
+            except tk.TclError:
+                pass
+            self._place_bind_id = None
+
+    def _on_root_configure(self, event=None) -> None:
+        """root 尺寸变化 → 重算面板几何。
+
+        注意：Configure 事件到达时布局（outer/op_col 的 winfo 值）尚未重排，
+        须先 `update_idletasks()` 完成布局再计算（否则读到旧值被同值跳过，
+        V1.8.8 实测）。子控件事件冒泡（event.widget ≠ root）忽略。
+        """
+        if event is not None and getattr(event, "widget", None) is not self.app.root:
+            return
+        if not self.visible:
+            return
+        try:
+            self.app.root.update_idletasks()
+        except tk.TclError:
+            return
+        self._place_panel()
 
     # ------------------------------------------------------------------
     # 载入 / 刷新
@@ -449,11 +545,66 @@ class LyricEditor:
             self._update_sel_time()
 
     def _update_sel_time(self) -> None:
-        """刷新 A 区下方「选中行时间戳」。"""
+        """刷新 A 区下方「选中行时间戳」（回写输入框显示）。"""
         if 0 <= self.sel < len(self.lines):
             self.sel_time_var.set(fmt_time(self.lines[self.sel]["time"]))
         else:
             self.sel_time_var.set("--:--.---")
+
+    # ---- 时间戳输入框（V1.8.8）----
+    def _on_time_focus_in(self, _event=None) -> None:
+        """输入框获得焦点：标记输入态（屏蔽编辑器快捷键）并全选。"""
+        self._time_edit_active = True
+        try:
+            self.sel_time_entry.select_range(0, "end")
+        except tk.TclError:
+            pass
+
+    def _on_time_focus_out(self, _event=None) -> None:
+        """失焦：退出输入态并恢复显示（未回车确认的输入不生效）。"""
+        self._time_edit_active = False
+        self._update_sel_time()
+
+    def _on_time_enter(self, _event=None) -> str:
+        """回车：提交输入的时间戳。"""
+        self._time_edit_active = False
+        self._commit_time_input()
+        return "break"
+
+    def _on_time_escape(self, _event=None) -> str:
+        """Esc：放弃输入（恢复原显示）。"""
+        self._time_edit_active = False
+        self._commit_time_input(cancel=True)
+        return "break"
+
+    def _commit_time_input(self, cancel: bool = False) -> None:
+        """提交/取消时间戳输入。
+
+    - 有效输入 → 设置选中行时间戳（记撤销；同值跳过）；
+    - 无效输入 → 恢复显示 + 主状态栏提示；
+    - cancel=True（Esc）→ 直接恢复显示。
+        """
+        if cancel:
+            self._update_sel_time()
+            self.listbox.focus_set()
+            return
+        value = parse_time_input(self.sel_time_var.get())
+        if value is None:
+            self._update_sel_time()
+            try:
+                self.app._hint_status(
+                    "时间格式无效：支持 1:23.456 或 83.456（秒）")
+            except Exception:
+                pass
+            self.listbox.focus_set()
+            return
+        if 0 <= self.sel < len(self.lines) \
+                and value != self.lines[self.sel]["time"]:
+            self._push_undo()
+            self.lines[self.sel]["time"] = value
+            self._update_row(self.sel)
+        self._update_sel_time()
+        self.listbox.focus_set()
 
     def _preview_text_at(self, t: float) -> str:
         """当前时间 t 在编辑数据中应显示的歌词文本。
@@ -549,6 +700,26 @@ class LyricEditor:
         self.lines[self.sel]["time"] = max(0, ms) / 1000.0
         self._update_row(self.sel)
         self._update_sel_time()
+
+    def move_up(self) -> None:
+        """上移选中行（与上一行交换；记入撤销，选中跟随）。"""
+        if not self.lines or self.sel <= 0 or self.sel >= len(self.lines):
+            return
+        self._push_undo()
+        i = self.sel
+        self.lines[i - 1], self.lines[i] = self.lines[i], self.lines[i - 1]
+        self._refresh_list()
+        self._select(i - 1)
+
+    def move_down(self) -> None:
+        """下移选中行（与下一行交换；记入撤销，选中跟随）。"""
+        if not self.lines or self.sel < 0 or self.sel >= len(self.lines) - 1:
+            return
+        self._push_undo()
+        i = self.sel
+        self.lines[i + 1], self.lines[i] = self.lines[i], self.lines[i + 1]
+        self._refresh_list()
+        self._select(i + 1)
 
     def delete_line(self) -> None:
         """删除选中行。"""
@@ -826,31 +997,31 @@ class LyricEditor:
         self._bind_ids.clear()
 
     def _key_prev(self, _event=None) -> str:
-        if not self._editing:
+        if not self._editing and not self._time_edit_active:
             self.prev_line()
         return "break"
 
     def _key_next(self, _event=None) -> str:
-        if not self._editing:
+        if not self._editing and not self._time_edit_active:
             self.next_line()
         return "break"
 
     def _key_stamp(self, _event=None) -> str:
-        if not self._editing:
+        if not self._editing and not self._time_edit_active:
             self.stamp()
         return "break"
 
     def _key_undo(self, _event=None) -> str:
-        if not self._editing:
+        if not self._editing and not self._time_edit_active:
             self.undo()
         return "break"
 
     def _key_redo(self, _event=None) -> str:
-        if not self._editing:
+        if not self._editing and not self._time_edit_active:
             self.redo()
         return "break"
 
     def _key_finish(self, _event=None) -> str:
-        if not self._editing:
+        if not self._editing and not self._time_edit_active:
             self.finish()
         return "break"

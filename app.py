@@ -280,6 +280,7 @@ class LrcPlayerApp:
         outer = tk.Frame(self.root, bg=BG_COLOR)
         outer.pack(fill="both", expand=True,
                    padx=self._px(18), pady=self._px(8))
+        self._outer = outer   # 歌词编辑器面板的挂靠容器（V1.8.8）
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=0)
         outer.rowconfigure(0, weight=1)
@@ -314,6 +315,7 @@ class LrcPlayerApp:
         op_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(340, 260))
         op_col.grid(row=0, column=2, sticky="nsew", padx=(self._px(12), 0))
         op_col.pack_propagate(False)  # 子控件为 pack，须用 pack_propagate 保持定宽
+        self.op_col = op_col   # 编辑器面板右边界参照（不覆盖操作区，V1.8.8）
         # 操作区面板（自包含滚动容器 + 倍速/音高/音量/高级/选项，见 operation_panel.py）
         self.op = OperationPanel(self, op_col)
 
@@ -979,6 +981,7 @@ class LrcPlayerApp:
                                height=self._px(220), width=self._px(220))
         cover_frame.pack(side="bottom", fill="x", pady=(0, 8))
         cover_frame.pack_propagate(False)
+        self.cover_frame = cover_frame   # 编辑器面板顶边界参照（其底边，V1.8.8）
         self.cover_label = tk.Label(
             cover_frame, bg=BG_COLOR, fg=FG_COLOR,
             text="专辑封面", font=self.list_font,
@@ -1003,7 +1006,7 @@ class LrcPlayerApp:
         self._ensure_bottom_shown()   # 确保歌曲选择区已显示（编辑器叠加其内）
         editor = getattr(self, "lyric_editor", None)
         if editor is None:
-            editor = LyricEditor(self, self.bottom_frame)
+            editor = LyricEditor(self, self._outer)
             self.lyric_editor = editor
         editor.show()
 
@@ -1097,18 +1100,11 @@ class LrcPlayerApp:
         self._refresh_status_bar()
 
     def _update_interlude_label(self) -> None:
-        """更新插播列表标题：有歌曲时追加播完所需总时长。"""
+        """插播列表标题固定为「插播列表」（总时长已移至状态栏，V1.8.8）。"""
         label = getattr(self, "_il_label", None)
         if label is None:
             return
-        if not self.interlude_items:
-            label.config(text="插播列表")
-            return
-        total = sum(
-            d for d in (item.get("duration") for item in self.interlude_items)
-            if isinstance(d, (int, float))
-        )
-        label.config(text=f"插播列表 ({format_hms(total)})")
+        label.config(text="插播列表")
 
     def _on_interlude_select(self) -> None:
         """插播列表选择变化：移动模式下锁定选中项，否则刷新按钮。"""
@@ -1385,9 +1381,16 @@ class LrcPlayerApp:
         else:
             self._liststat_var.set("共 0 首")
 
-        # 插播统计
+        # 插播统计（含全部插播总时长，V1.8.8 由列表标题移入状态栏）
         n = len(self.interlude_items)
-        self._ilst_var.set(f"插播: {n}首" if n else "插播: 0")
+        if n:
+            total = sum(
+                d for d in (it.get("duration") for it in self.interlude_items)
+                if isinstance(d, (int, float))
+            )
+            self._ilst_var.set(f"插播: {n}首 ({format_hms(total)})")
+        else:
+            self._ilst_var.set("插播: 0")
 
     def _set_scan_progress(self, done: int, total: int) -> None:
         """更新扫描进度（主线程安全）。"""
