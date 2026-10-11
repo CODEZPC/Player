@@ -165,6 +165,8 @@ class LrcPlayerApp:
         self._play_mode_locked = False        # 歌词编辑器打开期间锁定播放模式
         self._play_mode_saved = self.play_mode  # 锁定前的模式（退出恢复用）
         self._status_hint_timer = None        # 状态栏临时提示定时器（V1.8.5）
+        # 封面尺寸：与左栏上部底边对齐（V1.8.9，首次布局后由 _align_cover 校准）
+        self._cover_size = self._px(205)
 
         # ---- 字体（小屏按 ui_scale 缩放）----
         self.title_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
@@ -197,6 +199,8 @@ class LrcPlayerApp:
 
         # 启动恢复：读取 data.json 应用操作栏/模式/置顶，并计划后台恢复文件夹
         self._load_persisted_state()
+
+        self.root.after(120, self._align_cover)   # 首次布局后校准封面（V1.8.9）
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
         self._setup_keyboard_shortcuts()
@@ -306,7 +310,7 @@ class LrcPlayerApp:
         self._build_bottom_panels(self.bottom_frame)
 
         # ---- 右栏（固定宽度；子控件为 pack，须用 pack_propagate 保持定宽）----
-        right_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(260))
+        right_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(220))
         right_col.grid(row=0, column=1, sticky="nsew", padx=(self._px(12), 0))
         right_col.pack_propagate(False)
         self._build_right_column(right_col)
@@ -521,6 +525,7 @@ class LrcPlayerApp:
         """进度条 + 右侧时间标签。"""
         progress_row = tk.Frame(parent, bg=BG_COLOR)
         progress_row.pack(fill="x", pady=(8, 4))
+        self._progress_row = progress_row   # 左栏上部底边参照（V1.8.9）
 
         self.seek_var = tk.DoubleVar(value=0.0)
         self.seek_scale = ttk.Scale(
@@ -833,6 +838,7 @@ class LrcPlayerApp:
     def _ensure_bottom_shown(self) -> None:
         """显示底部面板；首次加载时展开窗口并锁定最小宽度（小屏按比例缩放）。"""
         self.bottom_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self._align_cover()   # 封面与左栏上部底边对齐（幂等，V1.8.9）
         if not self._first_scan_done:
             self._first_scan_done = True
             self.root.geometry(f"{self._px(1280)}x{self._px(660)}")
@@ -976,9 +982,9 @@ class LrcPlayerApp:
         self.interlude_list.bind("<<ListboxSelect>>",
                                 lambda e: self._on_interlude_select())
 
-        # ---- 专辑封面（固定 220×220，与图片尺寸一致，避免灰边；小屏缩放）----
+        # ---- 专辑封面（高度动态：与左栏上部底边对齐，V1.8.9；小屏缩放）----
         cover_frame = tk.Frame(parent, bg=BG_COLOR,
-                               height=self._px(220), width=self._px(220))
+                               height=self._cover_size, width=self._px(220))
         cover_frame.pack(side="bottom", fill="x", pady=(0, 8))
         cover_frame.pack_propagate(False)
         self.cover_frame = cover_frame   # 编辑器面板顶边界参照（其底边，V1.8.8）
@@ -1021,13 +1027,47 @@ class LrcPlayerApp:
             self._refresh_overlay_header()
             return
         data = extract_cover_art(path)
-        photo = cover_to_tk_image(data, self._px(220)) if data else None
+        photo = cover_to_tk_image(data, self._cover_size) if data else None
         if photo:
             self._cover_photo = photo
             self.cover_label.config(image=photo, text="")
         else:
             self._show_default_cover()
         self._refresh_overlay_header()
+
+    def _align_cover(self) -> None:
+        """把封面高度对齐到左栏上部底边（V1.8.9）。
+
+        对齐线优先取歌曲选择区（bottom_frame）实际顶边（已显示时最准）；
+        未显示时按「进度条底边 + 间距（4 + 6，与两处 pack pady 一致）」估算。
+        封面尺寸变化时按新尺寸重渲染当前封面（幂等）。
+        """
+        try:
+            self.root.update_idletasks()   # 先完成布局再测量（V1.8.8 经验）
+        except tk.TclError:
+            return
+        try:
+            if (self.bottom_frame.winfo_manager()
+                    and self.bottom_frame.winfo_height() > 0):
+                y = self.bottom_frame.winfo_y()
+            else:
+                pr = self._progress_row
+                y = (pr.winfo_y() + pr.winfo_height()
+                     + self._px(4) + self._px(6))
+        except (AttributeError, tk.TclError):
+            return
+        if y <= 0 or y == self._cover_size:
+            return
+        self._cover_size = y
+        try:
+            self.cover_frame.config(height=y)
+        except (AttributeError, tk.TclError):
+            return
+        if self.audio_path:
+            editor = getattr(self, "lyric_editor", None)
+            if editor is not None and editor.visible:
+                editor._place_panel()   # 封面底边变化 → 编辑器面板跟随
+            self._update_cover(self.audio_path)
 
     def _show_default_cover(self) -> None:
         """显示默认封面占位。"""
