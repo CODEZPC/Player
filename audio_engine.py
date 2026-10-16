@@ -8,26 +8,57 @@ import os
 import re
 import threading
 
-import numpy as np
+# PEP 810 延迟导入（Python 3.15+，V1.9.0）：语句本身零开销、不加载模块，
+# 首次访问时才真正导入——主窗口构建不再等待 numpy / sounddevice 等重量级导入。
+# 限制：lazy 只能出现在模块顶层（不能放 try/except 或函数内），
+# 因此可用性探测改为「首次调用的探测函数 + 结果缓存」（见下方 _sd_available 等）。
+lazy import numpy as np
+lazy import sounddevice as sd
+lazy import soundfile as sf
+lazy import pygame
+lazy from mutagen import File as MutagenFile
 
-try:
-    import sounddevice as sd
-    import soundfile as sf
-    SD_AVAILABLE = True
-except Exception:
-    SD_AVAILABLE = False
+# ---- 后端可用性探测（结果缓存：None = 尚未探测）----
+_sd_state: bool | None = None
+_pygame_state: bool | None = None
+_mutagen_state: bool | None = None
 
-try:
-    import pygame
-    PYGAME_AVAILABLE = True
-except Exception:
-    PYGAME_AVAILABLE = False
 
-try:
-    from mutagen import File as MutagenFile
-    MUTAGEN_AVAILABLE = True
-except Exception:
-    MUTAGEN_AVAILABLE = False
+def _sd_available() -> bool:
+    """sounddevice 是否可用（首次调用触发真实导入并查询输出设备）。"""
+    global _sd_state
+    if _sd_state is None:
+        try:
+            sd.query_devices(kind="output")
+            _sd_state = True
+        except Exception:
+            _sd_state = False
+    return _sd_state
+
+
+def _pygame_available() -> bool:
+    """pygame 兜底后端是否可用（首次调用触发真实导入并初始化 mixer）。"""
+    global _pygame_state
+    if _pygame_state is None:
+        try:
+            pygame.mixer.init()
+            _pygame_state = True
+        except Exception:
+            _pygame_state = False
+    return _pygame_state
+
+
+def _mutagen_available() -> bool:
+    """mutagen 是否可用（首次调用触发真实导入）。"""
+    global _mutagen_state
+    if _mutagen_state is None:
+        try:
+            _ = MutagenFile
+            _mutagen_state = True
+        except Exception:
+            _mutagen_state = False
+    return _mutagen_state
+
 
 # 音轨号标签的常见键名
 _TRACK_TAG_KEYS = ("tracknumber", "track", "trck")
@@ -145,7 +176,7 @@ def _format_size(size_bytes: int) -> str:
 
 def _get_track_number(path: str) -> str:
     """从音频文件的元数据中读取音轨号。"""
-    if not MUTAGEN_AVAILABLE:
+    if not _mutagen_available():
         return "不可用"
     try:
         audio = MutagenFile(path, easy=True)
@@ -180,7 +211,10 @@ class AudioEngine:
     def __init__(self) -> None:
         self._ready = False
         self._current_path: str | None = None
-        self.backend = "none"
+        # 后端：pending = 尚未探测（V1.9.0 起构造时不再探测，
+        # 避免启动路径加载 numpy / sounddevice 等重量级模块）
+        self.backend = "pending"
+        self._probed = False
 
         # sounddevice 后端状态
         self._sf = None          # soundfile.SoundFile
@@ -199,32 +233,31 @@ class AudioEngine:
         self._pitch_fix = False
         self._pitch_shift = 0.0  # 音高移调（半音，-12 ~ +12，0=原始；变调不变速）
         self._pv: PhaseVocoder | None = None
-        self._pv_spill: np.ndarray = np.empty((0, 2), dtype=np.float32)
+        self._pv_spill = None     # numpy 数组，首次 load/seek 时创建（延迟 numpy 导入）
 
-        self._init()
+        # 不在此探测后端：等后台预热完成后由 app 回调 probe()（或首次播放时同步探测）
 
     # ------------------------------------------------------------------
     # 初始化
     # ------------------------------------------------------------------
 
-    def _init(self) -> None:
-        """优先初始化 sounddevice，失败则回退 pygame。"""
-        if SD_AVAILABLE:
-            try:
-                sd.query_devices(kind="output")
-                self.backend = "sounddevice"
-                self._ready = True
-                return
-            except Exception:
-                pass
-        if PYGAME_AVAILABLE:
-            try:
-                pygame.mixer.init()
-                self.backend = "pygame"
-                self._ready = True
-                return
-            except Exception:
-                pass
+    def probe(self) -> None:
+        """探测并选择音频后端（幂等；sounddevice 优先，失败回退 pygame）。
+
+        V1.9.0：构造不再探测——主窗口显示后由后台预热回调触发；若用户抢先
+        播放，load() 也会同步探测一次（此时重量级模块多半已就绪）。
+        """
+        if self._probed:
+            return
+        self._probed = True
+        if _sd_available():
+            self.backend = "sounddevice"
+            self._ready = True
+            return
+        if _pygame_available():
+            self.backend = "pygame"
+            self._ready = True
+            return
         self.backend = "none"
         self._ready = False
 
@@ -258,6 +291,8 @@ class AudioEngine:
         Returns:
             bool: 加载成功返回 True，否则返回 False。
         """
+        if self.backend == "pending":
+            self.probe()   # 预热未完成时用户已开始播放：同步探测一次
         if not self._ready:
             return False
         self.stop()
@@ -566,7 +601,7 @@ class AudioEngine:
         chunk = self._read_resampled(self._pos_frames, need, ratio)
         self._pos_frames += need * ratio
         stretched = self._pv.process(chunk)
-        if self._pv_spill.size:
+        if self._pv_spill is not None and self._pv_spill.size:
             self._pv_spill = np.concatenate([self._pv_spill, stretched],
                                             axis=0)
         else:

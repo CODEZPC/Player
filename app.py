@@ -186,9 +186,14 @@ class LrcPlayerApp:
         self._configure_style()
         self._build_ui()
 
-        if not self.engine.ready:
+        # 探测在后台预热完成后进行（V1.9.0，见 _on_heavy_modules_ready）：
+        # 正常启动为 pending（未探测）；仅「已探测且失败」时在此警告
+        self._backend_warned = False
+        if self.engine.backend == "none":
             self._disable_audio_controls()
-            messagebox.showwarning("音频后端", "音频后端不可用（需 sounddevice 或 pygame）。")
+            messagebox.showwarning(
+                "音频后端", "音频后端不可用（需 sounddevice 或 pygame）。")
+            self._backend_warned = True
 
         # 非 sounddevice 后端不支持倍速/保音高/平衡/增益，禁用对应控件
         if self.engine.backend != "sounddevice":
@@ -1322,6 +1327,21 @@ class LrcPlayerApp:
     # 音频控件状态
     # ==================================================================
 
+    def _on_heavy_modules_ready(self) -> None:
+        """重量级模块后台预热完成回调（主线程）：探测音频后端并刷新 UI。"""
+        self.engine.probe()
+        if not self.engine.ready:
+            self._disable_audio_controls()
+            if not self._backend_warned:
+                self._backend_warned = True
+                messagebox.showwarning(
+                    "音频后端", "音频后端不可用（需 sounddevice 或 pygame）。")
+        elif self.engine.backend != "sounddevice":
+            self._disable_op_controls()
+        self._audio_var.set(self._read_audio_info())
+        self.op.update_vol_preview()
+        self._update_controls_state()
+
     def _disable_audio_controls(self) -> None:
         """音频后端不可用时禁用相关按钮。"""
         for btn in (self.play_pause_btn, self.stop_btn):
@@ -1381,6 +1401,8 @@ class LrcPlayerApp:
 
     def _read_audio_info(self) -> str:
         """读取当前音频输出设备名称/参数信息。"""
+        if self.engine.backend == "pending":
+            return "音频: 检测中…"     # 延迟探测（V1.9.0）：预热完成后刷新
         if not self.engine.ready:
             return "音频: 未就绪"
         if self.engine.backend == "sounddevice":

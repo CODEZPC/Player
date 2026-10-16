@@ -2,11 +2,23 @@
 
 import os
 
-try:
-    from PIL import Image, ImageTk
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
+# PEP 810 延迟导入（Python 3.15+，V1.9.0）：PIL 首次转图时才真正加载。
+# lazy 不能放 try/except 内，可用性改为「首次探测 + 缓存」。
+lazy from PIL import Image, ImageTk
+
+_PIL_STATE: bool | None = None
+
+
+def _pil_available() -> bool:
+    """PIL 是否可用（首次调用触发真实导入）。"""
+    global _PIL_STATE
+    if _PIL_STATE is None:
+        try:
+            _ = (Image, ImageTk)
+            _PIL_STATE = True
+        except Exception:
+            _PIL_STATE = False
+    return _PIL_STATE
 
 
 def extract_cover_art(path: str) -> bytes | None:
@@ -31,7 +43,7 @@ def extract_cover_art(path: str) -> bytes | None:
 
 def cover_to_tk_image(data: bytes, size: int = 220) -> "ImageTk.PhotoImage | None":
     """将封面字节数据转换为 tkinter PhotoImage。"""
-    if not PIL_AVAILABLE or not data:
+    if not _pil_available() or not data:
         return None
     try:
         from io import BytesIO

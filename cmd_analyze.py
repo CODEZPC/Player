@@ -2,6 +2,10 @@
 
 IPC 约定（V1.8.7）：服务端 socket 由 main.py 最早期经 `ipc.create_server()`
 绑定并传入 `run_app(ipc_server=...)`；本模块负责主窗口就绪后的 accept 循环。
+
+启动预热（V1.9.0）：主窗口显示后由 `_preheat_heavy_modules` 后台真实导入
+重量级模块（numpy / sounddevice / soundfile / pygame / mutagen / PIL），
+完成后回主线程探测音频后端——配合各模块的 PEP 810 lazy import 缩短启动等待。
 """
 
 import os
@@ -60,6 +64,31 @@ def _start_ipc_listener(app_instance: LrcPlayerApp,
     threading.Thread(target=listener, daemon=True).start()
 
 
+# 主窗口显示后延迟多久开始后台预热（先用少量时间让首帧渲染完成）
+PREHEAT_DELAY_MS = 350
+
+
+def _preheat_heavy_modules(app: LrcPlayerApp) -> None:
+    """后台线程：真实导入重量级第三方模块（audio_engine 内均为 lazy 导入）。
+
+    完成后回主线程调用 `app._on_heavy_modules_ready()`
+    （探测音频后端、刷新状态栏设备名与控件可用状态）。
+    """
+    try:
+        import numpy          # noqa: F401  （触发 audio_engine 的 lazy 引用加载）
+        import sounddevice    # noqa: F401
+        import soundfile      # noqa: F401
+        import pygame         # noqa: F401
+        import mutagen        # noqa: F401
+        from PIL import Image, ImageTk  # noqa: F401
+    except Exception:
+        pass
+    try:
+        app.root.after(0, app._on_heavy_modules_ready)
+    except Exception:
+        pass
+
+
 def run_app(root: tk.Tk, initial_file: str | None = None,
             splash: tk.Toplevel | None = None,
             ipc_server: socket.socket | None = None) -> None:
@@ -80,6 +109,12 @@ def run_app(root: tk.Tk, initial_file: str | None = None,
 
     # 3. 启动 IPC accept 循环（复用早前绑定的 socket），进入事件循环
     _start_ipc_listener(app, ipc_server)
+
+    # 4. 主窗口显示后再调度重量级模块预热（V1.9.0：audio_engine 等为 lazy import，
+    #    窗口构建无需等待；此处后台真实导入，完成后探测音频后端）
+    root.after(PREHEAT_DELAY_MS,
+               lambda: threading.Thread(target=_preheat_heavy_modules,
+                                        args=(app,), daemon=True).start())
 
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

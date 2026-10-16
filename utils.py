@@ -4,6 +4,10 @@ import os
 import sys
 import tkinter as tk
 from tkinter import font as tkfont
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:   # 仅类型检查：app 依赖 utils，运行时导入会循环
+    from app import LrcPlayerApp
 
 
 # ===========================================================================
@@ -11,7 +15,7 @@ from tkinter import font as tkfont
 # ===========================================================================
 
 APP_NAME = "Player PRO"
-APP_VERSION = "1.8.9"
+APP_VERSION = "1.9.1"
 
 
 # ===========================================================================
@@ -114,7 +118,8 @@ def bind_tooltip(widget: tk.Widget, text_var: tk.StringVar,
     """给状态栏标签绑定悬停提示。
 
     Args:
-        app: LrcPlayerApp 实例，需具有 _tooltip 属性。
+        app: LrcPlayerApp 实例，需具有 _tooltip 属性（类型仅作注解，
+            见文件顶部 `TYPE_CHECKING` 导入）。
     """
     def _enter(event: tk.Event) -> None:
         if app._tooltip:

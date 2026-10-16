@@ -1,14 +1,17 @@
 """音乐播放器入口。
 
-启动流程（V1.8.7 起）：
+启动流程（V1.8.7 起；V1.9.0 lazy import 优化）：
 0. 最早期【单实例互斥】：直接尝试绑定 IPC 端口（轻量 ipc 模块，毫秒级，无重量级依赖）
    ——绑定成功即成为服务端，后续重复点击都会被识别并静默退出（消除多重启动窗口期）；
    绑定失败 = 已有实例 → 发送 SHOW/OPEN 通知后本进程直接退出（不创建任何窗口）。
-1. 建隐藏根窗口 + 启动画面（无边框、居中、主题匹配，含图标/应用名/版本号/加载动画）。
-2. 后台线程【预热导入重量级模块】，主线程泵事件驱动启动画面加载动画滚动，
-   覆盖整个等待期（无"卡住"停顿）。
+1. 建隐藏根窗口 + 启动画面（无边框、居中、主题匹配；PIL 图标延迟到画面显示后加载）。
+2. 后台线程导入 UI 模块（cmd_analyze 等），主线程泵事件驱动启动画面动画——
+   重量级模块（numpy / sounddevice / soundfile / pygame / mutagen / PIL）在
+   audio_engine / cover_utils 中均为 PEP 810 lazy import（Python 3.15+），
+   本阶段不再加载，主窗口构建无需等待。
 3. 构建主窗口（极快），关闭启动画面；由 run_app 启动 IPC accept 循环
-   （复用早前绑定的 socket，窗口构建期间到达的通知由 listen backlog 缓存不丢失）。
+   （复用早前绑定的 socket，窗口构建期间到达的通知由 listen backlog 缓存不丢失），
+   并在主窗口显示后调度重量级模块的后台预热（cmd_analyze._preheat_heavy_modules）。
 """
 
 import sys
@@ -22,7 +25,12 @@ from splash import SplashWindow
 
 
 def _preload_imports(done: threading.Event) -> None:
-    """后台线程：预热导入重量级模块（连带 app / audio_engine / numpy / pygame…）。"""
+    """后台线程：导入构建主窗口所需的 UI 模块（不含重量级第三方库，V1.9.0）。
+
+    cmd_analyze 连带 app / audio_engine / cover_utils 等；这些模块内对
+    numpy / sounddevice / pygame / PIL 的导入均为 PEP 810 lazy（首次访问才加载），
+    因此本阶段毫秒级完成；重量级模块改为主窗口显示后由 cmd_analyze 后台预热。
+    """
     try:
         import cmd_analyze  # noqa: F401  连带导入 app / audio_engine 等
         import console      # noqa: F401

@@ -6,18 +6,13 @@
 - 主题与主程序匹配（深色背景 + 强调色）
 - 内容：应用图标 + 应用名 + 版本号 + 加载动画（不定进度条）
 
-注意：本模块刻意保持轻量（只依赖 tkinter / PIL / utils），
+注意：本模块刻意保持轻量（只依赖 tkinter / utils；PIL 在启动画面构建时经
+函数内导入按需加载，`import splash` 本身不加载 PIL，V1.9.1），
 **不要** import app / audio_engine 等重量级模块，否则启动画面会延迟出现。
 """
 
 import tkinter as tk
 from tkinter import ttk, font as tkfont
-
-try:
-    from PIL import Image, ImageTk
-    _HAS_PIL = True
-except ImportError:  # PIL 缺失时退回文字图标
-    _HAS_PIL = False
 
 from utils import APP_NAME, resource_path
 
@@ -56,11 +51,13 @@ class SplashWindow(tk.Toplevel):
 
     def _build(self, app_name: str, version: str) -> None:
         """构建启动画面内容：图标 / 应用名 / 版本号 / 进度条 / 状态文字。"""
-        # 图标
+        # 图标：构建时同步加载并显示（V1.9.1；PIL 仍经函数内导入，
+        # `import splash` 本身不加载 PIL）；失败退文字 ♪。
+        self._icon_photo = None
         photo = self._load_icon()
         if photo is not None:
+            self._icon_photo = photo        # 防止被 GC
             tk.Label(self, image=photo, bg=SPLASH_BG).pack(pady=(36, 10))
-            self._icon_photo = photo  # 防止被 GC
         else:
             tk.Label(self, text="♪",
                      font=tkfont.Font(family="Jetbrains mono", size=42),
@@ -95,11 +92,14 @@ class SplashWindow(tk.Toplevel):
         self._bar.pack(pady=(0, 14))
         self._bar.start(25)
 
-    def _load_icon(self) -> ImageTk.PhotoImage | None:
-        """加载 MP.ico 并缩放到 72x72；失败返回 None。"""
-        if not _HAS_PIL:
-            return None
+    def _load_icon(self) -> "ImageTk.PhotoImage | None":
+        """构建时同步加载 MP.ico 并缩放到 72x72；失败返回 None（退文字 ♪）。
+
+        PIL 经函数内导入：`import splash` 不加载 PIL，但图标在启动画面构建时
+        同步完成、正常显示（V1.9.1 由「♬ 占位 + 异步替换」方案改回）。
+        """
         try:
+            from PIL import Image, ImageTk
             img = Image.open(resource_path("MP.ico"))
             img = img.resize((72, 72), Image.LANCZOS)
             return ImageTk.PhotoImage(img)

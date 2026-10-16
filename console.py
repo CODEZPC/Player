@@ -236,6 +236,8 @@ class PlayerConsole:
         if os.path.isdir(path):
             return self.app._add_folder(path)
         if os.path.isfile(path):
+            if self.app.engine.backend == "pending":
+                self.app.engine.probe()   # 预热未完成：先同步探测（幂等）
             if not self.app.engine.ready:
                 return "音频后端不可用"
             if self.app._track_switch_guard("打开文件"):
