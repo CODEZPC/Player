@@ -39,6 +39,7 @@ ACCENT_COLOR = "#6FA3FF"
 SUBTLE_COLOR = "#3A3F46"
 BUTTON_WIDTH = 10
 TICK_INTERVAL_MS = 10
+INIT_STATUS_TEXT = "正在初始化…"     # 预热完成前的状态栏提示（V1.9.2）
 
 PLAY_MODES = [
     ("列表循环", "loop_all"),
@@ -96,6 +97,8 @@ class LrcPlayerApp:
         self.audio_path: str | None = None
         self.lrc_path: str | None = None
         self.duration: float | None = None
+        # 引擎未就绪时挂起的待播文件（预热完成后重试，V1.9.2）
+        self._pending_play_file: str | None = None
 
         # ---- 歌曲列表 ----
         # 多文件夹模型：folder_tabs 保存各已加载文件夹的扫描结果（缓存）；
@@ -160,6 +163,8 @@ class LrcPlayerApp:
         # ---- UI 状态 ----
         self.user_seeking = False
         self.always_on_top = False
+        # 重量级模块预热是否完成（V1.9.2：完成前状态栏显示「正在初始化…」）
+        self._preheat_done = False
         self.play_mode_index = 0
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
         self._play_mode_locked = False        # 歌词编辑器打开期间锁定播放模式
@@ -205,6 +210,9 @@ class LrcPlayerApp:
         # 启动恢复：读取 data.json 应用操作栏/模式/置顶，并计划后台恢复文件夹
         self._load_persisted_state()
 
+        # 预热完成前的状态栏提示（V1.9.2；预热回调后刷新为「就绪」）
+        self._refresh_idle_status()
+
         self.root.after(120, self._align_cover)   # 首次布局后校准封面（V1.8.9）
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
@@ -218,6 +226,9 @@ class LrcPlayerApp:
             if self._load_audio_file(initial_file):
                 self._auto_load_lrc(initial_file)
                 self._play()   # 自动开始播放
+            else:
+                # 加载失败（极端瞬态）：挂起，预热完成后重试（V1.9.2）
+                self._pending_play_file = initial_file
 
     def handle_external_file(self, path: str) -> None:
         """外部进程打开文件时调用的入口（主线程执行）。"""
@@ -231,6 +242,9 @@ class LrcPlayerApp:
         if self._load_audio_file(path):
             self._auto_load_lrc(path)
             self._play()
+        else:
+            # 引擎尚未就绪（预热未完成等）：挂起，预热完成后重试（V1.9.2）
+            self._pending_play_file = path
 
     # ==================================================================
     # 字体 & 样式
@@ -1342,6 +1356,18 @@ class LrcPlayerApp:
         self.op.update_vol_preview()
         self._update_controls_state()
 
+        # 预热完成：刷新状态栏显示（扫描进行中则不覆盖「解析中」），
+        # 并重试此前因引擎未就绪而挂起的待播文件（V1.9.2）
+        self._preheat_done = True
+        if not self._scanning_paths:
+            self._refresh_idle_status()
+        pending = self._pending_play_file
+        if pending and self.engine.ready:
+            self._pending_play_file = None
+            if self._load_audio_file(pending):
+                self._auto_load_lrc(pending)
+                self._play()
+
     def _disable_audio_controls(self) -> None:
         """音频后端不可用时禁用相关按钮。"""
         for btn in (self.play_pause_btn, self.stop_btn):
@@ -1465,14 +1491,29 @@ class LrcPlayerApp:
         self._prog_var.set("就绪")
         self._refresh_status_bar()
 
+    def _refresh_idle_status(self) -> None:
+        """刷新空闲态状态显示（V1.9.2）。
+
+        预热未完成 → 「正在初始化…」；预热完成但音频后端失败 →
+        「音频后端不可用」；否则 → 「就绪」。扫描进行中不调用本方法
+        （「解析中」优先）；由扫描结束（`_on_scan_finished`）与预热完成
+        回调（`_on_heavy_modules_ready`）触发。
+        """
+        if not self._preheat_done:
+            self._prog_var.set(INIT_STATUS_TEXT)
+        elif not self.engine.ready:
+            self._prog_var.set("音频后端不可用")
+        else:
+            self._prog_var.set("就绪")
+        self._refresh_status_bar()
+
     def _on_scan_finished(self, folder: str) -> None:
         """主线程：登记某文件夹扫描结束；全部扫描结束则置状态为就绪。"""
         if folder:
             self._scanning_paths.discard(
                 os.path.normcase(os.path.abspath(folder)))
         if not self._scanning_paths:
-            self._prog_var.set("就绪")
-            self._refresh_status_bar()
+            self._refresh_idle_status()
 
     # ==================================================================
     # 歌曲列表
@@ -1850,8 +1891,6 @@ class LrcPlayerApp:
 
     def _open_file(self) -> None:
         """打开单个音频文件并自动匹配 LRC。"""
-        if not self.engine.ready:
-            return
         if self._track_switch_guard("打开文件"):
             return
         path = filedialog.askopenfilename(
@@ -1866,9 +1905,12 @@ class LrcPlayerApp:
         self._auto_load_lrc(path)
 
     def _load_audio_file(self, path: str) -> bool:
-        """加载音频文件到引擎。成功返回 True。"""
-        if not self.engine.ready:
-            return False
+        """加载音频文件到引擎。成功返回 True。
+
+        不预检 `engine.ready`（V1.9.2 修复）：引擎 pending（重量级模块尚未
+        导入完成）时 `engine.load()` 会先同步探测一次；原预检使该兜底不可达，
+        导致双击文件打开时无法播放。
+        """
         success = self.engine.load(path)
         if not success:
             return False

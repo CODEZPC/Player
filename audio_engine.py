@@ -25,38 +25,54 @@ _mutagen_state: bool | None = None
 
 
 def _sd_available() -> bool:
-    """sounddevice 是否可用（首次调用触发真实导入并查询输出设备）。"""
+    """sounddevice 是否可用（首次调用触发真实导入并查询输出设备）。
+
+    模块/依赖缺失（ImportError）→ 缓存 False（永久）；
+    其他异常（如设备查询瞬态失败）→ 不缓存，之后可重试（V1.9.2）。
+    """
     global _sd_state
     if _sd_state is None:
         try:
             sd.query_devices(kind="output")
             _sd_state = True
-        except Exception:
+        except ImportError:
             _sd_state = False
+        except Exception:
+            return False
     return _sd_state
 
 
 def _pygame_available() -> bool:
-    """pygame 兜底后端是否可用（首次调用触发真实导入并初始化 mixer）。"""
+    """pygame 兜底后端是否可用（首次调用触发真实导入并初始化 mixer）。
+
+    同上：ImportError 缓存 False（永久）；其他异常不缓存（可重试，V1.9.2）。
+    """
     global _pygame_state
     if _pygame_state is None:
         try:
             pygame.mixer.init()
             _pygame_state = True
-        except Exception:
+        except ImportError:
             _pygame_state = False
+        except Exception:
+            return False
     return _pygame_state
 
 
 def _mutagen_available() -> bool:
-    """mutagen 是否可用（首次调用触发真实导入）。"""
+    """mutagen 是否可用（首次调用触发真实导入）。
+
+    ImportError 缓存 False（永久）；其他异常不缓存（V1.9.2）。
+    """
     global _mutagen_state
     if _mutagen_state is None:
         try:
             _ = MutagenFile
             _mutagen_state = True
-        except Exception:
+        except ImportError:
             _mutagen_state = False
+        except Exception:
+            return False
     return _mutagen_state
 
 
@@ -242,12 +258,14 @@ class AudioEngine:
     # ------------------------------------------------------------------
 
     def probe(self) -> None:
-        """探测并选择音频后端（幂等；sounddevice 优先，失败回退 pygame）。
+        """探测并选择音频后端（幂等：成功后不再重复探测）。
 
         V1.9.0：构造不再探测——主窗口显示后由后台预热回调触发；若用户抢先
         播放，load() 也会同步探测一次（此时重量级模块多半已就绪）。
+        V1.9.2：探测失败不再永久锁定——仅成功（`_ready`）时幂等；瞬态失败
+        可由后续 probe()（预热回调 / 再次 load）重试。
         """
-        if self._probed:
+        if self._ready:
             return
         self._probed = True
         if _sd_available():
@@ -291,8 +309,10 @@ class AudioEngine:
         Returns:
             bool: 加载成功返回 True，否则返回 False。
         """
-        if self.backend == "pending":
-            self.probe()   # 预热未完成时用户已开始播放：同步探测一次
+        if not self._ready:
+            # 未探测（pending）或曾瞬态失败：同步探测一次
+            # （预热未完成时用户已开始播放的兜底；成功后 probe 幂等）
+            self.probe()
         if not self._ready:
             return False
         self.stop()
