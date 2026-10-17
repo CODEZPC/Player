@@ -197,7 +197,7 @@ class LrcPlayerApp:
         if self.engine.backend == "none":
             self._disable_audio_controls()
             messagebox.showwarning(
-                "音频后端", "音频后端不可用（需 sounddevice 或 pygame）。")
+                "音频后端", "音频后端不可用（需 sounddevice）。")
             self._backend_warned = True
 
         # 非 sounddevice 后端不支持倍速/保音高/平衡/增益，禁用对应控件
@@ -391,9 +391,10 @@ class LrcPlayerApp:
 
         status_sep(bar)
 
-        # 插播统计（w=85）
+        # 插播统计（w=180；V1.10.0 加宽防截断：
+        # 「插播: N首 (hh:mm:ss)」实测最长约 166px，原 85px 会截断）
         il_frame = tk.Frame(bar, bg=SUBTLE_COLOR,
-                            width=self._px(85), height=self._px(24))
+                            width=self._px(180), height=self._px(24))
         il_frame.pack(side="left")
         il_frame.pack_propagate(False)
         self._ilst_var = tk.StringVar(value="插播: 0")
@@ -1349,7 +1350,7 @@ class LrcPlayerApp:
             if not self._backend_warned:
                 self._backend_warned = True
                 messagebox.showwarning(
-                    "音频后端", "音频后端不可用（需 sounddevice 或 pygame）。")
+                    "音频后端", "音频后端不可用（需 sounddevice）。")
         elif self.engine.backend != "sounddevice":
             self._disable_op_controls()
         self._audio_var.set(self._read_audio_info())
@@ -1385,7 +1386,7 @@ class LrcPlayerApp:
     def _update_controls_state(self) -> None:
         """根据是否已加载文件/文件夹统一启用/禁用播放相关控件。
 
-        加载任何文件或扫描任何文件夹后，除 sounddevice 专属控件（pygame 后端禁用）外全部启用；
+        加载任何文件或扫描任何文件夹后，除 sounddevice 专属控件（非 sounddevice 后端禁用）外全部启用；
         完全未加载时（刚启动）全部禁用。
         """
         loaded = self.audio_path is not None or bool(self.audio_items)
@@ -1444,16 +1445,6 @@ class LrcPlayerApp:
                 return f"音频: {sr}Hz {ch_name}" if sr > 0 else "音频: 就绪"
             except Exception:
                 return "音频: 就绪"
-        try:
-            import pygame
-            info = pygame.mixer.get_init()
-            if info:
-                freq, fmt, ch = info
-                ch_name = {1: "Mono", 2: "Stereo"}.get(ch, f"{ch}ch")
-                bits = 16 if fmt < 0 else 8
-                return f"音频: pygame {freq}Hz {bits}bit {ch_name}"
-        except Exception:
-            pass
         return "音频: 就绪"
 
     def _refresh_status_bar(self) -> None:
@@ -1666,7 +1657,7 @@ class LrcPlayerApp:
         ).start()
 
     def _bg_cache_thread(self, generation: int) -> None:
-        """后台子线程：用 mutagen 获取时长，不触碰 pygame 避免音频撕裂。"""
+        """后台子线程：用 mutagen 获取时长（不触碰音频线程，避免撕裂）。"""
         items_snapshot = self.audio_items
         total = len(items_snapshot)
         for i, item in enumerate(items_snapshot):

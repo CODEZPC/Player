@@ -15,7 +15,7 @@ if TYPE_CHECKING:   # 仅类型检查：app 依赖 utils，运行时导入会循
 # ===========================================================================
 
 APP_NAME = "Player PRO"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.10.0"
 
 
 # ===========================================================================
@@ -68,7 +68,7 @@ def read_text_file(path: str) -> str | None:
 # ===========================================================================
 
 def get_duration_mutagen(path: str) -> float | None:
-    """用 mutagen 读取音频时长（不占用 pygame mixer，线程安全）。"""
+    """用 mutagen 读取音频时长（线程安全，不占用音频设备）。"""
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == ".mp3":

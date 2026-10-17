@@ -1,7 +1,7 @@
 """音频播放引擎。
 
-主后端：sounddevice + soundfile + numpy 流式播放，支持倍速（简单变速 / 保音高）与音量。
-兜底后端：pygame.mixer（当 sounddevice/soundfile/numpy 不可用时）。
+唯一后端：sounddevice + soundfile + numpy 流式播放，支持倍速（简单变速 / 保音高）与音量。
+V1.10.0：移除 pygame 兜底后端——sounddevice 不可用时后端为 none（不播放）。
 """
 
 import os
@@ -15,12 +15,10 @@ import threading
 lazy import numpy as np
 lazy import sounddevice as sd
 lazy import soundfile as sf
-lazy import pygame
 lazy from mutagen import File as MutagenFile
 
 # ---- 后端可用性探测（结果缓存：None = 尚未探测）----
 _sd_state: bool | None = None
-_pygame_state: bool | None = None
 _mutagen_state: bool | None = None
 
 
@@ -40,23 +38,6 @@ def _sd_available() -> bool:
         except Exception:
             return False
     return _sd_state
-
-
-def _pygame_available() -> bool:
-    """pygame 兜底后端是否可用（首次调用触发真实导入并初始化 mixer）。
-
-    同上：ImportError 缓存 False（永久）；其他异常不缓存（可重试，V1.9.2）。
-    """
-    global _pygame_state
-    if _pygame_state is None:
-        try:
-            pygame.mixer.init()
-            _pygame_state = True
-        except ImportError:
-            _pygame_state = False
-        except Exception:
-            return False
-    return _pygame_state
 
 
 def _mutagen_available() -> bool:
@@ -221,7 +202,7 @@ def _get_track_number(path: str) -> str:
 class AudioEngine:
     """音频播放引擎。
 
-    主后端 sounddevice（流式，支持倍速/保音高/音量），兜底 pygame.mixer。
+    唯一后端 sounddevice（流式，支持倍速/保音高/音量）；不可用时不播放（V1.10.0 移除 pygame 兜底）。
     """
 
     def __init__(self) -> None:
@@ -264,16 +245,13 @@ class AudioEngine:
         播放，load() 也会同步探测一次（此时重量级模块多半已就绪）。
         V1.9.2：探测失败不再永久锁定——仅成功（`_ready`）时幂等；瞬态失败
         可由后续 probe()（预热回调 / 再次 load）重试。
+        V1.10.0：移除 pygame 回退——结果只有 sounddevice 或 none。
         """
         if self._ready:
             return
         self._probed = True
         if _sd_available():
             self.backend = "sounddevice"
-            self._ready = True
-            return
-        if _pygame_available():
-            self.backend = "pygame"
             self._ready = True
             return
         self.backend = "none"
@@ -337,9 +315,6 @@ class AudioEngine:
                         samplerate=self._sr, channels=self._ch,
                         dtype="float32", callback=self._callback,
                         blocksize=1024)
-            else:
-                pygame.mixer.music.stop()
-                pygame.mixer.music.load(path)
         except Exception:
             return False
         self._current_path = path
@@ -357,8 +332,6 @@ class AudioEngine:
             self._paused = False
             if self._stream and not self._stream.active:
                 self._stream.start()
-        else:
-            pygame.mixer.music.play(start=start)
 
     def pause(self) -> None:
         """暂停播放。"""
@@ -366,8 +339,6 @@ class AudioEngine:
             return
         if self.backend == "sounddevice":
             self._paused = True
-        else:
-            pygame.mixer.music.pause()
 
     def unpause(self) -> None:
         """恢复播放。"""
@@ -375,8 +346,6 @@ class AudioEngine:
             return
         if self.backend == "sounddevice":
             self._paused = False
-        else:
-            pygame.mixer.music.unpause()
 
     def stop(self) -> None:
         """停止播放（重置到开头）。"""
@@ -397,8 +366,6 @@ class AudioEngine:
                     except Exception:
                         pass
                 self._pos_frames = 0.0
-        else:
-            pygame.mixer.music.stop()
 
     def seek(self, seconds: float) -> None:
         """跳转到指定位置并继续播放。"""
@@ -415,14 +382,9 @@ class AudioEngine:
                 self._pv_spill = np.empty((0, self._ch), dtype=np.float32)
                 if self._pv:
                     self._pv.reset()
-        else:
-            try:
-                pygame.mixer.music.play(start=seconds)
-            except Exception:
-                pass
 
     def get_position(self) -> float | None:
-        """返回当前源音频位置（秒）；pygame 后端返回 None。"""
+        """返回当前源音频位置（秒）；非 sounddevice 返回 None。"""
         if self.backend != "sounddevice" or self._sf is None:
             return None
         return self._pos_frames / self._sr
@@ -434,14 +396,14 @@ class AudioEngine:
         if self.backend == "sounddevice":
             return bool(self._stream and self._stream.active
                         and not self._paused and not self._eof)
-        return pygame.mixer.music.get_busy()
+        return False
 
     # ------------------------------------------------------------------
     # 倍速 / 音量 / 保音高
     # ------------------------------------------------------------------
 
     def set_speed(self, speed: float) -> None:
-        """设置倍速（0.01 ~ 10.0）。pygame 后端不支持，忽略。"""
+        """设置倍速（0.01 ~ 10.0）。"""
         self._speed = max(0.01, min(10.0, float(speed)))
         if (self.backend == "sounddevice" and self._sf
                 and (self._pitch_fix or abs(self._pitch_shift) > 1e-9)):
@@ -487,11 +449,6 @@ class AudioEngine:
     def set_volume(self, volume: float) -> None:
         """设置音量（0.0 ~ 1.0）。"""
         self._volume = max(0.0, min(1.0, float(volume)))
-        if self.backend == "pygame":
-            try:
-                pygame.mixer.music.set_volume(self._volume)
-            except Exception:
-                pass
 
     def get_volume(self) -> float:
         """当前音量。"""
@@ -662,13 +619,7 @@ class AudioEngine:
                 return float(sf.info(path).duration)
             except Exception:
                 return None
-        try:
-            if os.path.getsize(path) > 80 * 1024 * 1024:
-                return None
-            sound = pygame.mixer.Sound(path)
-            return float(sound.get_length())
-        except Exception:
-            return None
+        return None
 
     @staticmethod
     def get_file_info(path: str) -> dict[str, str]:
@@ -723,11 +674,4 @@ class AudioEngine:
             with self._lock:
                 self._close_stream()
                 self._close_file()
-            self._ready = False
-        else:
-            try:
-                pygame.mixer.music.stop()
-                pygame.mixer.quit()
-            except Exception:
-                pass
-            self._ready = False
+        self._ready = False

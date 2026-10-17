@@ -4,7 +4,7 @@ IPC 约定（V1.8.7）：服务端 socket 由 main.py 最早期经 `ipc.create_s
 绑定并传入 `run_app(ipc_server=...)`；本模块负责主窗口就绪后的 accept 循环。
 
 启动预热（V1.9.0）：主窗口显示后由 `_preheat_heavy_modules` 后台真实导入
-重量级模块（numpy / sounddevice / soundfile / pygame / mutagen / PIL），
+重量级模块（numpy / sounddevice / soundfile / mutagen / PIL），
 完成后回主线程探测音频后端——配合各模块的 PEP 810 lazy import 缩短启动等待。
 """
 
@@ -78,7 +78,6 @@ def _preheat_heavy_modules(app: LrcPlayerApp) -> None:
         import numpy          # noqa: F401  （触发 audio_engine 的 lazy 引用加载）
         import sounddevice    # noqa: F401
         import soundfile      # noqa: F401
-        import pygame         # noqa: F401
         import mutagen        # noqa: F401
         from PIL import Image, ImageTk  # noqa: F401
     except Exception:
