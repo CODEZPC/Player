@@ -49,6 +49,9 @@ def strip_invisible(text: str) -> str:
 
 # 行首单时间标签：[mm:ss]、[mm:ss.xx]、[mm:ss.xxx]
 _TIME_LINE_RE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
+# 翻译行（V1.11.0）：[tr mm:ss.xxx] 开头；保存时原样保留、不参与编辑
+_TRANSLATION_LINE_RE = re.compile(
+    r"^\s*\[\s*tr\s+(\d+):(\d+(?:\.\d+)?)\s*\]", re.IGNORECASE)
 
 
 # ======================================================================
@@ -108,18 +111,31 @@ def _norm_text(text: str) -> str:
     return strip_invisible(text).replace(FULLWIDTH_SPACE, "").replace(" ", "").strip()
 
 
-def is_prefix_expanded(texts: list[str]) -> bool:
-    """判断行列表是否为逐字展开型（存在相邻行的前缀关系）。
+def prefix_ratio(texts: list[str]) -> float:
+    """相邻行对中满足「前缀关系」的比例（0.0~1.0；空行对不计入，V1.11.0）。
 
     与 app._build_lyric_stem 的中间态判定一致：某行去空白后是下一行的
-    严格前缀，即为逐字展开的中间态。
+    严格前缀（逐字展开中间态）即命中。
     """
+    pairs = 0
+    hits = 0
     for i in range(len(texts) - 1):
         cur = _norm_text(texts[i])
         nxt = _norm_text(texts[i + 1])
-        if cur and nxt.startswith(cur) and nxt != cur:
-            return True
-    return False
+        if not cur or not nxt:
+            continue          # 空行/占位行不参与比例计算
+        pairs += 1
+        if nxt.startswith(cur) and nxt != cur:
+            hits += 1
+    return (hits / pairs) if pairs else 0.0
+
+
+def is_prefix_expanded(texts: list[str]) -> bool:
+    """是否逐字展开型：相邻行前缀关系比例 ≥ 50%（V1.11.0）。
+
+    原判定为「存在任意前缀对即 True」，过于宽松；现按比例判定。
+    """
+    return prefix_ratio(texts) >= 0.5
 
 
 def _split_ms(t: float) -> tuple[int, int, int]:
@@ -155,6 +171,8 @@ def parse_lines(text: str) -> list[tuple[float | None, str]]:
         line = strip_invisible(raw).strip()
         if not line or line.lower().startswith("[offset:"):
             continue
+        if _TRANSLATION_LINE_RE.match(line):
+            continue          # 翻译行单独保留，不进编辑列表（V1.11.0）
         m = _TIME_LINE_RE.match(line)
         if m:
             t = int(m.group(1)) * 60 + float(m.group(2))
@@ -221,6 +239,8 @@ class LyricEditor:
         self._after_id = None
         self._bind_ids: list[tuple[str, str]] = []
         self._initial_lines: list[dict] | None = None  # 打开时快照（未更改判定）
+        # 保留的原文件翻译行（[tr ...]，保存时原样带出；V1.11.0）
+        self._kept_translation_lines: list[str] = []
         self._time_edit_active = False     # 时间戳输入框聚焦中（屏蔽快捷键）
         self._place_bind_id = None         # root <Configure> 绑定 id（V1.8.8）
         self._panel_geom: tuple | None = None  # 面板几何缓存（同值跳过 place）
@@ -300,6 +320,13 @@ class LyricEditor:
         # 点击后把焦点还给歌词列表（便于继续键盘操作，避免空格双触发）
         self.jump_btn.bind("<ButtonRelease-1>",
                            lambda e: self.listbox.focus_set(), add="+")
+        # 「手动转换」按钮（V1.11.0）：逐字判定 ≥50% 且 <100% 时显示，
+        # 点击把非逐字（孤立）行展开，整表统一为逐字
+        self.convert_btn = tk.Button(a_col, text="手动转换",
+                                     command=self.convert_to_verbatim,
+                                     **btn_cfg)
+        self.convert_btn.bind("<ButtonRelease-1>",
+                              lambda e: self.listbox.focus_set(), add="+")
 
         b_col = tk.Frame(top, bg=self.BG_COLOR)
         b_col.pack(side="left", fill="both", expand=True,
@@ -462,6 +489,9 @@ class LyricEditor:
         self._cancel_edit()
         self._undo.clear()
         self._redo.clear()
+        # 保留原文件翻译行（[tr ...]），保存写回时原样带出（V1.11.0）
+        self._kept_translation_lines = self._read_translation_lines(
+            self.app.lrc_path)
         src: list[tuple[float, str]] = []
         if self.app.lrc_lines and self.app.lrc_path is not None:
             src = list(self.app.lrc_lines)
@@ -484,6 +514,84 @@ class LyricEditor:
                     [(l["time"], l["text"]) for l in self.lines])
                 self.sel = 0 if self.lines else -1
                 self._refresh_list()
+
+    def _verbatim_group_flags(self) -> list[bool]:
+        """标记每行是否属于逐字组（与前/后续行构成前缀关系；V1.11.0）。"""
+        texts = [_norm_text(l["text"]) for l in self.lines]
+        n = len(texts)
+        flags = [False] * n
+        for i in range(n - 1):
+            cur, nxt = texts[i], texts[i + 1]
+            if cur and nxt and nxt.startswith(cur) and nxt != cur:
+                flags[i] = True
+                flags[i + 1] = True
+        return flags
+
+    def _has_convertible_lines(self) -> bool:
+        """是否存在可转换的孤立行（不属于逐字组且能拆出多行；V1.11.0）。"""
+        flags = self._verbatim_group_flags()
+        for i, line in enumerate(self.lines):
+            if flags[i]:
+                continue
+            if len(expand_prefix_lines(line["text"])) > 1:
+                return True
+        return False
+
+    def convert_to_verbatim(self) -> None:
+        """手动转换（V1.11.0）：把可拆分的孤立行展开，尽量统一为逐字。
+
+        已处于逐字组（与前/后续行构成前缀关系）的行保持原样；
+        孤立行按 expand_prefix_lines 展开（时间戳复制到全部子行）；
+        无法拆分（如单个英文单词）的行保持原样。
+        """
+        if not self.lines:
+            return
+        flags = self._verbatim_group_flags()
+        out: list[dict] = []
+        changed = False
+        for i, line in enumerate(self.lines):
+            if flags[i]:
+                out.append(dict(line))
+                continue
+            subs = expand_prefix_lines(line["text"])
+            if len(subs) > 1:
+                out.extend({"text": s, "time": line["time"]} for s in subs)
+                changed = True
+            else:
+                out.append(dict(line))
+        if not changed:
+            return
+        self._push_undo()
+        self.lines = out
+        self.sel = 0 if self.lines else -1
+        self._refresh_list()
+
+    def _refresh_convert_btn(self) -> None:
+        """刷新「手动转换」按钮显隐（V1.11.0）。
+
+        条件：相邻行前缀比例 ∈ [50%, 100%) 且存在可拆分的孤立行
+        （逐字组边界处的非前缀对属于正常结构，不算待转换内容）。
+        """
+        try:
+            ratio = prefix_ratio([l["text"] for l in self.lines])
+            if 0.5 <= ratio < 1.0 and self._has_convertible_lines():
+                self.convert_btn.pack(fill="x", pady=(1, 1))
+            else:
+                self.convert_btn.pack_forget()
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _read_translation_lines(lrc_path: str | None) -> list[str]:
+        """读取 lrc 文件中的翻译行（[tr ...]，原样保留用于保存，V1.11.0）。"""
+        if not lrc_path:
+            return []
+        try:
+            text = read_text_file(lrc_path) or ""
+        except Exception:
+            return []
+        return [ln.strip() for ln in text.splitlines()
+                if _TRANSLATION_LINE_RE.match(ln)]
 
     @staticmethod
     def _expand_pairs(pairs) -> list[dict]:
@@ -511,6 +619,7 @@ class LyricEditor:
         else:
             self.sel = -1
         self._update_sel_time()
+        self._refresh_convert_btn()
 
     def _update_row(self, idx: int) -> None:
         """刷新单行显示（打轴/文本编辑后调用）。"""
@@ -763,6 +872,11 @@ class LyricEditor:
             messagebox.showerror("导入歌词", "无法读取文件。",
                                  parent=self.app.root)
             return
+        # 保留导入文件中的翻译行（V1.11.0）
+        self._kept_translation_lines = [
+            ln.strip() for ln in content.splitlines()
+            if _TRANSLATION_LINE_RE.match(ln)
+        ]
         pairs = parse_lines(content)
         if not pairs:
             messagebox.showwarning("导入歌词", "文件中没有可用的歌词行。",
@@ -846,9 +960,21 @@ class LyricEditor:
     # 保存 / 导出辅助
     # ------------------------------------------------------------------
     def _to_lrc_text(self) -> str:
-        """生成 LRC 文本（未打轴行占位 [00:00.000]）。"""
-        return "".join(f"{fmt_lrc_time(l['time'])}{l['text']}\n"
-                       for l in self.lines)
+        """生成 LRC 文本（未打轴行占位 [00:00.000]）。
+
+        V1.11.0：原文件的翻译行（[tr ...]）按时间戳插入保留，不丢失。
+        """
+        entries: list[tuple[float, int, str]] = []
+        for line in self.lines:
+            t = 0.0 if line["time"] is None else float(line["time"])
+            entries.append((t, 0,
+                            f"{fmt_lrc_time(line['time'])}{line['text']}"))
+        for raw in self._kept_translation_lines:
+            m = _TRANSLATION_LINE_RE.match(raw)
+            t = (int(m.group(1)) * 60 + float(m.group(2))) if m else 0.0
+            entries.append((t, 1, raw))
+        entries.sort(key=lambda e: (e[0], e[1]))
+        return "".join(e[2] + "\n" for e in entries)
 
     def _save_to_song(self, audio_path: str) -> bool:
         """保存到歌曲同名 .lrc 并刷新主界面歌词。返回是否成功。"""
@@ -945,6 +1071,7 @@ class LyricEditor:
             self._push_undo()
             self.lines[idx]["text"] = text
             self._update_row(idx)
+            self._refresh_convert_btn()
         try:
             self.listbox.focus_set()
         except tk.TclError:

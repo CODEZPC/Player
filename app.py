@@ -37,6 +37,7 @@ BG_COLOR = "#23272E"
 FG_COLOR = "#C8C8C8"
 ACCENT_COLOR = "#6FA3FF"
 SUBTLE_COLOR = "#3A3F46"
+TRANSLATION_COLOR = "#9AA0A6"   # 翻译行文字色（V1.11.0：略暗于主歌词）
 BUTTON_WIDTH = 10
 TICK_INTERVAL_MS = 10
 INIT_STATUS_TEXT = "正在初始化…"     # 预热完成前的状态栏提示（V1.9.2）
@@ -158,6 +159,10 @@ class LrcPlayerApp:
         # ---- 歌词 ----
         self.lrc_lines: list[tuple[float, str]] = []
         self.lrc_times: list[float] = []
+        # 翻译独立时间轴（V1.12.0：[tr mm:ss.xxx] 行，与主歌词分别解析）
+        self.lrc_trans_lines: list[tuple[float, str]] = []
+        self.lrc_trans_times: list[float] = []
+        self._cur_trans_text = ""      # 当前已显示的翻译（变化才刷新控件）
         self.current_lrc_index = -1
 
         # ---- UI 状态 ----
@@ -186,6 +191,10 @@ class LrcPlayerApp:
         self.overlay_lyric_small_font = self._pick_font("汉仪文黑-85W", self._font_size(13))
         self.lyric_bar_font = self._pick_font(
             "汉仪文黑-85W", self._font_size(self._lyric_bar_font_size))
+        # 翻译行字体（V1.11.0）：主界面 12 / 浮层 16（相对歌词行缩小）
+        self.trans_font = self._pick_font("汉仪文黑-85W", self._font_size(12))
+        self.overlay_trans_font = self._pick_font(
+            "汉仪文黑-85W", self._font_size(16))
 
         # ---- 构建 ----
         self._configure_style()
@@ -473,6 +482,18 @@ class LrcPlayerApp:
             anchor="w",
         )
         now_label.pack(fill="x")
+
+        # 翻译行（V1.11.0）：常驻占位（无翻译时留空，避免歌词/信息行跳动）
+        self.trans_line_var = tk.StringVar(value="")
+        self.trans_label = tk.Label(
+            header,
+            textvariable=self.trans_line_var,
+            bg=BG_COLOR,
+            fg=TRANSLATION_COLOR,
+            font=self.trans_font,
+            anchor="w",
+        )
+        self.trans_label.pack(fill="x")
 
         self.info_var = tk.StringVar(value="音频: --- | 歌词: ---/---")
         info_label = tk.Label(
@@ -1967,6 +1988,10 @@ class LrcPlayerApp:
         name = os.path.splitext(os.path.basename(audio_path))[0] or "未命名"
         self.lrc_lines = [(0.0, name)]
         self.lrc_times = [0.0]
+        # 占位歌词无翻译（V1.12.0：独立翻译时间轴一并清空）
+        self.lrc_trans_lines = []
+        self.lrc_trans_times = []
+        self._cur_trans_text = ""
         self.current_lrc_index = -1
         self.lrc_path = None          # 无真实歌词文件
         self._refresh_lyric_display()
@@ -1986,31 +2011,39 @@ class LrcPlayerApp:
             messagebox.showerror("加载歌词", "无法读取 LRC 文件。")
             self._clear_lrc()
             return
-        self.lrc_lines = LrcParser.parse(content)
+        self.lrc_lines, self.lrc_trans_lines = LrcParser.parse_full(content)
         self.lrc_times = [ts for ts, _ in self.lrc_lines]
+        self.lrc_trans_times = [ts for ts, _ in self.lrc_trans_lines]
+        self._cur_trans_text = ""
         self.current_lrc_index = -1
         self.lrc_path = path
         self._refresh_lyric_display()
         self._update_info()
 
     def _clear_lrc(self) -> None:
-        """清除当前歌词数据。"""
+        """清除当前歌词数据（含独立翻译时间轴，V1.12.0）。"""
         self.lrc_lines.clear()
         self.lrc_times.clear()
+        self.lrc_trans_lines.clear()
+        self.lrc_trans_times.clear()
+        self._cur_trans_text = ""
         self.current_lrc_index = -1
         self.lrc_path = None
         self._refresh_lyric_display()
         self._update_info()
 
     def _refresh_lyric_display(self) -> None:
-        """刷新歌词显示区（同时刷新桌面歌词条）。"""
+        """刷新歌词显示区（翻译行 + 桌面歌词条；V1.12.0 翻译独立轴）。"""
         if not self.lrc_lines:
             self.now_line_var.set(
                 "未加载歌词" if self.lrc_path is None else "未找到时间轴歌词")
+            self._cur_trans_text = ""
+            self.trans_line_var.set("")
             self._update_lyric_overlay()
             self._update_lyric_bar()
             return
         self.now_line_var.set(self.lrc_lines[0][1])
+        self._sync_translation()
         self._update_lyric_overlay()
         self._update_lyric_bar()
 
@@ -2598,6 +2631,9 @@ class LrcPlayerApp:
         self.duration = None
         self.lrc_lines.clear()
         self.lrc_times.clear()
+        self.lrc_trans_lines.clear()
+        self.lrc_trans_times.clear()
+        self._cur_trans_text = ""
         self.current_lrc_index = -1
         self._reset_playback_state()
         self._refresh_lyric_display()
@@ -2662,6 +2698,7 @@ class LrcPlayerApp:
         dur_str = format_time(self.duration)
         self.time_var.set(f"00:00 / {dur_str}")
         self._highlight_line(-1)
+        self._sync_translation(0.0)   # 回到起点：翻译按独立时间轴重新定位
         self.play_pause_btn.config(text="播放")
 
     def _current_time(self) -> float:
@@ -2686,6 +2723,8 @@ class LrcPlayerApp:
     def _sync_lyrics(self, current_time: float) -> None:
         """根据当前播放时间更新高亮歌词行（考虑歌词偏移）。"""
         if not self.lrc_times:
+            # 无主歌词时间轴时，翻译仍按独立时间轴推进（V1.12.0）
+            self._sync_translation(current_time)
             return
         lookup = current_time - self.lrc_offset / 100  # 正值偏移 → 歌词延后
         index = bisect_right(self.lrc_times, lookup) - 1
@@ -2693,12 +2732,19 @@ class LrcPlayerApp:
             self.current_lrc_index = index
             self._highlight_line(index)
             self._update_info()
+        # 翻译行是独立时间轴（V1.12.0）：放在歌词更新之后，避免被覆盖
+        self._sync_translation(current_time)
 
     def _highlight_line(self, index: int) -> None:
-        """高亮指定索引的歌词行，并同步歌词浮层与桌面歌词条。"""
+        """高亮指定索引的歌词行，并同步歌词浮层与桌面歌词条。
+
+        翻译行不在此处理（V1.12.0）：由 `_sync_lyrics` 按独立时间轴统一同步。
+        """
         if not self.lrc_lines:
             self.now_line_var.set(
                 "未加载歌词" if self.lrc_path is None else "未找到时间轴歌词")
+            self._cur_trans_text = ""
+            self.trans_line_var.set("")
             self._update_lyric_overlay()
             self._update_lyric_bar()
             return
@@ -2714,6 +2760,28 @@ class LrcPlayerApp:
         self.now_line_var.set(self.lrc_lines[index][1])
         self._update_lyric_overlay()
         self._update_lyric_bar()
+
+    def _sync_translation(self, current_time: float | None = None) -> None:
+        """按**独立时间轴**同步翻译行（V1.12.0）。
+
+        主歌词与翻译分别解析、互不依赖：以「当前播放时间扣除歌词偏移」在
+        翻译时间轴上二分取最近一条，该翻译从自身时间戳起一直显示到下一
+        条翻译为止；无翻译（首条之前 / 整首无翻译）时留空。
+        仅在文本变化时刷新控件，避免每帧重绘。
+        """
+        if current_time is None:
+            current_time = self._current_time()
+        lookup = current_time - self.lrc_offset / 100
+        text = ""
+        if self.lrc_trans_times:
+            idx = bisect_right(self.lrc_trans_times, lookup) - 1
+            if idx >= 0:
+                text = self.lrc_trans_lines[idx][1]
+        if text == self._cur_trans_text:
+            return
+        self._cur_trans_text = text
+        self.trans_line_var.set(text)
+        self._set_overlay_translation(text)
 
     # ==================================================================
     # 全窗口歌词浮层（点击封面打开）
@@ -2794,6 +2862,9 @@ class LrcPlayerApp:
         self._overlay_lyric_labels = []
         self._overlay_row_count = 0
         self._overlay_rows_timer = None
+        # 翻译行（V1.11.0）：位于当前（中间）行下方，固定占位
+        self._overlay_trans_var: tk.StringVar | None = tk.StringVar(value="")
+        self._overlay_trans_label: tk.Label | None = None
         # 初次按当前窗口高度决定行数
         self._rebuild_overlay_lyric_rows(
             self._overlay_target_row_count(
@@ -2814,7 +2885,12 @@ class LrcPlayerApp:
             small_ls, big_ls = 20, 34
         row_small = max(1, small_ls + 12)     # 小字行高 + 上下 pady(6+6)
         middle_row = max(1, big_ls + 20)      # 中间大字行高 + 上下 pady(10+10)
-        avail = max(60, int(height) - 48)     # 上下留边距
+        try:
+            trans_ls = int(self.overlay_trans_font.metrics("linespace"))
+        except Exception:
+            trans_ls = 22
+        # 上下留边距 + 翻译行高度（V1.11.0：当前行下方常驻占位）
+        avail = max(60, int(height) - 48 - (trans_ls + 6))
         n = 1 + int(max(0, avail - middle_row) // row_small)
         if n % 2 == 0:
             n -= 1
@@ -2846,6 +2922,17 @@ class LrcPlayerApp:
                      pady=(10, 10) if is_middle else 6)
             self._overlay_lyric_vars.append(var)
             self._overlay_lyric_labels.append(lbl)
+            if is_middle:
+                # 当前行下方：翻译行（V1.11.0，固定占位；无翻译时留空）
+                if getattr(self, "_overlay_trans_var", None) is None:
+                    self._overlay_trans_var = tk.StringVar(value="")
+                self._overlay_trans_label = tk.Label(
+                    frame, textvariable=self._overlay_trans_var,
+                    bg=BG_COLOR, fg=TRANSLATION_COLOR,
+                    font=self.overlay_trans_font,
+                    anchor="w", justify="left", wraplength=wrap)
+                self._overlay_trans_label.pack(fill="x", padx=24,
+                                               pady=(0, 6))
 
     def _on_overlay_configure(self, event: tk.Event) -> None:
         """浮层尺寸变化：更新换行宽度，并按高度防抖调整歌词行数。"""
@@ -2897,6 +2984,8 @@ class LrcPlayerApp:
         self._overlay_lyric_labels = []
         self._overlay_lyric_frame = None
         self._overlay_row_count = 0
+        self._overlay_trans_label = None
+        self._overlay_trans_var = None
 
     def _refresh_overlay_header(self) -> None:
         """刷新浮层左栏：放大封面、歌曲名、歌手名。"""
@@ -2970,6 +3059,7 @@ class LrcPlayerApp:
         if not self.lrc_lines:
             vars_[middle].set("未加载歌词" if self.lrc_path is None
                               else "未找到时间轴歌词")
+            self._set_overlay_translation("")
             return
 
         # 当前行（-1 时按首行处理，与主窗口一致）
@@ -2992,6 +3082,15 @@ class LrcPlayerApp:
 
         # 中间行与现有解析一致（逐字原样）
         vars_[middle].set(self.lrc_lines[cur][1])
+        # 翻译行（V1.12.0）：独立时间轴当前值（由 _sync_lyrics 统一维护，
+        # 这里只回填缓存，避免浮层刷新反向改写翻译状态）
+        self._set_overlay_translation(self._cur_trans_text)
+
+    def _set_overlay_translation(self, text: str) -> None:
+        """设置浮层翻译行文本（浮层未创建时忽略；V1.11.0）。"""
+        var = getattr(self, "_overlay_trans_var", None)
+        if var is not None:
+            var.set(text)
 
     # ==================================================================
     # 桌面歌词条（独立置顶小窗：关闭 / 顶部 / 底部）
