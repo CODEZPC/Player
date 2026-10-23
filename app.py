@@ -38,6 +38,7 @@ FG_COLOR = "#C8C8C8"
 ACCENT_COLOR = "#6FA3FF"
 SUBTLE_COLOR = "#3A3F46"
 TRANSLATION_COLOR = "#9AA0A6"   # 翻译行文字色（V1.11.0：略暗于主歌词）
+TRANSLATION_PREFIX = "译："      # 主界面翻译行前缀（V1.11.2；仅真实翻译，占位不加）
 BUTTON_WIDTH = 10
 TICK_INTERVAL_MS = 10
 INIT_STATUS_TEXT = "正在初始化…"     # 预热完成前的状态栏提示（V1.9.2）
@@ -83,10 +84,9 @@ class LrcPlayerApp:
         else:
             self.ui_scale = 1.0
 
-        title = f"{APP_NAME} V{APP_VERSION}"
-        if self.small_screen:
-            title += " 缩小兼容模式"
-        self.root.title(title)
+        # 窗口标题（V1.11.1）：未加载曲目时「Player PRO Vx.y.z」，
+        # 不再附加「缩小兼容模式」（小屏提示仅保留在状态栏）
+        self._refresh_window_title()
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(self._px(1280), self._px(660))
         self.root.resizable(True, True)
@@ -163,6 +163,7 @@ class LrcPlayerApp:
         self.lrc_trans_lines: list[tuple[float, str]] = []
         self.lrc_trans_times: list[float] = []
         self._cur_trans_text = ""      # 当前已显示的翻译（变化才刷新控件）
+        self._cur_trans_is_placeholder = False   # 显示内容是否为「下一句歌词」占位（V1.11.1）
         self.current_lrc_index = -1
 
         # ---- UI 状态 ----
@@ -338,7 +339,8 @@ class LrcPlayerApp:
         self._build_bottom_panels(self.bottom_frame)
 
         # ---- 右栏（固定宽度；子控件为 pack，须用 pack_propagate 保持定宽）----
-        right_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(220))
+        # V1.11.1：220 → 240，保证正方形封面（高度≈231）左右不被裁切
+        right_col = tk.Frame(outer, bg=BG_COLOR, width=self._px(240))
         right_col.grid(row=0, column=1, sticky="nsew", padx=(self._px(12), 0))
         right_col.pack_propagate(False)
         self._build_right_column(right_col)
@@ -482,6 +484,8 @@ class LrcPlayerApp:
             anchor="w",
         )
         now_label.pack(fill="x")
+        self.now_label = now_label   # 点击复制（V1.11.1）
+        now_label.bind("<Button-1>", self._copy_current_lyric)
 
         # 翻译行（V1.11.0）：常驻占位（无翻译时留空，避免歌词/信息行跳动）
         self.trans_line_var = tk.StringVar(value="")
@@ -494,6 +498,8 @@ class LrcPlayerApp:
             anchor="w",
         )
         self.trans_label.pack(fill="x")
+        # 点击翻译行复制翻译文本（V1.11.1）
+        self.trans_label.bind("<Button-1>", self._copy_current_translation)
 
         self.info_var = tk.StringVar(value="音频: --- | 歌词: ---/---")
         info_label = tk.Label(
@@ -505,6 +511,39 @@ class LrcPlayerApp:
             anchor="w",
         )
         info_label.pack(fill="x", pady=(4, 6))
+
+    # ------------------------------------------------------------------
+    # 点击歌词复制（V1.11.1）
+    # ------------------------------------------------------------------
+
+    def _copy_to_clipboard(self, text: str) -> bool:
+        """写入系统剪贴板（失败静默返回 False）。"""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+            return True
+        except tk.TclError:
+            return False
+
+    def _copy_current_lyric(self, _event: tk.Event | None = None) -> None:
+        """点击当前歌词行：复制**整句主干歌词**（逐字中间态也复制完整句）。"""
+        text = self._current_stem_text()
+        if not text:
+            self._hint_status("当前无歌词可复制")
+            return
+        if self._copy_to_clipboard(text):
+            self._hint_status("已复制歌词到剪贴板")
+
+    def _copy_current_translation(
+            self, _event: tk.Event | None = None) -> None:
+        """点击翻译行：复制当前翻译；无翻译（含「下一句」占位）时不复制。"""
+        text = self._cur_trans_text.strip()
+        if not text or self._cur_trans_is_placeholder:
+            self._hint_status("当前无翻译可复制")
+            return
+        if self._copy_to_clipboard(text):
+            self._hint_status("已复制翻译到剪贴板")
 
     def _build_button_rows(self, parent: tk.Frame) -> None:
         """两行按钮，每行 4 个。包裹在容器中供取消条覆盖。"""
@@ -1025,7 +1064,7 @@ class LrcPlayerApp:
 
         # ---- 专辑封面（高度动态：与左栏上部底边对齐，V1.8.9；小屏缩放）----
         cover_frame = tk.Frame(parent, bg=BG_COLOR,
-                               height=self._cover_size, width=self._px(220))
+                               height=self._cover_size, width=self._px(240))
         cover_frame.pack(side="bottom", fill="x", pady=(0, 8))
         cover_frame.pack_propagate(False)
         self.cover_frame = cover_frame   # 编辑器面板顶边界参照（其底边，V1.8.8）
@@ -2057,6 +2096,23 @@ class LrcPlayerApp:
         current_lyric_count = (self.current_lrc_index + 1) if self.lrc_lines else "---"
         total_lyric_count = len(self.lrc_lines) if self.lrc_lines else "---"
         self.info_var.set(f"音频: {audio_name} | 歌词: {current_lyric_count} / {total_lyric_count}")
+        self._refresh_window_title()
+
+    def _refresh_window_title(self) -> None:
+        """刷新窗口标题（V1.11.1）。
+
+        已加载曲目：「歌曲名 - Player PRO Vx.y.z」；未加载：「Player PRO Vx.y.z」
+        （不再附加「缩小兼容模式」，小屏提示仅保留在状态栏）。
+        """
+        path = getattr(self, "audio_path", None)
+        try:
+            if path:
+                name = os.path.splitext(os.path.basename(path))[0]
+                self.root.title(f"{name} - {APP_NAME} V{APP_VERSION}")
+            else:
+                self.root.title(f"{APP_NAME} V{APP_VERSION}")
+        except tk.TclError:
+            pass
 
     # ==================================================================
     # 进度条
@@ -2637,6 +2693,7 @@ class LrcPlayerApp:
         self.current_lrc_index = -1
         self._reset_playback_state()
         self._refresh_lyric_display()
+        self._update_info()   # 信息行 + 窗口标题回默认（V1.11.1）
         self._clear_song_info()
         self._show_default_cover()
         # 清空插播
@@ -2762,12 +2819,15 @@ class LrcPlayerApp:
         self._update_lyric_bar()
 
     def _sync_translation(self, current_time: float | None = None) -> None:
-        """按**独立时间轴**同步翻译行（V1.12.0）。
+        """按**独立时间轴**同步翻译行（V1.12.0；V1.11.1 增加「下一句」补位）。
 
         主歌词与翻译分别解析、互不依赖：以「当前播放时间扣除歌词偏移」在
         翻译时间轴上二分取最近一条，该翻译从自身时间戳起一直显示到下一
-        条翻译为止；无翻译（首条之前 / 整首无翻译）时留空。
-        仅在文本变化时刷新控件，避免每帧重绘。
+        条翻译为止。**无翻译时段**（首条翻译之前 / 整首无翻译 / 命中
+        `[tr mm:ss.xxx]` 后方无内容的空行）改为显示**下一句主歌词**作为
+        占位提示；末句之后没有下一句则不显示（V1.11.1）。
+        真实翻译在主界面加「译：」前缀，占位不加；浮层不加前缀（V1.11.2）。
+        仅在显示内容或占位状态变化时刷新控件，避免每帧重绘。
         """
         if current_time is None:
             current_time = self._current_time()
@@ -2777,11 +2837,66 @@ class LrcPlayerApp:
             idx = bisect_right(self.lrc_trans_times, lookup) - 1
             if idx >= 0:
                 text = self.lrc_trans_lines[idx][1]
-        if text == self._cur_trans_text:
+        placeholder = False
+        if not text.strip():
+            # 无翻译 → 以「下一句歌词」占位（V1.11.1）
+            text = self._next_stem_text(lookup)
+            placeholder = bool(text)
+        if (text == self._cur_trans_text
+                and placeholder == self._cur_trans_is_placeholder):
             return
         self._cur_trans_text = text
-        self.trans_line_var.set(text)
-        self._set_overlay_translation(text)
+        self._cur_trans_is_placeholder = placeholder
+        # 主界面：真实翻译加「译：」前缀；占位（下一句歌词）不加（V1.11.2）
+        self.trans_line_var.set(
+            text if placeholder else (TRANSLATION_PREFIX + text if text else ""))
+        # 浮层保持原样（不加前缀）；复制用 _cur_trans_text（纯正文）
+        # 无翻译/占位时浮层隐藏该行（V1.11.3）
+        self._set_overlay_translation(text, placeholder)
+
+    # ------------------------------------------------------------------
+    # 歌词「主干句」辅助（V1.11.1：整句复制 / 下一句补位 / 浮层双击跳转）
+    # ------------------------------------------------------------------
+
+    def _stem_group_index(self, line_index: int) -> int:
+        """返回主歌词行所属的「主干分组」索引（逐字中间态归入其所属组）。"""
+        if not self.lrc_lines:
+            return -1
+        stem = self._build_lyric_stem(self.lrc_lines)
+        if not stem:
+            return -1
+        cur = min(max(line_index, 0), len(self.lrc_lines) - 1)
+        g = bisect_right(stem, cur) - 1
+        if cur not in stem:
+            g += 1   # 逐字中间态属于下一个主干分组
+        return g
+
+    def _current_stem_text(self) -> str:
+        """当前正在唱的主干歌词整句（逐字中间态时取完整句，V1.11.1）。"""
+        if not self.lrc_lines:
+            return ""
+        stem = self._build_lyric_stem(self.lrc_lines)
+        if not stem:
+            return ""
+        cur = self.current_lrc_index if self.current_lrc_index >= 0 else 0
+        g = min(max(self._stem_group_index(cur), 0), len(stem) - 1)
+        return self.lrc_lines[stem[g]][1].strip()
+
+    def _next_stem_text(self, lookup: float) -> str:
+        """取「下一句」主干歌词文本；末句之后返回空串（V1.11.1）。"""
+        if not self.lrc_lines:
+            return ""
+        stem = self._build_lyric_stem(self.lrc_lines)
+        if not stem:
+            return ""
+        cur = bisect_right(self.lrc_times, lookup) - 1
+        if cur < 0:
+            g = 0        # 尚未唱到首句：下一句即第一句主干
+        else:
+            g = self._stem_group_index(cur) + 1
+        if g < 0 or g >= len(stem):
+            return ""
+        return self.lrc_lines[stem[g]][1].strip()
 
     # ==================================================================
     # 全窗口歌词浮层（点击封面打开）
@@ -2920,10 +3035,13 @@ class LrcPlayerApp:
                 anchor="w", justify="left", wraplength=wrap)
             lbl.pack(fill="x", padx=24,
                      pady=(10, 10) if is_middle else 6)
+            # 双击该行：跳转到对应歌词开头（V1.11.1）
+            lbl.bind("<Double-Button-1>",
+                     lambda e, idx=i: self._on_overlay_row_dblclick(idx))
             self._overlay_lyric_vars.append(var)
             self._overlay_lyric_labels.append(lbl)
             if is_middle:
-                # 当前行下方：翻译行（V1.11.0，固定占位；无翻译时留空）
+                # 当前行下方：翻译行（V1.11.0；V1.11.3 无翻译时隐藏该行）
                 if getattr(self, "_overlay_trans_var", None) is None:
                     self._overlay_trans_var = tk.StringVar(value="")
                 self._overlay_trans_label = tk.Label(
@@ -2931,8 +3049,40 @@ class LrcPlayerApp:
                     bg=BG_COLOR, fg=TRANSLATION_COLOR,
                     font=self.overlay_trans_font,
                     anchor="w", justify="left", wraplength=wrap)
-                self._overlay_trans_label.pack(fill="x", padx=24,
-                                               pady=(0, 6))
+                # 只在有真实翻译时 pack（无翻译/占位不占空间，V1.11.3）
+                if (self._cur_trans_text.strip()
+                        and not self._cur_trans_is_placeholder):
+                    self._overlay_trans_label.pack(fill="x", padx=24,
+                                                   pady=(0, 6))
+
+    def _on_overlay_row_dblclick(self, row_index: int) -> None:
+        """浮层双击某行歌词：跳转到该行开头（保持播放/暂停状态，V1.11.1）。"""
+        if not self.lrc_lines or self.duration is None:
+            return
+        vars_ = getattr(self, "_overlay_lyric_vars", [])
+        if not vars_:
+            return
+        middle = len(vars_) // 2
+        cur = self.current_lrc_index if self.current_lrc_index >= 0 else 0
+        cur = min(max(cur, 0), len(self.lrc_lines) - 1)
+        stem = self._build_lyric_stem(self.lrc_lines)
+        if not stem:
+            return
+        g = bisect_right(stem, cur) - 1
+        if cur not in stem:
+            g += 1   # 与 _update_lyric_overlay 的分组定位保持一致
+        target_stem = g + (row_index - middle)
+        if not (0 <= target_stem < len(stem)):
+            return
+        line_index = stem[target_stem]
+        # 偏移补偿：歌词行在 t = line_time + offset/100 时显示
+        start = self.lrc_lines[line_index][0] + self.lrc_offset / 100
+        self._seek_to(max(0.0, min(start, self.duration)))
+        target = float(self.seek_var.get())
+        self.time_var.set(
+            f"{format_time(target)} / {format_time(self.duration)}")
+        self._sync_lyrics(target)
+        self._hint_status(f"已跳转到第 {line_index + 1} 句")
 
     def _on_overlay_configure(self, event: tk.Event) -> None:
         """浮层尺寸变化：更新换行宽度，并按高度防抖调整歌词行数。"""
@@ -3084,13 +3234,37 @@ class LrcPlayerApp:
         vars_[middle].set(self.lrc_lines[cur][1])
         # 翻译行（V1.12.0）：独立时间轴当前值（由 _sync_lyrics 统一维护，
         # 这里只回填缓存，避免浮层刷新反向改写翻译状态）
-        self._set_overlay_translation(self._cur_trans_text)
+        self._set_overlay_translation(self._cur_trans_text,
+                                      self._cur_trans_is_placeholder)
 
-    def _set_overlay_translation(self, text: str) -> None:
-        """设置浮层翻译行文本（浮层未创建时忽略；V1.11.0）。"""
+    def _set_overlay_translation(self, text: str,
+                                 placeholder: bool = False) -> None:
+        """设置浮层翻译行（V1.11.0；V1.11.3 无翻译时隐藏该行）。
+
+        只有**真实翻译**才显示：文本为空或为「下一句歌词」占位（placeholder）
+        时 `pack_forget` 隐藏该行（不占空间，下方歌词行上移）；重新显示时按
+        middle 行之后的位置插回，保持浮层行序。
+        """
         var = getattr(self, "_overlay_trans_var", None)
         if var is not None:
-            var.set(text)
+            var.set(text if (text and not placeholder) else "")
+        lbl = getattr(self, "_overlay_trans_label", None)
+        if lbl is None:
+            return
+        show = bool(text.strip()) and not placeholder
+        try:
+            mapped = bool(lbl.winfo_manager())
+        except tk.TclError:
+            return
+        if show and not mapped:
+            labels = getattr(self, "_overlay_lyric_labels", [])
+            anchor = labels[len(labels) // 2] if labels else None
+            if anchor is not None:
+                lbl.pack(fill="x", padx=24, pady=(0, 6), after=anchor)
+            else:
+                lbl.pack(fill="x", padx=24, pady=(0, 6))
+        elif not show and mapped:
+            lbl.pack_forget()
 
     # ==================================================================
     # 桌面歌词条（独立置顶小窗：关闭 / 顶部 / 底部）

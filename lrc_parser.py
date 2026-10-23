@@ -41,6 +41,8 @@ class LrcParser:
         - 翻译行形如 `[tr mm:ss.xxx]翻译文本`，单独成为一条**独立时间轴**，
           不与主歌词行配对（时间戳不必对应任何歌词行），按时间升序；
         - 同时间戳的翻译行后者覆盖前者；
+        - `[tr mm:ss.xxx]` 后方无内容的空行同样保留，表示「自此刻起无翻译」
+          的时间轴标记（V1.11.1，播放端据此显示「下一句歌词」占位）；
         - `[offset:...]` 同时作用于两条时间轴。
 
         Returns:
@@ -73,8 +75,10 @@ class LrcParser:
                 except ValueError:
                     continue
                 tr_text = cls.TRANSLATION_RE.sub("", raw).strip()
-                if tr_text:
-                    trans_entries[cls.ms_key(ts)] = (ts, tr_text)
+                # 空文本行也保留为时间轴条目（V1.11.1）：
+                # 表示「自此刻起无翻译」，播放端据此显示「下一句歌词」占位；
+                # 同时间戳后者覆盖前者（显式清空同样生效）。
+                trans_entries[cls.ms_key(ts)] = (ts, tr_text)
                 continue
 
             # 解析时间标签 [mm:ss.xx]

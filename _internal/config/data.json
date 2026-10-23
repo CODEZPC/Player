@@ -18,7 +18,12 @@
     "lyric_font": 18
   },
   "folders": [
-    "D:\\codefile\\File\\Music\\MSC"
+    "D:\\codefile\\File\\Music\\MSC\\Codelib",
+    "D:\\codefile\\File\\Music\\MSC\\HoYoMix",
+    "D:\\codefile\\File\\Music\\MSC\\Phigros-OST",
+    "D:\\codefile\\File\\Music\\MSC\\ADOFAI-OST",
+    "D:\\codefile\\File\\Music\\MSC\\PhiloDeka-OST",
+    "D:\\codefile\\File\\Music\\MSC\\ICEY-OST"
   ],
-  "active_folder": "D:\\codefile\\File\\Music\\MSC"
+  "active_folder": "D:\\codefile\\File\\Music\\MSC\\ICEY-OST"
 }
