@@ -8,7 +8,6 @@ python -m nuitka ^
   --windows-console-mode=disable ^
   --enable-plugin=tk-inter ^
   --assume-yes-for-downloads ^
-  --include-data-dir=.\_internal=_internal ^
   --windows-icon-from-ico=.\_internal\Mp.ico ^
   --output-dir=dist ^
   --remove-output ^

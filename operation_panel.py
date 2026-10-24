@@ -179,6 +179,9 @@ class SmoothScrollFrame(tk.Frame):
             widget.bind("<MouseWheel>", self._on_wheel, add="+")   # Win/macOS
             widget.bind("<Button-4>", self._on_wheel, add="+")     # Linux 上滚
             widget.bind("<Button-5>", self._on_wheel, add="+")     # Linux 下滚
+            # Tk 9（本机 9.0.4）：高精度触控板滚动只产生 <TouchpadScroll>，
+            # 不产生 <MouseWheel>，必须单独绑定（V1.12.1）
+            widget.bind("<TouchpadScroll>", self._on_touchpad_scroll, add="+")
         try:
             children = widget.winfo_children()
         except tk.TclError:
@@ -196,6 +199,54 @@ class SmoothScrollFrame(tk.Frame):
         else:                                    # macOS：像素级 delta
             px = -event.delta * 3.0
         self.scroll_by(px)
+
+    def _on_touchpad_scroll(self, event) -> None:
+        """Tk 9 高精度触控板滚动（V1.12.1；V1.12.2 修正方向）。
+
+        Tk 9 的 `<TouchpadScroll>` 在 Windows/macOS 上把触控板双指滚动映射
+        为单一事件，`%D`（即 `event.delta`）是**打包整数**：
+        **X 增量在高 16 位、Y 增量在低 16 位**，各自为有符号 16 位数。
+        旧实现直接把它当垂直位移——水平划产生的巨大高位值被全程当纵向距，
+        表现为「上下划几乎无反应、左右划才滚动且方向错」。
+        现只取 **Y（垂直）分量**并忽略水平分量。
+        """
+        dx, dy = self._split_touchpad_delta(event)
+        if dy == 0:
+            return          # 纯水平滑动：不滚动操作栏
+        px = -dy * 3        # 与 MouseWheel 同号语义（正=向上滚），放大 3 倍更跟手
+        if abs(px) < 4:
+            px = 4 if px > 0 else -4   # 极小增量也保证有反馈
+        self.scroll_by(px)
+
+    @staticmethod
+    def _split_touchpad_delta(event) -> tuple[int, int]:
+        """拆分 TouchpadScroll 的打包 delta → (dx, dy)（V1.12.2）。
+
+        优先调用 Tk 9 自带工具过程 `tk::PreciseScrollDeltas`（与官方语义
+        完全一致），失败时本地按高/低 16 位有符号解包。
+        """
+        raw = getattr(event, "delta", 0) or 0
+        widget = getattr(event, "widget", None)
+        try:
+            interp = widget.tk if widget is not None else None
+            if interp is not None:
+                vals = interp.splitlist(
+                    interp.call("tk::PreciseScrollDeltas", str(raw)))
+                if len(vals) == 2:
+                    return int(vals[0]), int(vals[1])
+        except Exception:
+            pass
+        try:
+            packed = int(raw) & 0xFFFFFFFF
+        except (TypeError, ValueError):
+            return 0, 0
+        dx = packed >> 16
+        dy = packed & 0xFFFF
+        if dx >= 0x8000:
+            dx -= 0x10000
+        if dy >= 0x8000:
+            dy -= 0x10000
+        return dx, dy
 
     def forget(self, widget) -> None:
         """销毁控件前调用，清理滚轮引用避免内存泄漏。"""
@@ -235,6 +286,9 @@ class OperationPanel:
         self.lyric_anchor_btns: dict[str, tk.Button] = {}
         self.mode_btns: dict[str, tk.Button] = {}
         self.topmost_btns: dict[bool, tk.Button] = {}
+        self.global_btns: dict[bool, tk.Button] = {}   # 全局模式（V1.12.0）
+        self.FOOTER_FG = "#6E747C"                     # 底部信息灰色（V1.12.0）
+        self._footer_hours = -1
 
         # 「歌词选项」行引用（模式变化时控制显隐/重排）
         self._lyric_mode_row: tk.Frame | None = None
@@ -253,6 +307,7 @@ class OperationPanel:
         self._build_advanced(inner)
         self._build_options(inner)
         self._build_lyric_options(inner)
+        self._build_footer(inner)          # 底部版本/陪伴时长（V1.12.0）
         self.scroller.bind_wheel()
 
     # ---------------- 便捷引用 ----------------
@@ -465,12 +520,48 @@ class OperationPanel:
                 box, text, lambda m=mode: self.app._set_play_mode(m))
         self.refresh_mode_buttons()
 
+        # 全局模式：开 / 关（V1.12.0；仅列表/随机模式生效，其他模式置灰）
+        # 位置：模式下方、置顶上方（V1.12.1）
+        box = self._build_option_row(opt_frame, "全局")
+        for text, val in (("开", True), ("关", False)):
+            self.global_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self.app._set_global_mode(v))
+        self.refresh_global_buttons()
+
         # 置顶：开 / 关
         box = self._build_option_row(opt_frame, "置顶")
         for text, val in (("开", True), ("关", False)):
             self.topmost_btns[val] = self._make_seam_button(
                 box, text, lambda v=val: self.app._set_topmost(v))
         self.refresh_topmost_buttons()
+
+    def _build_footer(self, parent: tk.Frame) -> None:
+        """操作区底部（V1.12.0）：空出一行，再以灰色显示版本号与陪伴时长。"""
+        from utils import APP_NAME, APP_VERSION
+        footer = tk.Frame(parent, bg=self.BG_COLOR)
+        footer.pack(side="top", fill="x", pady=(0, 12))
+        # 空出一行
+        tk.Frame(footer, bg=self.BG_COLOR,
+                 height=self._px(18)).pack(fill="x")
+        self.footer_version_var = tk.StringVar(
+            value=f"{APP_NAME} V{APP_VERSION}")
+        self.footer_company_var = tk.StringVar(value="")
+        for var in (self.footer_version_var, self.footer_company_var):
+            tk.Label(footer, textvariable=var, bg=self.BG_COLOR,
+                     fg=self.FOOTER_FG, font=self.app.info_font,
+                     anchor="w").pack(anchor="w", pady=(0, 2))
+        self.set_footer_hours(0)
+
+    def set_footer_hours(self, hours: int) -> None:
+        """更新「Player已陪伴你X小时时光」（V1.12.0，同值跳过）。"""
+        h = max(0, int(hours))
+        if h == self._footer_hours:
+            return
+        self._footer_hours = h
+        try:
+            self.footer_company_var.set(f"Player已陪伴你{h}小时时光")
+        except tk.TclError:
+            pass
 
     def _build_lyric_options(self, parent: tk.Frame) -> None:
         """歌词选项区：歌词偏移 / 桌面歌词（锚点与位置）/ 透明度 / 宽度 / 字体。
@@ -1050,6 +1141,22 @@ class OperationPanel:
             try:
                 btn.config(bg=self.ACCENT_COLOR if active else self.SUBTLE_COLOR,
                            fg=self.BG_COLOR if active else self.FG_COLOR)
+            except tk.TclError:
+                pass
+        # 全局模式按钮的可用性随模式变化（V1.12.0）
+        self.refresh_global_buttons()
+
+    def refresh_global_buttons(self) -> None:
+        """刷新全局模式按钮组（V1.12.0）：高亮当前值；非列表/随机模式时置灰。"""
+        usable = self.app.play_mode in ("loop_all", "shuffle")
+        for val, btn in self.global_btns.items():
+            active = (bool(val) == bool(self.app.global_mode))
+            try:
+                btn.config(
+                    state="normal" if usable else "disabled",
+                    bg=self.ACCENT_COLOR if active else self.SUBTLE_COLOR,
+                    fg=self.BG_COLOR if active else self.FG_COLOR,
+                    disabledforeground="#666C74")
             except tk.TclError:
                 pass
 

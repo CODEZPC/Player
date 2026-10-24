@@ -31,6 +31,7 @@ DEFAULTS: dict = {
         "balance": 0.0,
         "gain": 1.0,
         "play_mode": "loop_all",
+        "global_mode": False,   # 全局模式：列表/随机在全部已打开文件夹中执行（V1.12.0）
         "always_on_top": False,
         "lyric_bar": "off",       # 桌面歌词条：off / top / bottom / custom
         "lyric_anchor": "c",     # 自定义锚点（九宫格：tl/t/tr/l/c/r/bl/b/br）
@@ -39,6 +40,7 @@ DEFAULTS: dict = {
         "lyric_alpha": 85,       # 歌词条透明度（30~100 %）
         "lyric_width": 25,       # 歌词条初始宽度（占屏幕 %）
         "lyric_font": 18,        # 歌词条字体大小（px）
+        "play_seconds": 0,       # 累计播放秒数（V1.12.0：操作栏底部「已陪伴你 X 小时」）
     },
 }
 

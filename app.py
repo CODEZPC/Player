@@ -173,8 +173,11 @@ class LrcPlayerApp:
         self._preheat_done = False
         self.play_mode_index = 0
         self.play_mode = PLAY_MODES[self.play_mode_index][1]
+        self.global_mode = False              # 全局模式（V1.12.0：跨文件夹切歌）
         self._play_mode_locked = False        # 歌词编辑器打开期间锁定播放模式
         self._play_mode_saved = self.play_mode  # 锁定前的模式（退出恢复用）
+        self._played_seconds = 0.0            # 累计播放秒数（V1.12.0，持久化）
+        self._footer_sec_snapshot = -1        # 底部陪伴时长上次刷新的整秒值（V1.12.0）
         self._status_hint_timer = None        # 状态栏临时提示定时器（V1.8.5）
         # 封面尺寸：与左栏上部底边对齐（V1.8.9，首次布局后由 _align_cover 校准）
         self._cover_size = self._px(205)
@@ -2114,6 +2117,14 @@ class LrcPlayerApp:
         except tk.TclError:
             pass
 
+    def _refresh_footer_info(self) -> None:
+        """刷新操作栏底部「已陪伴你 X 小时时光」（V1.12.0，圆整小时）。"""
+        hours = int(max(0.0, self._played_seconds) // 3600)
+        try:
+            self.op.set_footer_hours(hours)
+        except Exception:
+            pass
+
     # ==================================================================
     # 进度条
     # ==================================================================
@@ -2297,10 +2308,56 @@ class LrcPlayerApp:
     # 上一曲 / 下一曲
     # ==================================================================
 
+    def _global_playlist(self) -> list[dict]:
+        """全局播放列表：所有已打开文件夹的曲目按标签顺序串联（V1.12.0）。"""
+        out: list[dict] = []
+        for tab in self.folder_tabs:
+            items = tab.get("items") or []
+            out.extend(items)
+        return out
+
+    def _global_index_of(self, path: str | None,
+                         playlist: list[dict] | None = None) -> int | None:
+        """当前曲目在全局播放列表中的索引（无则 None；V1.12.0）。"""
+        if not path:
+            return None
+        items = playlist if playlist is not None else self._global_playlist()
+        for i, it in enumerate(items):
+            if it.get("path") == path:
+                return i
+        return None
+
+    def _load_global_track(self, global_index: int,
+                           autoplay: bool = True) -> bool:
+        """加载全局列表中的曲目；跨文件夹时自动切换选中文件夹（V1.12.0）。"""
+        playlist = self._global_playlist()
+        if not (0 <= global_index < len(playlist)):
+            return False
+        if not playlist[global_index].get("path"):
+            return False
+        offset = 0
+        for fi, tab in enumerate(self.folder_tabs):
+            items = tab.get("items") or []
+            if global_index < offset + len(items):
+                local = global_index - offset
+                if fi != self.active_folder_index:
+                    self._select_folder_by_index(fi)
+                self._load_track_by_index(local, autoplay=autoplay)
+                return True
+            offset += len(items)
+        return False
+
     def _prev_track(self) -> None:
-        """切换到上一首歌曲。"""
+        """切换到上一首歌曲（全局模式下跨全部已打开文件夹，V1.12.0）。"""
         if self._track_switch_guard():
             return
+        if self.global_mode:
+            playlist = self._global_playlist()
+            if playlist:
+                cur = self._global_index_of(self.audio_path, playlist)
+                idx = 0 if cur is None else (cur - 1) % len(playlist)
+                self._load_global_track(idx, autoplay=True)
+                return
         if not self.audio_items:
             return
         if self.current_song_index is None:
@@ -2312,13 +2369,30 @@ class LrcPlayerApp:
         self._load_track_by_index(idx, autoplay=True)
 
     def _next_track(self) -> None:
-        """下一曲：插播优先，否则按播放模式切歌（随机模式下随机选曲）。"""
+        """下一曲：插播优先，否则按播放模式切歌（全局模式下跨全部文件夹，V1.12.0）。"""
         if self._track_switch_guard():
             return
         if self.interlude_items:
             self._stop()
             self._play_next_interlude()
             return
+        if self.global_mode:
+            playlist = self._global_playlist()
+            if playlist:
+                cur = self._global_index_of(self.audio_path, playlist)
+                if self.play_mode == "shuffle":
+                    if cur is None:
+                        idx = random.randrange(len(playlist))
+                    elif len(playlist) == 1:
+                        idx = 0
+                    else:
+                        choices = [i for i in range(len(playlist))
+                                   if i != cur]
+                        idx = random.choice(choices)
+                else:
+                    idx = 0 if cur is None else (cur + 1) % len(playlist)
+                self._load_global_track(idx, autoplay=True)
+                return
         if not self.audio_items:
             return
         if self.play_mode == "shuffle":
@@ -2363,6 +2437,16 @@ class LrcPlayerApp:
         if persist:
             self._schedule_config_save()
         return True
+
+    def _set_global_mode(self, on: bool, persist: bool = True) -> None:
+        """设置全局模式（V1.12.0）：列表/随机在全部已打开文件夹中执行。
+
+        仅在「列表」「随机」模式下生效，其他模式选项区按钮置灰（值保留）。
+        """
+        self.global_mode = bool(on)
+        self.op.refresh_global_buttons()
+        if persist:
+            self._schedule_config_save()
 
     def _lock_play_mode_single(self) -> None:
         """进入歌词编辑：临时锁定播放模式为「关闭」（仅一首，不写入配置）。"""
@@ -2413,6 +2497,8 @@ class LrcPlayerApp:
             # 歌词编辑锁定期间不写临时模式（直接关窗口也保留用户原设置）
             "play_mode": (self._play_mode_saved
                           if self._play_mode_locked else self.play_mode),
+            "global_mode": bool(self.global_mode),
+            "play_seconds": int(self._played_seconds),
             "always_on_top": bool(self.always_on_top),
             "lyric_bar": self._lyric_bar_mode,
             "lyric_anchor": self._lyric_bar_anchor,
@@ -2545,6 +2631,18 @@ class LrcPlayerApp:
         self.play_mode_index = idx
         self.play_mode = PLAY_MODES[idx][1]
         self.op.refresh_mode_buttons()
+
+        # 全局模式（V1.12.0）
+        self.global_mode = bool(cfg.get("global_mode", False))
+        self.op.refresh_global_buttons()
+
+        # 累计播放秒数（V1.12.0：操作栏底部「已陪伴你 X 小时」）
+        try:
+            self._played_seconds = max(
+                0.0, float(cfg.get("play_seconds", 0) or 0))
+        except Exception:
+            self._played_seconds = 0.0
+        self._refresh_footer_info()
 
         # 置顶（直接设置，不走 _set_topmost 以免触发保存）
         top = bool(cfg.get("always_on_top", False))
@@ -2971,8 +3069,8 @@ class LrcPlayerApp:
         self._overlay_lyric_frame.pack(fill="x")
         tk.Frame(right, bg=BG_COLOR).pack(expand=True)  # 底部弹性空间
 
-        self._overlay_lyric_wrap = max(
-            80, int(self.root.winfo_width() * 11 / 20) - 48)
+        self._overlay_lyric_wrap = self._overlay_lyric_wrap_width(
+            self.root.winfo_width())
         self._overlay_lyric_vars = []
         self._overlay_lyric_labels = []
         self._overlay_row_count = 0
@@ -3011,8 +3109,30 @@ class LrcPlayerApp:
             n -= 1
         return max(3, n - 4)
 
+    def _overlay_lyric_wrap_width(self, width: int) -> int:
+        """浮层歌词最大换行宽度（V1.12.3）。
+
+        右栏占窗口宽 11/20；行 Frame 左右各 24px 内边距；行内左侧还有
+        预留的时间按钮（Label `width=9` 字符）——三者均需扣除，否则文字
+        会顶出右栏右侧（旧实现漏扣按钮宽）。
+        """
+        btn_w = 0
+        try:
+            font = self.overlay_lyric_small_font
+            btn_w = max(int(font.measure("0")) * 9,
+                        int(font.measure("[88:88] ▶")))
+        except Exception:
+            btn_w = 0
+        if btn_w <= 0:
+            btn_w = self._px(84)
+        return max(80, int(int(width) * 11 / 20) - 48 - btn_w - 6)
+
     def _rebuild_overlay_lyric_rows(self, count: int) -> None:
-        """重建浮层歌词行（行数变化时调用）：中间行大字，其余小字。"""
+        """重建浮层歌词行（行数变化时调用）：中间行大字，其余小字。
+
+        V1.12.0：每行 = [左侧时间跳转按钮（预留宽度，悬停该行才显示）]
+        + [歌词文本 Label]。
+        """
         frame = getattr(self, "_overlay_lyric_frame", None)
         if frame is None:
             return
@@ -3020,26 +3140,44 @@ class LrcPlayerApp:
             child.destroy()
         self._overlay_lyric_vars = []
         self._overlay_lyric_labels = []
+        self._overlay_lyric_rows = []
+        self._overlay_time_labels = []
+        self._overlay_hover_row = None      # 当前悬停行（V1.12.1）
         self._overlay_row_count = count
         middle = count // 2
-        wrap = getattr(self, "_overlay_lyric_wrap", 0) or max(
-            80, int(self.root.winfo_width() * 11 / 20) - 48)
+        wrap = getattr(self, "_overlay_lyric_wrap", 0) or \
+            self._overlay_lyric_wrap_width(self.root.winfo_width())
         for i in range(count):
             is_middle = (i == middle)
+            row = tk.Frame(frame, bg=BG_COLOR)
+            row.pack(fill="x", padx=24,
+                     pady=(10, 10) if is_middle else 6)
+            # 左侧时间跳转按钮（预留宽度，悬停显示「【mm:ss】▶」；V1.12.0）
+            t_lbl = tk.Label(
+                row, text="", bg=BG_COLOR, fg=ACCENT_COLOR,
+                font=self.overlay_lyric_small_font, width=9,
+                anchor="w", cursor="hand2")
+            t_lbl.pack(side="left")
             var = tk.StringVar(value="")
             lbl = tk.Label(
-                frame, textvariable=var, bg=BG_COLOR,
+                row, textvariable=var, bg=BG_COLOR,
                 fg=ACCENT_COLOR if is_middle else FG_COLOR,
                 font=(self.overlay_lyric_big_font if is_middle
                       else self.overlay_lyric_small_font),
                 anchor="w", justify="left", wraplength=wrap)
-            lbl.pack(fill="x", padx=24,
-                     pady=(10, 10) if is_middle else 6)
-            # 双击该行：跳转到对应歌词开头（V1.11.1）
-            lbl.bind("<Double-Button-1>",
-                     lambda e, idx=i: self._on_overlay_row_dblclick(idx))
+            lbl.pack(side="left", fill="x", expand=True)
+            # 悬停该行显示时间按钮 / 离开隐藏；点击按钮跳转（V1.12.0）
+            for w in (row, t_lbl, lbl):
+                w.bind("<Enter>",
+                       lambda e, idx=i: self._on_overlay_row_hover(idx, True))
+                w.bind("<Leave>",
+                       lambda e, idx=i: self._on_overlay_row_hover(idx, False))
+            t_lbl.bind("<Button-1>",
+                       lambda e, idx=i: self._jump_overlay_row(idx))
             self._overlay_lyric_vars.append(var)
             self._overlay_lyric_labels.append(lbl)
+            self._overlay_lyric_rows.append(row)
+            self._overlay_time_labels.append(t_lbl)
             if is_middle:
                 # 当前行下方：翻译行（V1.11.0；V1.11.3 无翻译时隐藏该行）
                 if getattr(self, "_overlay_trans_var", None) is None:
@@ -3055,39 +3193,107 @@ class LrcPlayerApp:
                     self._overlay_trans_label.pack(fill="x", padx=24,
                                                    pady=(0, 6))
 
-    def _on_overlay_row_dblclick(self, row_index: int) -> None:
-        """浮层双击某行歌词：跳转到该行开头（保持播放/暂停状态，V1.11.1）。"""
-        if not self.lrc_lines or self.duration is None:
-            return
+    def _overlay_row_stem_line(self,
+                              row_index: int) -> tuple[int, float] | None:
+        """浮层第 row_index 行对应的主歌词行索引与时间（无则 None；V1.12.0）。"""
+        if not self.lrc_lines:
+            return None
         vars_ = getattr(self, "_overlay_lyric_vars", [])
         if not vars_:
-            return
+            return None
         middle = len(vars_) // 2
         cur = self.current_lrc_index if self.current_lrc_index >= 0 else 0
         cur = min(max(cur, 0), len(self.lrc_lines) - 1)
         stem = self._build_lyric_stem(self.lrc_lines)
         if not stem:
-            return
+            return None
         g = bisect_right(stem, cur) - 1
         if cur not in stem:
             g += 1   # 与 _update_lyric_overlay 的分组定位保持一致
-        target_stem = g + (row_index - middle)
-        if not (0 <= target_stem < len(stem)):
+        target = g + (row_index - middle)
+        if not (0 <= target < len(stem)):
+            return None
+        # 组首行 = 上一个主干项 + 1（第一个组从 0 开始）：逐字歌词时即为
+        # 该句第一个字所在行，跳转/显示均取「该行开头」而非末字时间（V1.12.3）
+        start_line = (stem[target - 1] + 1) if target > 0 else 0
+        return start_line, self.lrc_lines[start_line][0]
+
+    def _show_overlay_time_hint(self, row_index: int) -> None:
+        """显示某行左侧的时间按钮「[mm:ss] ▶」（V1.12.0；V1.12.1 改格式）。"""
+        labels = getattr(self, "_overlay_time_labels", [])
+        if not (0 <= row_index < len(labels)):
             return
-        line_index = stem[target_stem]
+        info = self._overlay_row_stem_line(row_index)
+        text = f"[{format_time(info[1])}] ▶" if info else ""
+        try:
+            labels[row_index].config(text=text)
+        except tk.TclError:
+            pass
+
+    def _refresh_overlay_time_hint(self) -> None:
+        """悬停行的时间随歌词滚动/跳转实时刷新（V1.12.1）。
+
+        原实现在悬停瞬间写入一次文本，跳转或歌词滚动后仍显示旧时间；
+        现由 `_update_lyric_overlay` 末尾调用本方法重算悬停行文本。
+        """
+        row = getattr(self, "_overlay_hover_row", None)
+        if row is not None:
+            self._show_overlay_time_hint(row)
+
+    def _on_overlay_row_hover(self, row_index: int, show: bool) -> None:
+        """悬停某行歌词：显示/隐藏左侧时间按钮（V1.12.0）。"""
+        if show:
+            self._overlay_hover_row = row_index
+            self._show_overlay_time_hint(row_index)
+            return
+        # 延迟判断：指针在行内子控件间移动会触发 Leave，需确认已真正离开
+        self.root.after_idle(
+            lambda idx=row_index: self._clear_overlay_time_hint_unless_inside(idx))
+
+    def _clear_overlay_time_hint_unless_inside(self, row_index: int) -> None:
+        """指针真正离开该行时清空时间按钮（V1.12.0）。"""
+        rows = getattr(self, "_overlay_lyric_rows", [])
+        if not (0 <= row_index < len(rows)):
+            return
+        try:
+            widget = self.root.winfo_containing(
+                self.root.winfo_pointerx(), self.root.winfo_pointery())
+        except tk.TclError:
+            widget = None
+        node = widget
+        while node is not None:
+            if node == rows[row_index]:
+                return   # 指针仍在该行（含子控件）内
+            node = getattr(node, "master", None)
+        labels = getattr(self, "_overlay_time_labels", [])
+        if 0 <= row_index < len(labels):
+            try:
+                labels[row_index].config(text="")
+            except tk.TclError:
+                pass
+        if getattr(self, "_overlay_hover_row", None) == row_index:
+            self._overlay_hover_row = None
+
+    def _jump_overlay_row(self, row_index: int) -> None:
+        """点击浮层行左侧「【时间】▶」：跳转到该行开头（保持播放/暂停状态）。"""
+        if self.duration is None:
+            return
+        info = self._overlay_row_stem_line(row_index)
+        if info is None:
+            return
+        line_index, line_time = info
         # 偏移补偿：歌词行在 t = line_time + offset/100 时显示
-        start = self.lrc_lines[line_index][0] + self.lrc_offset / 100
+        start = line_time + self.lrc_offset / 100
         self._seek_to(max(0.0, min(start, self.duration)))
         target = float(self.seek_var.get())
         self.time_var.set(
             f"{format_time(target)} / {format_time(self.duration)}")
         self._sync_lyrics(target)
-        self._hint_status(f"已跳转到第 {line_index + 1} 句")
 
     def _on_overlay_configure(self, event: tk.Event) -> None:
         """浮层尺寸变化：更新换行宽度，并按高度防抖调整歌词行数。"""
         left_wrap = max(80, int(event.width * 9 / 20) - 60)
-        lyric_wrap = max(80, int(event.width * 11 / 20) - 48)
+        lyric_wrap = self._overlay_lyric_wrap_width(event.width)
         self._overlay_lyric_wrap = lyric_wrap
         if hasattr(self, "_overlay_name_label"):
             self._overlay_name_label.config(wraplength=left_wrap)
@@ -3132,6 +3338,9 @@ class LrcPlayerApp:
         self._overlay_cover_photo = None
         self._overlay_lyric_vars = []
         self._overlay_lyric_labels = []
+        self._overlay_lyric_rows = []
+        self._overlay_time_labels = []
+        self._overlay_hover_row = None
         self._overlay_lyric_frame = None
         self._overlay_row_count = 0
         self._overlay_trans_label = None
@@ -3210,6 +3419,7 @@ class LrcPlayerApp:
             vars_[middle].set("未加载歌词" if self.lrc_path is None
                               else "未找到时间轴歌词")
             self._set_overlay_translation("")
+            self._refresh_overlay_time_hint()
             return
 
         # 当前行（-1 时按首行处理，与主窗口一致）
@@ -3236,6 +3446,8 @@ class LrcPlayerApp:
         # 这里只回填缓存，避免浮层刷新反向改写翻译状态）
         self._set_overlay_translation(self._cur_trans_text,
                                       self._cur_trans_is_placeholder)
+        # 悬停行的时间按钮随歌词滚动/跳转实时刷新（V1.12.1）
+        self._refresh_overlay_time_hint()
 
     def _set_overlay_translation(self, text: str,
                                  placeholder: bool = False) -> None:
@@ -3257,8 +3469,8 @@ class LrcPlayerApp:
         except tk.TclError:
             return
         if show and not mapped:
-            labels = getattr(self, "_overlay_lyric_labels", [])
-            anchor = labels[len(labels) // 2] if labels else None
+            rows = getattr(self, "_overlay_lyric_rows", [])
+            anchor = rows[len(rows) // 2] if rows else None
             if anchor is not None:
                 lbl.pack(fill="x", padx=24, pady=(0, 6), after=anchor)
             else:
@@ -3583,6 +3795,11 @@ class LrcPlayerApp:
     def _tick(self) -> None:
         """定时器回调：更新进度条、时间、歌词同步，检测曲目结束。"""
         if self.engine.ready and self.is_playing and not self.is_paused:
+            # 累计播放时长（V1.12.0：仅实际播放计，暂停/停止不计）
+            self._played_seconds += TICK_INTERVAL_MS / 1000.0
+            if int(self._played_seconds) != self._footer_sec_snapshot:
+                self._footer_sec_snapshot = int(self._played_seconds)
+                self._refresh_footer_info()
             if not self.engine.is_busy():
                 self._handle_track_end()
             elif not self.user_seeking:
@@ -3615,6 +3832,25 @@ class LrcPlayerApp:
         if self.play_mode == "single":
             self._reset_playback_state()
             return
+
+        # ---- 全局模式：在全部已打开文件夹中继续（V1.12.0）----
+        if self.global_mode:
+            playlist = self._global_playlist()
+            if playlist:
+                cur = self._global_index_of(self.audio_path, playlist)
+                if self.play_mode == "shuffle":
+                    if cur is None:
+                        next_g = random.randrange(len(playlist))
+                    elif len(playlist) == 1:
+                        next_g = 0
+                    else:
+                        choices = [i for i in range(len(playlist))
+                                   if i != cur]
+                        next_g = random.choice(choices)
+                else:   # loop_all
+                    next_g = 0 if cur is None else (cur + 1) % len(playlist)
+                self._load_global_track(next_g, autoplay=True)
+                return
 
         if not self.audio_items or self.current_song_index is None:
             self._reset_playback_state()

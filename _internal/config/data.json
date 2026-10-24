@@ -7,7 +7,9 @@
     "lrc_offset": 0.0,
     "balance": 0.0,
     "gain": 1.0,
-    "play_mode": "loop_one",
+    "play_mode": "shuffle",
+    "global_mode": true,
+    "play_seconds": 13,
     "always_on_top": false,
     "lyric_bar": "off",
     "lyric_anchor": "c",
@@ -25,5 +27,5 @@
     "D:\\codefile\\File\\Music\\MSC\\PhiloDeka-OST",
     "D:\\codefile\\File\\Music\\MSC\\ICEY-OST"
   ],
-  "active_folder": "D:\\codefile\\File\\Music\\MSC\\ICEY-OST"
+  "active_folder": "D:\\codefile\\File\\Music\\MSC\\Codelib"
 }
