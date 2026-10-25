@@ -12,7 +12,8 @@ import config_store
 from operation_panel import OperationPanel
 from lrc_parser import LrcParser
 from audio_engine import AudioEngine
-from cover_utils import extract_cover_art, cover_to_tk_image
+from cover_utils import (
+    extract_cover_art, cover_to_tk_image, cover_to_fill_image)
 from utils import (
     format_time,
     format_hms,
@@ -131,6 +132,9 @@ class LrcPlayerApp:
 
         # ---- 歌词浮层 ----
         self._lyric_overlay = None  # 全窗口歌词浮层 Frame
+        self._cover_fullscreen = None        # 全屏封面 Frame（V1.12.7）
+        self._cover_fullscreen_photo = None  # 全屏封面图（防 GC）
+        self._cover_esc_bind = None          # Esc 关闭绑定 id
         self._overlay_cover_photo = None
         self._overlay_lyric_vars: list[tk.StringVar] = []
 
@@ -3038,6 +3042,9 @@ class LrcPlayerApp:
             left, bg=BG_COLOR, fg=FG_COLOR, text="专辑封面",
             font=self.list_font)
         self._overlay_cover_label.pack(anchor="s", pady=(0, 16))
+        # 点击封面 → 全屏展示（忽略透明边、按原比例；V1.12.7）
+        self._overlay_cover_label.bind(
+            "<Button-1>", self._show_cover_fullscreen)
 
         self._overlay_name_var = tk.StringVar(value="")
         self._overlay_name_label = tk.Label(
@@ -3109,6 +3116,16 @@ class LrcPlayerApp:
             n -= 1
         return max(3, n - 4)
 
+    def _overlay_time_btn_width(self) -> int:
+        """浮层行左侧预留时间按钮的像素宽（V1.12.5；与行内 Label 一致）。"""
+        try:
+            font = self.overlay_lyric_small_font
+            width = max(int(font.measure("0")) * 9,
+                        int(font.measure("[88:88] ▶")))
+        except Exception:
+            width = 0
+        return width if width > 0 else self._px(84)
+
     def _overlay_lyric_wrap_width(self, width: int) -> int:
         """浮层歌词最大换行宽度（V1.12.3）。
 
@@ -3116,16 +3133,8 @@ class LrcPlayerApp:
         预留的时间按钮（Label `width=9` 字符）——三者均需扣除，否则文字
         会顶出右栏右侧（旧实现漏扣按钮宽）。
         """
-        btn_w = 0
-        try:
-            font = self.overlay_lyric_small_font
-            btn_w = max(int(font.measure("0")) * 9,
-                        int(font.measure("[88:88] ▶")))
-        except Exception:
-            btn_w = 0
-        if btn_w <= 0:
-            btn_w = self._px(84)
-        return max(80, int(int(width) * 11 / 20) - 48 - btn_w - 6)
+        btn_w = self._overlay_time_btn_width()
+        return max(80, int(int(width) * 11 / 20) - 16 - btn_w - 6)
 
     def _rebuild_overlay_lyric_rows(self, count: int) -> None:
         """重建浮层歌词行（行数变化时调用）：中间行大字，其余小字。
@@ -3150,14 +3159,20 @@ class LrcPlayerApp:
         for i in range(count):
             is_middle = (i == middle)
             row = tk.Frame(frame, bg=BG_COLOR)
-            row.pack(fill="x", padx=24,
+            row.pack(fill="x", padx=8,
                      pady=(10, 10) if is_middle else 6)
-            # 左侧时间跳转按钮（预留宽度，悬停显示「【mm:ss】▶」；V1.12.0）
+            # 左侧时间跳转按钮（像素定宽容器，悬停显示「[mm:ss] ▶」；V1.12.0/1.12.5）
+            # 用 Frame 固定像素宽而非 Label 的字符宽，才能与翻译行的左缩进精确对齐
+            btn_box = tk.Frame(
+                row, bg=BG_COLOR, width=self._overlay_time_btn_width(),
+                height=int(self.overlay_lyric_small_font.metrics("linespace")))
+            btn_box.pack(side="left")
+            btn_box.pack_propagate(False)
             t_lbl = tk.Label(
-                row, text="", bg=BG_COLOR, fg=ACCENT_COLOR,
-                font=self.overlay_lyric_small_font, width=9,
+                btn_box, text="", bg=BG_COLOR, fg=ACCENT_COLOR,
+                font=self.overlay_lyric_small_font,
                 anchor="w", cursor="hand2")
-            t_lbl.pack(side="left")
+            t_lbl.pack(fill="both", expand=True)
             var = tk.StringVar(value="")
             lbl = tk.Label(
                 row, textvariable=var, bg=BG_COLOR,
@@ -3167,7 +3182,7 @@ class LrcPlayerApp:
                 anchor="w", justify="left", wraplength=wrap)
             lbl.pack(side="left", fill="x", expand=True)
             # 悬停该行显示时间按钮 / 离开隐藏；点击按钮跳转（V1.12.0）
-            for w in (row, t_lbl, lbl):
+            for w in (row, btn_box, t_lbl, lbl):
                 w.bind("<Enter>",
                        lambda e, idx=i: self._on_overlay_row_hover(idx, True))
                 w.bind("<Leave>",
@@ -3190,8 +3205,11 @@ class LrcPlayerApp:
                 # 只在有真实翻译时 pack（无翻译/占位不占空间，V1.11.3）
                 if (self._cur_trans_text.strip()
                         and not self._cur_trans_is_placeholder):
-                    self._overlay_trans_label.pack(fill="x", padx=24,
-                                                   pady=(0, 6))
+                    # 左侧额外缩进时间按钮宽：翻译文字与歌词文字左对齐（V1.12.5）
+                    self._overlay_trans_label.pack(
+                        fill="x",
+                        padx=(8 + self._overlay_time_btn_width(), 8),
+                        pady=(0, 6))
 
     def _overlay_row_stem_line(self,
                               row_index: int) -> tuple[int, float] | None:
@@ -3290,6 +3308,61 @@ class LrcPlayerApp:
             f"{format_time(target)} / {format_time(self.duration)}")
         self._sync_lyrics(target)
 
+    def _show_cover_fullscreen(self, _event: tk.Event | None = None) -> None:
+        """点击浮层封面：在浮层上叠加全屏 frame 展示封面（V1.12.7）。
+
+        自动缩放：忽略四周透明像素（含边角零星非透明点，见
+        `cover_utils._cover_content_bbox`）后按**原比例**等比缩放到窗口内，
+        允许放大；背景使用程序主背景色（V1.12.8）；点击任意处或按 Esc 关闭。
+        """
+        if self._lyric_overlay is None or self._cover_fullscreen is not None:
+            return
+        data = extract_cover_art(self.audio_path) if self.audio_path else None
+        if not data:
+            self._hint_status("当前歌曲无封面")
+            return
+        avail_w = max(80, self.root.winfo_width())
+        avail_h = max(80, self.root.winfo_height())
+        photo = cover_to_fill_image(data, avail_w, avail_h)
+        if photo is None:
+            self._hint_status("封面加载失败")
+            return
+        frame = tk.Frame(self._lyric_overlay, bg=BG_COLOR)
+        frame.place(x=0, y=0, relwidth=1, relheight=1)
+        frame.lift()
+        lbl = tk.Label(frame, image=photo, bg=BG_COLOR, bd=0)
+        lbl.place(relx=0.5, rely=0.5, anchor="center")
+        self._cover_fullscreen = frame
+        self._cover_fullscreen_photo = photo
+        for widget in (frame, lbl):
+            widget.bind(
+                "<Button-1>",
+                lambda e: (self._close_cover_fullscreen(), "break")[1])
+        try:
+            self._cover_esc_bind = self.root.bind(
+                "<Escape>",
+                lambda e: (self._close_cover_fullscreen(), "break")[1],
+                add="+")
+        except tk.TclError:
+            self._cover_esc_bind = None
+
+    def _close_cover_fullscreen(self) -> None:
+        """关闭全屏封面并清理引用（V1.12.7，幂等）。"""
+        if self._cover_esc_bind:
+            try:
+                self.root.unbind("<Escape>", self._cover_esc_bind)
+            except tk.TclError:
+                pass
+        self._cover_esc_bind = None
+        frame = self._cover_fullscreen
+        if frame is not None:
+            try:
+                frame.destroy()
+            except tk.TclError:
+                pass
+        self._cover_fullscreen = None
+        self._cover_fullscreen_photo = None
+
     def _on_overlay_configure(self, event: tk.Event) -> None:
         """浮层尺寸变化：更新换行宽度，并按高度防抖调整歌词行数。"""
         left_wrap = max(80, int(event.width * 9 / 20) - 60)
@@ -3326,6 +3399,7 @@ class LrcPlayerApp:
         """销毁歌词浮层并清理引用。"""
         if self._lyric_overlay is None:
             return
+        self._close_cover_fullscreen()   # 先关全屏封面（V1.12.7）
         timer = getattr(self, "_overlay_rows_timer", None)
         if timer:
             try:
@@ -3471,10 +3545,12 @@ class LrcPlayerApp:
         if show and not mapped:
             rows = getattr(self, "_overlay_lyric_rows", [])
             anchor = rows[len(rows) // 2] if rows else None
+            # 左侧缩进时间按钮宽 → 翻译与歌词文字左对齐（V1.12.5）
+            pad = (8 + self._overlay_time_btn_width(), 8)
             if anchor is not None:
-                lbl.pack(fill="x", padx=24, pady=(0, 6), after=anchor)
+                lbl.pack(fill="x", padx=pad, pady=(0, 6), after=anchor)
             else:
-                lbl.pack(fill="x", padx=24, pady=(0, 6))
+                lbl.pack(fill="x", padx=pad, pady=(0, 6))
         elif not show and mapped:
             lbl.pack_forget()
 

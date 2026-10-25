@@ -42,13 +42,82 @@ def extract_cover_art(path: str) -> bytes | None:
 
 
 def cover_to_tk_image(data: bytes, size: int = 220) -> "ImageTk.PhotoImage | None":
-    """将封面字节数据转换为 tkinter PhotoImage。"""
+    """将封面字节数据转换为 tkinter PhotoImage（强制为 size×size 正方形）。"""
     if not _pil_available() or not data:
         return None
     try:
         from io import BytesIO
         image = Image.open(BytesIO(data))
         image = image.resize((size, size), Image.LANCZOS)
+        return ImageTk.PhotoImage(image)
+    except Exception:
+        return None
+
+
+def _cover_content_bbox(image) -> tuple[int, int, int, int]:
+    """主要内容 bbox：忽略四周透明边，并忽略边角零星非透明像素（V1.12.7）。
+
+    部分封面被人工调整过——实际图像只在中间，四周是大量透明像素；另有
+    些图的边角残留几个非透明像素（`getbbox()` 会被它们撑大，导致内容看清
+    很小）。因此按**行/列非透明像素数量**判断：达到阈值（边长 1%，至少 2 像素）
+    才算内容行/列，从四边向内收缩。
+    """
+    width, height = image.size
+    try:
+        alpha = image.getchannel("A")
+    except Exception:
+        return (0, 0, width, height)
+    try:
+        import numpy as np
+        mask = np.asarray(alpha) > 0
+    except Exception:
+        return image.getbbox() or (0, 0, width, height)
+    if not mask.any():
+        return (0, 0, width, height)
+    rows = mask.sum(axis=1)
+    cols = mask.sum(axis=0)
+    row_thr = max(2, int(width * 0.01))
+    col_thr = max(2, int(height * 0.01))
+    top = 0
+    while top < height and rows[top] < row_thr:
+        top += 1
+    bottom = height - 1
+    while bottom > top and rows[bottom] < row_thr:
+        bottom -= 1
+    left = 0
+    while left < width and cols[left] < col_thr:
+        left += 1
+    right = width - 1
+    while right > left and cols[right] < col_thr:
+        right -= 1
+    if right <= left or bottom <= top:
+        return (0, 0, width, height)
+    return (left, top, right + 1, bottom + 1)
+
+
+def cover_to_fill_image(data: bytes, max_w: int, max_h: int
+                        ) -> "ImageTk.PhotoImage | None":
+    """封面 → 全屏展示图（V1.12.7）。
+
+    与 `cover_to_tk_image` 的区别：**不拉伸**——忽略透明边后按**原比例**
+    等比缩放到 `max_w × max_h` 内（允许放大到铺满可用区域），非 1:1 封面
+    不会变形。
+    """
+    if not _pil_available() or not data or max_w <= 0 or max_h <= 0:
+        return None
+    try:
+        from io import BytesIO
+        image = Image.open(BytesIO(data)).convert("RGBA")
+        box = _cover_content_bbox(image)
+        if box != (0, 0, image.width, image.height):
+            image = image.crop(box)
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return None
+        scale = min(max_w / width, max_h / height)
+        new_w = max(1, int(round(width * scale)))
+        new_h = max(1, int(round(height * scale)))
+        image = image.resize((new_w, new_h), Image.LANCZOS)
         return ImageTk.PhotoImage(image)
     except Exception:
         return None
