@@ -135,6 +135,9 @@ class LrcPlayerApp:
         self._cover_fullscreen = None        # 全屏封面 Frame（V1.12.7）
         self._cover_fullscreen_photo = None  # 全屏封面图（防 GC）
         self._cover_esc_bind = None          # Esc 关闭绑定 id
+        # 浮层底部进度块（V1.12.11）
+        self._overlay_progress_bar = None
+        self._overlay_progress_frac = -1.0
         self._overlay_cover_photo = None
         self._overlay_lyric_vars: list[tk.StringVar] = []
 
@@ -3100,6 +3103,32 @@ class LrcPlayerApp:
         # 后创建的两栏 Frame 会盖住先创建的返回按钮，必须提升到最上层
         close_btn.lift()
 
+        # 窗口最底部：3px 色块式进度条（仅 ACCENT 色块，无底槽；V1.12.11）
+        self._overlay_progress_bar = tk.Frame(
+            overlay, bg=ACCENT_COLOR, height=self._px(3))
+        self._overlay_progress_bar.place(x=0, rely=1.0, anchor="sw",
+                                        relwidth=0.0)
+        self._overlay_progress_frac = -1.0
+        self._update_overlay_progress()
+
+    def _update_overlay_progress(self) -> None:
+        """更新浮层底部进度块宽度（V1.12.11，仅展示不交互）。"""
+        bar = self._overlay_progress_bar
+        if bar is None or self._lyric_overlay is None:
+            return
+        duration = self.duration or 0.0
+        if duration <= 0:
+            frac = 0.0
+        else:
+            frac = max(0.0, min(1.0, self._current_time() / duration))
+        if abs(frac - self._overlay_progress_frac) < 0.0005:
+            return        # 变化很小就不重排，避免每帧刷新
+        self._overlay_progress_frac = frac
+        try:
+            bar.place_configure(relwidth=frac)
+        except tk.TclError:
+            pass
+
     def _overlay_target_row_count(self, height: int) -> int:
         """按窗口高度估算可显示的歌词行数（奇数、中间为当前行、最少 3 行）。"""
         try:
@@ -3429,6 +3458,8 @@ class LrcPlayerApp:
         self._overlay_hover_row = None
         self._overlay_lyric_frame = None
         self._overlay_row_count = 0
+        self._overlay_progress_bar = None
+        self._overlay_progress_frac = -1.0
         self._overlay_trans_label = None
         self._overlay_trans_var = None
 
@@ -3901,6 +3932,8 @@ class LrcPlayerApp:
             current = self._current_time()
             self.time_var.set(
                 f"{format_time(current)} / {format_time(self.duration)}")
+        # 浮层底部进度块（浮层未打开时内部直接返回；V1.12.11）
+        self._update_overlay_progress()
         self.root.after(TICK_INTERVAL_MS, self._tick)
 
     def _handle_track_end(self) -> None:
