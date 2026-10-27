@@ -3069,7 +3069,11 @@ class LrcPlayerApp:
 
         # ---- 右栏：歌词（行数随窗口高度动态变化，中间为当前行大字）----
         right = tk.Frame(overlay, bg=BG_COLOR)
-        right.grid(row=0, column=1, sticky="nsew")
+        # 右栏整体左移（V1.12.9）：用 place 精确定位——左栏控件位置不变；
+        # 注意不能靠子控件负 x 溢出：Windows 会裁剪超出父窗口的部分（会截掉
+        # 按钮左侧的「[」，V1.12.10 修正），因此左移放在右栏自身。
+        right.place(relx=0.45, y=0, relheight=1,
+                    x=-self._overlay_lyric_shift(), relwidth=0.55)
 
         tk.Frame(right, bg=BG_COLOR).pack(expand=True)  # 顶部弹性空间
         self._overlay_lyric_frame = tk.Frame(right, bg=BG_COLOR)
@@ -3115,6 +3119,14 @@ class LrcPlayerApp:
         if n % 2 == 0:
             n -= 1
         return max(3, n - 4)
+
+    def _overlay_lyric_shift(self) -> int:
+        """浮层歌词区相对右栏整体左移的像素量（V1.12.9）。
+
+        两栏 9:11 的列宽与左栏控件位置保持不变，仅歌词区（含跳转按钮列）
+        向左平移，使其更靠近左侧封面。
+        """
+        return self._px(24)
 
     def _overlay_time_btn_width(self) -> int:
         """浮层行左侧预留时间按钮的像素宽（V1.12.5；与行内 Label 一致）。"""
@@ -3171,8 +3183,8 @@ class LrcPlayerApp:
             t_lbl = tk.Label(
                 btn_box, text="", bg=BG_COLOR, fg=ACCENT_COLOR,
                 font=self.overlay_lyric_small_font,
-                anchor="w", cursor="hand2")
-            t_lbl.pack(fill="both", expand=True)
+                anchor="w", justify="left", cursor="hand2")
+            t_lbl.pack(side="left", fill="y")   # 自然宽度 + 靠左，文字不居中
             var = tk.StringVar(value="")
             lbl = tk.Label(
                 row, textvariable=var, bg=BG_COLOR,
