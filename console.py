@@ -31,7 +31,7 @@ def _parse_bool(s: str):
 
 
 class PlayerConsole:
-    """控制台窗口：置顶、Jetbrains Mono 字体、输出区/输入区、指令解析执行。"""
+    """控制台窗口：置顶、江城圆体 600W 字体、输出区/输入区、指令解析执行。"""
 
     MODE_MAP = {"list": 0, "single": 1, "only": 2, "random": 3}
     HELP = (
@@ -134,10 +134,8 @@ class PlayerConsole:
         self.entry.focus_set()
 
     def _pick_console_font(self, size: int) -> tkfont.Font:
-        """选择 Jetbrains Mono（缺省回退 Consolas）。"""
-        available = {f.lower() for f in tkfont.families(self.app.root)}
-        family = "Jetbrains Mono" if "jetbrains mono" in available else "Consolas"
-        return tkfont.Font(family=family, size=size)
+        """控制台字体（V1.13.3：统一为江城圆体 600W）。"""
+        return self.app._pick_font("江城圆体 600W", size)
 
     # ------------------------------------------------------------------
     # 窗口控制

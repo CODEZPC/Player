@@ -60,17 +60,17 @@ class SplashWindow(tk.Toplevel):
             tk.Label(self, image=photo, bg=SPLASH_BG).pack(pady=(36, 10))
         else:
             tk.Label(self, text="♪",
-                     font=tkfont.Font(family="Jetbrains mono", size=42),
+                     font=tkfont.Font(family="江城圆体 600W", size=42),
                      fg=SPLASH_ACCENT, bg=SPLASH_BG).pack(pady=(30, 0))
 
         # 应用名
         tk.Label(self, text=app_name,
-                 font=tkfont.Font(family="Jetbrains mono", size=24, weight="bold"),
+                 font=tkfont.Font(family="江城圆体 600W", size=24, weight="bold"),
                  fg=SPLASH_FG, bg=SPLASH_BG).pack()
 
         # 版本号
         tk.Label(self, text=f"V{version}\n请稍后……",
-                 font=tkfont.Font(family="Jetbrains mono", size=14),
+                 font=tkfont.Font(family="江城圆体 600W", size=14),
                  fg=SPLASH_ACCENT, bg=SPLASH_BG).pack(pady=(2, 20))
 
         # 加载进度条（不定模式，滚动动画）

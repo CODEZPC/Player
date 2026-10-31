@@ -313,7 +313,7 @@ class LrcPlayerApp:
         return max(8, int(round(n * self.ui_scale)))
 
     def _pick_font(self, family: str, size: int, weight: str = "normal") -> tkfont.Font:
-        """查找可用字体，降级到系统默认。"""
+        """查找可用字体，降级到系统默认（字体族不存在时 Tk 会自行回退）。"""
         available = list(tkfont.families(self.root))
         lookup = {name.lower(): name for name in available}
         family = lookup.get(family.lower(), family)
@@ -406,7 +406,7 @@ class LrcPlayerApp:
         bar.pack(side="bottom", fill="x")
         bar.pack_propagate(False)
 
-        status_font = tkfont.Font(family="Segoe UI", size=self._font_size(10))
+        status_font = tkfont.Font(family="江城圆体 600W", size=self._font_size(10))
         lbl_cfg = dict(bg=SUBTLE_COLOR, fg=FG_COLOR, font=status_font,
                        anchor="w", padx=6)
 

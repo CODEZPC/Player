@@ -262,15 +262,15 @@ class LyricEditor:
         self._time_edit_active = False     # 时间戳输入框聚焦中（屏蔽快捷键）
         self._place_bind_id = None         # root <Configure> 绑定 id（V1.8.8）
         self._panel_geom: tuple | None = None  # 面板几何缓存（同值跳过 place）
-        # 时间显示专用等宽字体（数字不跳动，宽度可控不截断）
+        # 时间显示字体（统一为江城圆体 600W，V1.13.3）
         self.time_font = self.app._pick_font(
-            "Jetbrains Mono", self.app._font_size(16))
-        # 歌词文本专用等宽字体（列表与内联编辑统一）
+            "江城圆体 600W", self.app._font_size(16))
+        # 歌词文本字体（列表与内联编辑统一）
         self.text_font = self.app._pick_font(
-            "Jetbrains Mono", self.app._font_size(11))
+            "江城圆体 600W", self.app._font_size(11))
         # 顶部预览行字体（与主窗口歌词行同族，小一号）
         self.preview_font = self.app._pick_font(
-            "汉仪文黑-85W", self.app._font_size(14))
+            "江城圆体 600W", self.app._font_size(14))
 
         self._build_ui()
 
@@ -286,7 +286,7 @@ class LyricEditor:
                               highlightthickness=1,
                               highlightbackground=self.SUBTLE_COLOR)
 
-        # ---- 顶部：当前应显示歌词预览（横跨全宽，汉仪文黑-85W）----
+        # ---- 顶部：当前应显示歌词预览（横跨全宽，江城圆体 600W）----
         self.preview_var = tk.StringVar(value="")
         self.preview_label = tk.Label(
             self.frame, textvariable=self.preview_var,
