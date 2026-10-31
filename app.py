@@ -487,6 +487,8 @@ class LrcPlayerApp:
           退出后尊重其最新意图，而不是被还原成进入前的旧状态；
         - 退出全屏时把实际 -topmost 强制同步回 always_on_top，杜绝残留置顶。
         """
+        if self._dialog_open:      # 全窗口弹窗打开时不响应 F11（V1.12.20）
+            return
         state = not bool(self.root.attributes("-fullscreen"))
         if state:
             # 进入全屏：记录用户当前的置顶意图，并复位"全屏期间改过置顶"标记
@@ -2391,10 +2393,10 @@ class LrcPlayerApp:
     def show_dialog(self, title: str, message: str, kind: str = "info",
                     buttons: tuple[tuple[str, str], ...] | None = None,
                     confirm_twice: bool = False) -> str:
-        """全窗口模态弹窗（替代所有 `messagebox`，V1.12.16）。
+        """全窗口模态弹窗（替代所有 `messagebox`；V1.12.20 改为**窗口内 Frame**）。
 
-        实现：覆盖主窗口的 Toplevel 遮罩 + 居中对话框；`grab_set` 与
-        `wait_window` 保证模态同步返回。
+        实现：在主窗口内 `place` 一个铺满的遮罩 Frame + 居中对话框，**不新建窗口**
+        （不产生额外任务栏项/焦点抢占/置顶问题）；模态用 `wait_variable` 同步等待。
         - `kind` 决定配色（info/question 蓝、success 绿、warning 黄、
           error/danger 红，见 `DIALOG_KINDS`）；
         - `buttons` 为 `(文字, 返回值)` 序列，返回被点击项的返回值；
@@ -2409,31 +2411,20 @@ class LrcPlayerApp:
         result: dict[str, str | None] = {"value": None}
         self._dialog_open = True
 
-        top = tk.Toplevel(self.root)
-        top.withdraw()
-        try:
-            top.transient(self.root)
-            top.overrideredirect(True)
-        except tk.TclError:
-            pass
-        top.configure(bg=bg)
-        # 覆盖主窗口（启动早期窗口未映射时覆盖整屏）
+        # 窗口内 Frame 遮罩（V1.12.20：不新建窗口）
         try:
             self.root.update_idletasks()
-            viewable = bool(self.root.winfo_viewable())
-        except tk.TclError:
-            viewable = False
-        if viewable and self.root.winfo_width() > 1:
             w = self.root.winfo_width()
-            h = self.root.winfo_height()
-            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
-        else:
-            w, h = self.screen_w, self.screen_h
-            x = y = 0
-        top.geometry(f"{w}x{h}{x:+d}{y:+d}")
+        except tk.TclError:
+            w = 0
+        if w <= 1:
+            w = self.screen_w
+        overlay = tk.Frame(self.root, bg=bg)
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        overlay.lift()
 
         wrap = max(260, min(int(w * 0.6), self._px(560)))
-        dlg = tk.Frame(top, bg=panel_bg, padx=24, pady=20,
+        dlg = tk.Frame(overlay, bg=panel_bg, padx=24, pady=20,
                        highlightthickness=1, highlightbackground=accent)
         dlg.place(relx=0.5, rely=0.5, anchor="center")
         tk.Label(dlg, text=title, bg=panel_bg, fg=accent,
@@ -2446,14 +2437,21 @@ class LrcPlayerApp:
         row.pack()
         state = {"armed": not confirm_twice}
 
+        done = tk.BooleanVar(master=self.root, value=False)
+        esc_bind = ""
+
         def _close(value: str) -> None:
             result["value"] = value
             try:
-                top.grab_release()
+                self.root.unbind("<Escape>", esc_bind)
+            except Exception:
+                pass
+            try:
+                overlay.destroy()
             except tk.TclError:
                 pass
             try:
-                top.destroy()
+                done.set(True)
             except tk.TclError:
                 pass
 
@@ -2510,15 +2508,14 @@ class LrcPlayerApp:
                     activebackground=accent, activeforeground=BG_COLOR,
                     relief="flat", padx=18, pady=5)
             btn.pack(side="left", padx=8)
-        top.bind("<Escape>", lambda e: _close(buttons[-1][1]))
+        esc_bind = self.root.bind("<Escape>",
+                                  lambda e: _close(buttons[-1][1]), add="+")
+        overlay.lift()
+        # 模态等待：Frame 无法用 wait_window，改用 wait_variable
         try:
-            top.deiconify()
-            top.lift()
-            top.grab_set()
-            top.focus_force()
+            self.root.wait_variable(done)
         except tk.TclError:
             pass
-        self.root.wait_window(top)
         self._dialog_open = False
         return result["value"] or buttons[-1][1]
 
@@ -2563,6 +2560,8 @@ class LrcPlayerApp:
 
     def _toggle_play_pause(self) -> None:
         """播放/暂停切换按钮回调。"""
+        if self._dialog_open:      # 全窗口弹窗打开时不响应空格（V1.12.20）
+            return
         if not self.engine.ready or not self.audio_path:
             return
         if not self.is_playing:
