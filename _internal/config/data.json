@@ -9,7 +9,7 @@
     "gain": 1.0,
     "play_mode": "shuffle",
     "global_mode": true,
-    "play_seconds": 42,
+    "play_seconds": 101,
     "always_on_top": false,
     "lyric_bar": "off",
     "lyric_anchor": "c",

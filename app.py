@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, font as tkfont
 
 import config_store
+import utils
 from operation_panel import OperationPanel
 from lrc_parser import LrcParser
 from audio_engine import AudioEngine
@@ -211,22 +212,25 @@ class LrcPlayerApp:
         self._cover_size = self._px(205)
 
         # ---- 字体（小屏按 ui_scale 缩放）----
-        self.title_font = self._pick_font("汉仪文黑-85W", self._font_size(18))
-        self.lyric_font = self._pick_font("汉仪文黑-85W", self._font_size(13))
-        self.info_font = self._pick_font("Jetbrains Mono", self._font_size(11))
-        self.list_font = self._pick_font("汉仪文黑-85W", self._font_size(11))
-        self.button_font = self._pick_font("汉仪文黑-85W", self._font_size(12))
-        self.button_font_sm = self._pick_font("汉仪文黑-85W", self._font_size(10))
-        self.overlay_name_font = self._pick_font("汉仪文黑-85W", self._font_size(20))
-        self.overlay_artist_font = self._pick_font("汉仪文黑-85W", self._font_size(14))
-        self.overlay_lyric_big_font = self._pick_font("汉仪文黑-85W", self._font_size(24))
-        self.overlay_lyric_small_font = self._pick_font("汉仪文黑-85W", self._font_size(13))
+        # 内置字体（V1.13.1）：main.py 已尝试加载，这里兜底（幂等）；
+        # 未加载时 _pick_font 会回退到系统字体
+        utils.load_bundled_fonts()
+        self.title_font = self._pick_font("江城圆体 600W", self._font_size(18))
+        self.lyric_font = self._pick_font("江城圆体 600W", self._font_size(13))
+        self.info_font = self._pick_font("江城圆体 600W", self._font_size(11))
+        self.list_font = self._pick_font("江城圆体 600W", self._font_size(11))
+        self.button_font = self._pick_font("江城圆体 600W", self._font_size(12))
+        self.button_font_sm = self._pick_font("江城圆体 600W", self._font_size(10))
+        self.overlay_name_font = self._pick_font("江城圆体 600W", self._font_size(20))
+        self.overlay_artist_font = self._pick_font("江城圆体 600W", self._font_size(14))
+        self.overlay_lyric_big_font = self._pick_font("江城圆体 600W", self._font_size(24))
+        self.overlay_lyric_small_font = self._pick_font("江城圆体 600W", self._font_size(13))
         self.lyric_bar_font = self._pick_font(
-            "汉仪文黑-85W", self._font_size(self._lyric_bar_font_size))
+            "江城圆体 600W", self._font_size(self._lyric_bar_font_size))
         # 翻译行字体（V1.11.0）：主界面 12 / 浮层 16（相对歌词行缩小）
-        self.trans_font = self._pick_font("汉仪文黑-85W", self._font_size(12))
+        self.trans_font = self._pick_font("江城圆体 600W", self._font_size(12))
         self.overlay_trans_font = self._pick_font(
-            "汉仪文黑-85W", self._font_size(16))
+            "江城圆体 600W", self._font_size(16))
 
         # ---- 构建 ----
         self._configure_style()
@@ -273,6 +277,12 @@ class LrcPlayerApp:
             else:
                 # 加载失败（极端瞬态）：挂起，预热完成后重试（V1.9.2）
                 self._pending_play_file = initial_file
+
+        # 内置字体加载失败提示（V1.13.1）：等主窗口显示后再弹窗
+        if utils.FONT_LOAD_WARNING:
+            self.root.after(
+                400, lambda: self.show_dialog("内置字体", utils.FONT_LOAD_WARNING,
+                                              kind="warning"))
 
     def handle_external_file(self, path: str) -> None:
         """外部进程打开文件时调用的入口（主线程执行）。"""
@@ -2391,9 +2401,9 @@ class LrcPlayerApp:
             self._seek_to(target)
 
     def show_dialog(self, title: str, message: str, kind: str = "info",
-                    buttons: tuple[tuple[str, str], ...] | None = None,
-                    confirm_twice: bool = False) -> str:
-        """全窗口模态弹窗（替代所有 `messagebox`；V1.12.20 改为**窗口内 Frame**）。
+                buttons: tuple[tuple[str, str], ...] | None = None,
+                confirm_twice: bool = False) -> str:
+        """全窗口模态弹窗（窗口内 Frame 遮罩 + 入场动画）。
 
         实现：在主窗口内 `place` 一个铺满的遮罩 Frame + 居中对话框，**不新建窗口**
         （不产生额外任务栏项/焦点抢占/置顶问题）；模态用 `wait_variable` 同步等待。
@@ -2403,6 +2413,8 @@ class LrcPlayerApp:
           Esc 等同点最后一项（通常是「取消」）；
         - `confirm_twice=True`：第一个按钮需点两次（第二次变红），
           3 秒未再点自动复原。
+        动画：① 中心一点横向拉成线 → ② 线纵向展开成面，
+        展开过程中文本与按钮自上而下依次露出。
         """
         if buttons is None:
             buttons = (("确定", "ok"),)
@@ -2411,7 +2423,6 @@ class LrcPlayerApp:
         result: dict[str, str | None] = {"value": None}
         self._dialog_open = True
 
-        # 窗口内 Frame 遮罩（V1.12.20：不新建窗口）
         try:
             self.root.update_idletasks()
             w = self.root.winfo_width()
@@ -2419,43 +2430,77 @@ class LrcPlayerApp:
             w = 0
         if w <= 1:
             w = self.screen_w
+
+        # ---------- ① 背景：直接铺满，无渐变 ----------
         overlay = tk.Frame(self.root, bg=bg)
         overlay.place(x=0, y=0, relwidth=1, relheight=1)
         overlay.lift()
 
         wrap = max(260, min(int(w * 0.6), self._px(560)))
-        dlg = tk.Frame(overlay, bg=panel_bg, padx=24, pady=20,
-                       highlightthickness=1, highlightbackground=accent)
-        dlg.place(relx=0.5, rely=0.5, anchor="center")
-        tk.Label(dlg, text=title, bg=panel_bg, fg=accent,
-                 font=self.title_font).pack(pady=(0, 12))
-        tk.Label(dlg, text=message, bg=panel_bg, fg=FG_COLOR,
-                 font=self.info_font, justify="center",
-                 wraplength=wrap).pack(pady=(0, 16))
+        line_h = self._px(6)          # 中心点/线高度（V1.13.0：更明显）
+        # ---------- ② 起点：line_h×line_h 的**纯强调色**方块 ----------
+        # 注意：线阶段不带边框、子控件全部隐藏，否则内部 panel_bg 会盖住强调色
+        dlg = tk.Frame(overlay, bg=accent, padx=24, pady=20)
+        dlg.place(relx=0.5, rely=0.5, anchor="center",
+                  width=line_h, height=line_h)
 
+        title_lbl = tk.Label(dlg, text=title, bg=panel_bg, fg=accent,
+                             font=self.title_font)
+        msg_lbl = tk.Label(dlg, text=message, bg=panel_bg, fg=FG_COLOR,
+                           font=self.info_font, justify="center",
+                           wraplength=wrap)
         row = tk.Frame(dlg, bg=panel_bg)
+        title_lbl.pack(pady=(0, 12))
+        msg_lbl.pack(pady=(0, 16))
         row.pack()
         state = {"armed": not confirm_twice}
-
         done = tk.BooleanVar(master=self.root, value=False)
         esc_bind = ""
+        shell: dict[str, tk.Button] = {}
+        anim = {"id": None}
+        closing = {"on": False}
 
         def _close(value: str) -> None:
+            if closing["on"]:
+                return
+            closing["on"] = True
             result["value"] = value
+            if anim["id"] is not None:
+                try:
+                    self.root.after_cancel(anim["id"])
+                except Exception:
+                    pass
+                anim["id"] = None
             try:
                 self.root.unbind("<Escape>", esc_bind)
             except Exception:
                 pass
-            try:
-                overlay.destroy()
-            except tk.TclError:
-                pass
-            try:
-                done.set(True)
-            except tk.TclError:
-                pass
+            # 收回动画（V1.13.0）：面板 → 线 → 点，总计约 230ms
+            cur_w = max(line_h, dlg.winfo_width())
+            cur_h = max(line_h, dlg.winfo_height())
 
-        shell: dict[str, tk.Button] = {}
+            def _shrink_y(e):
+                dlg.place_configure(
+                    width=cur_w,
+                    height=max(line_h, round(cur_h - (cur_h - line_h) * e)))
+
+            def _shrink_x(e):
+                dlg.place_configure(
+                    width=max(line_h, round(cur_w - (cur_w - line_h) * e)),
+                    height=line_h)
+
+            def _finish_close() -> None:
+                try:
+                    overlay.destroy()
+                except tk.TclError:
+                    pass
+                try:
+                    done.set(True)
+                except tk.TclError:
+                    pass
+
+            _tween(130, _shrink_y,
+                   lambda: (_to_line(), _tween(100, _shrink_x, _finish_close)))
 
         def _rearm() -> None:
             state["armed"] = False
@@ -2467,6 +2512,8 @@ class LrcPlayerApp:
                     pass
 
         def _on_primary(value: str) -> None:
+            if closing["on"]:
+                return
             if not state["armed"]:
                 state["armed"] = True
                 btn = shell.get("primary")
@@ -2479,39 +2526,92 @@ class LrcPlayerApp:
                 return
             _close(value)
 
-        # 按钮排布（V1.12.19）：取消类固定最左，主按钮（buttons[0]）放最右
-        # 并用强调色作底色，其余按钮居中
         primary_item = buttons[0]
         others = list(buttons[1:])
-        cancel_items = [b for b in others
-                        if b[1] == "cancel" or b[0] == "取消"]
+        cancel_items = [b for b in others if b[1] == "cancel" or b[0] == "取消"]
         middle_items = [b for b in others if b not in cancel_items]
         ordered = (cancel_items + middle_items + [primary_item]
-                   if len(buttons) > 1 else [primary_item])
+                if len(buttons) > 1 else [primary_item])
         for text, value in ordered:
             is_primary = (text, value) == primary_item
-            if is_primary and confirm_twice:
-                cmd = lambda v=value: _on_primary(v)
-            else:
-                cmd = lambda v=value: _close(v)
+            cmd = (lambda v=value: _on_primary(v)) if (is_primary and confirm_twice) \
+                else (lambda v=value: _close(v))
             if is_primary:
-                btn = tk.Button(
-                    row, text=text, command=cmd,
-                    bg=accent, fg=BG_COLOR, font=self.button_font,
-                    activebackground=BG_COLOR, activeforeground=accent,
-                    relief="flat", padx=18, pady=5)
+                btn = tk.Button(row, text=text, command=cmd,
+                                bg=accent, fg=BG_COLOR, font=self.button_font,
+                                activebackground=BG_COLOR, activeforeground=accent,
+                                relief="flat", padx=18, pady=5)
                 shell["primary"] = btn
             else:
-                btn = tk.Button(
-                    row, text=text, command=cmd,
-                    bg=BG_COLOR, fg=FG_COLOR, font=self.button_font,
-                    activebackground=accent, activeforeground=BG_COLOR,
-                    relief="flat", padx=18, pady=5)
+                btn = tk.Button(row, text=text, command=cmd,
+                                bg=BG_COLOR, fg=FG_COLOR, font=self.button_font,
+                                activebackground=accent, activeforeground=BG_COLOR,
+                                relief="flat", padx=18, pady=5)
             btn.pack(side="left", padx=8)
-        esc_bind = self.root.bind("<Escape>",
-                                  lambda e: _close(buttons[-1][1]), add="+")
-        overlay.lift()
-        # 模态等待：Frame 无法用 wait_window，改用 wait_variable
+
+        # ---------- 量出终点尺寸（先切回面板样式量，再切回线条样式） ----------
+        dlg.configure(bg=panel_bg, highlightthickness=2,
+                      highlightbackground=accent)
+        dlg.update_idletasks()
+        target_w = min(dlg.winfo_reqwidth(), max(120, w - 40))
+        target_h = dlg.winfo_reqheight()
+        # 回到「纯强调色线条」阶段：无边框、内容隐藏
+        title_lbl.pack_forget()
+        msg_lbl.pack_forget()
+        row.pack_forget()
+        dlg.configure(bg=accent, highlightthickness=0)
+
+        def _tween(ms, on_frame, on_done=None):
+            t0 = time.monotonic()
+            def step():
+                anim["id"] = None
+                try:
+                    t = min(1.0, (time.monotonic() - t0) * 1000.0 / max(1, ms))
+                    on_frame(1 - (1 - t) ** 3)      # ease-out cubic
+                    if t < 1.0:
+                        anim["id"] = self.root.after(12, step)
+                    elif on_done is not None:
+                        on_done()
+                except tk.TclError:
+                    pass
+            step()
+
+        def _grow_x(e):                              # 点 → line_h 高强调色横线
+            dlg.place_configure(
+                width=max(line_h, round(line_h + (target_w - line_h) * e)),
+                height=line_h)
+
+        def _to_panel():                             # 线 → 面板：换回面板样式并放出内容
+            title_lbl.pack(pady=(0, 12))
+            msg_lbl.pack(pady=(0, 16))
+            row.pack()
+            dlg.configure(bg=panel_bg, highlightthickness=2,
+                          highlightbackground=accent,
+                          highlightcolor=accent)
+
+        def _to_line():                              # 面板 → 线：隐藏内容并变回纯强调色
+            title_lbl.pack_forget()
+            msg_lbl.pack_forget()
+            row.pack_forget()
+            dlg.configure(bg=accent, highlightthickness=0)
+            dlg.place_configure(height=line_h)
+
+        def _grow_y(e):                              # line_h 线 → 面板高度
+            dlg.place_configure(width=target_w,
+                        height=max(line_h,
+                                   round(line_h + (target_h - line_h) * e)))
+
+        def _anim_done():
+            nonlocal esc_bind
+            if closing["on"]:
+                return
+            esc_bind = self.root.bind("<Escape>",
+                                    lambda e: _close(buttons[-1][1]), add="+")
+
+        # ---------- 入场：点→线、线→面 ----------
+        _tween(200, _grow_x,
+               lambda: (_to_panel(), _tween(180, _grow_y, _anim_done)))
+
         try:
             self.root.wait_variable(done)
         except tk.TclError:

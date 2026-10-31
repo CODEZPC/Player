@@ -20,6 +20,7 @@ import time
 import tkinter as tk
 
 import ipc
+import utils
 from utils import APP_NAME, APP_VERSION
 from splash import SplashWindow
 
@@ -69,6 +70,9 @@ def main() -> None:
     # 1. 建隐藏根窗口 + 启动画面（在重量级模块导入前弹出，掩盖等待）
     root = tk.Tk()
     root.withdraw()
+    # 内置字体（V1.13.1）：必须在创建启动画面/任何 Font 之前加载，
+    # 否则首帧会回退到系统字体（私有字体仅本进程可见，无需安装）
+    utils.load_bundled_fonts()
     splash = SplashWindow(root, APP_VERSION, APP_NAME)
     root.update()
 

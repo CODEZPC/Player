@@ -1,4 +1,4 @@
-"""共享工具函数 —— 无外部业务依赖的纯工具。"""
+﻿"""共享工具函数 —— 无外部业务依赖的纯工具。"""
 
 import os
 import sys
@@ -15,7 +15,7 @@ if TYPE_CHECKING:   # 仅类型检查：app 依赖 utils，运行时导入会循
 # ===========================================================================
 
 APP_NAME = "Player PRO"
-APP_VERSION = "1.12.20"
+APP_VERSION = "1.13.2"
 
 
 # ===========================================================================
@@ -177,3 +177,47 @@ def resource_path(relative_path: str) -> str:
             base_path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), "_internal")
     return os.path.join(base_path, relative_path)
+
+
+# ===========================================================================
+# 内置字体（V1.13.1：随程序打包，未安装系统字体也能用）
+# ===========================================================================
+
+BUNDLED_FONT_REL = "fonts/JC-600W.ttf"   # 相对 `_internal` 的路径（ASCII 文件名：避免打包脚本中文路径乱码）
+FONT_LOAD_WARNING = ""      # 加载失败时的提示文本（空 = 正常）
+_fonts_loaded = False       # 幂等标记
+
+
+def load_bundled_fonts() -> tuple[bool, str]:
+    """加载随程序打包的字体（Windows `AddFontResourceExW` 私有字体，无需安装）。
+
+    幂等：重复调用只生效一次。返回 `(是否成功, 失败原因)`；失败原因同时
+    写入模块级 `FONT_LOAD_WARNING`，供主窗口建成后弹窗提示。
+    非 Windows 平台直接跳过（不算失败）。
+    """
+    global _fonts_loaded, FONT_LOAD_WARNING
+    if _fonts_loaded:
+        return (FONT_LOAD_WARNING == ""), FONT_LOAD_WARNING
+    _fonts_loaded = True
+    if os.name != "nt":
+        FONT_LOAD_WARNING = ""
+        return True, ""
+    path = resource_path(BUNDLED_FONT_REL)
+    if not os.path.isfile(path):
+        FONT_LOAD_WARNING = (f"内置字体文件缺失：\n{path}\n\n"
+                             "界面将使用系统默认字体。")
+        return False, FONT_LOAD_WARNING
+    try:
+        import ctypes
+        FR_PRIVATE = 0x10        # 仅本进程可用，不写注册表
+        added = ctypes.windll.gdi32.AddFontResourceExW(path, FR_PRIVATE, 0)
+    except Exception as exc:     # noqa: BLE001
+        FONT_LOAD_WARNING = (f"内置字体加载失败：{exc}\n\n"
+                             "界面将使用系统默认字体。")
+        return False, FONT_LOAD_WARNING
+    if not added:
+        FONT_LOAD_WARNING = ("内置字体加载失败（系统未接受该字体文件）：\n"
+                             f"{path}\n\n界面将使用系统默认字体。")
+        return False, FONT_LOAD_WARNING
+    FONT_LOAD_WARNING = ""
+    return True, ""
