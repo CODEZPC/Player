@@ -4,3 +4,5 @@ requests.txt
 note
 web
 .vscode
+_internal/config
+dist/main/_internal/config
