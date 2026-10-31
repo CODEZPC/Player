@@ -9,7 +9,7 @@
     "gain": 1.0,
     "play_mode": "shuffle",
     "global_mode": true,
-    "play_seconds": 13,
+    "play_seconds": 42,
     "always_on_top": false,
     "lyric_bar": "off",
     "lyric_anchor": "c",
@@ -20,12 +20,7 @@
     "lyric_font": 18
   },
   "folders": [
-    "D:\\codefile\\File\\Music\\MSC\\Codelib",
-    "D:\\codefile\\File\\Music\\MSC\\HoYoMix",
-    "D:\\codefile\\File\\Music\\MSC\\Phigros-OST",
-    "D:\\codefile\\File\\Music\\MSC\\ADOFAI-OST",
-    "D:\\codefile\\File\\Music\\MSC\\PhiloDeka-OST",
-    "D:\\codefile\\File\\Music\\MSC\\ICEY-OST"
+    "D:\\codefile\\File\\Music\\MSC"
   ],
-  "active_folder": "D:\\codefile\\File\\Music\\MSC\\Codelib"
+  "active_folder": "D:\\codefile\\File\\Music\\MSC"
 }

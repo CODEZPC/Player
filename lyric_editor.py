@@ -30,7 +30,8 @@
 import os
 import re
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import unicodedata
+from tkinter import filedialog, ttk
 
 from utils import read_text_file
 
@@ -62,17 +63,34 @@ def _split_units(word: str) -> list[str]:
     """把空格分隔的词拆为揭示单元。
 
     连续 ASCII 字母/数字（含 ' ’ -）为一个整体单元（英文按单词揭示）；
-    其余字符（中文、标点等）每字符一个单元。
+    **标点/符号跟随前一个单元**（`Hello,` → 单元 `Hello,`；
+    `阿房宫，` → `阿`,`房`,`宫，`，V1.12.13），行首标点没有前一个单元时
+    单独成单元；其余字符（中文等）每字符一个单元。
     """
     units: list[str] = []
-    pos = 0
-    for m in _ASCII_UNIT_RE.finditer(word):
-        for ch in word[pos:m.start()]:
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            units.append("".join(buf))
+            buf.clear()
+
+    for ch in word:
+        if ch.isspace():
+            flush()          # 空白不产生揭示单元
+        elif _ASCII_UNIT_RE.fullmatch(ch):
+            buf.append(ch)
+        elif unicodedata.category(ch)[0] in ("P", "S"):
+            # 标点/符号：附着到前一个单元（中英文标点行为一致）
+            flush()
+            if units:
+                units[-1] += ch
+            else:
+                units.append(ch)
+        else:
+            flush()
             units.append(ch)
-        units.append(m.group())
-        pos = m.end()
-    for ch in word[pos:]:
-        units.append(ch)
+    flush()
     return units
 
 
@@ -504,11 +522,12 @@ class LyricEditor:
         self._refresh_list()
         if self.lines and not is_prefix_expanded(
                 [l["text"] for l in self.lines]):
-            if messagebox.askyesno(
+            if self.app.show_dialog(
                     "编辑歌词",
                     "当前歌词不是逐字（前缀）歌词。\n"
                     "是否转换为逐字歌词（按字展开）？",
-                    parent=self.app.root):
+                    kind="question",
+                    buttons=(("是", "yes"), ("否", "no"))) == "yes":
                 self._push_undo()
                 self.lines = self._expand_pairs(
                     [(l["time"], l["text"]) for l in self.lines])
@@ -869,8 +888,7 @@ class LyricEditor:
             return
         content = read_text_file(path)
         if content is None:
-            messagebox.showerror("导入歌词", "无法读取文件。",
-                                 parent=self.app.root)
+            self.app.show_dialog("导入歌词", "无法读取文件。", kind="error")
             return
         # 保留导入文件中的翻译行（V1.11.0）
         self._kept_translation_lines = [
@@ -879,16 +897,17 @@ class LyricEditor:
         ]
         pairs = parse_lines(content)
         if not pairs:
-            messagebox.showwarning("导入歌词", "文件中没有可用的歌词行。",
-                                   parent=self.app.root)
+            self.app.show_dialog("导入歌词", "文件中没有可用的歌词行。",
+                                 kind="warning")
             return
         expand = False
         if not is_prefix_expanded([t for _, t in pairs]):
-            expand = messagebox.askyesno(
+            expand = self.app.show_dialog(
                 "导入歌词",
                 "该文件不是逐字（前缀）歌词。\n"
                 "是否转换为逐字歌词（按字展开）？",
-                parent=self.app.root)
+                kind="question",
+                buttons=(("是", "yes"), ("否", "no"))) == "yes"
         self._push_undo()
         if expand:
             self.lines = self._expand_pairs(pairs)
@@ -912,22 +931,24 @@ class LyricEditor:
         audio = self.app.audio_path
         if audio:
             name = os.path.splitext(os.path.basename(audio))[0] or "未命名"
-            ans = messagebox.askyesnocancel(
+            ans = self.app.show_dialog(
                 "完成编辑",
                 f"是否保存到歌曲同名歌词文件？\n{name}.lrc",
-                parent=self.app.root)
-            if ans is None:
+                kind="question",
+                buttons=(("是", "yes"), ("否", "no"), ("取消", "cancel")))
+            if ans == "cancel":
                 return
-            if ans and not self._save_to_song(audio):
+            if ans == "yes" and not self._save_to_song(audio):
                 return
         else:
-            ans = messagebox.askyesnocancel(
+            ans = self.app.show_dialog(
                 "完成编辑",
                 "当前没有播放歌曲，是否导出歌词到文件？",
-                parent=self.app.root)
-            if ans is None:
+                kind="question",
+                buttons=(("是", "yes"), ("否", "no"), ("取消", "cancel")))
+            if ans == "cancel":
                 return
-            if ans and not self.export_file():
+            if ans == "yes" and not self.export_file():
                 return
         self.hide()
 
@@ -951,8 +972,7 @@ class LyricEditor:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self._to_lrc_text())
         except OSError as e:
-            messagebox.showerror("导出歌词", f"写入失败：{e}",
-                                 parent=self.app.root)
+            self.app.show_dialog("导出歌词", f"写入失败：{e}", kind="error")
             return False
         return True
 
@@ -983,8 +1003,7 @@ class LyricEditor:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(self._to_lrc_text())
         except OSError as e:
-            messagebox.showerror("保存歌词", f"写入失败：{e}",
-                                 parent=self.app.root)
+            self.app.show_dialog("保存歌词", f"写入失败：{e}", kind="error")
             return False
         try:
             self.app._load_lrc_file(target)

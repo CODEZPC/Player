@@ -6,7 +6,7 @@ import threading
 import time
 from bisect import bisect_right
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, font as tkfont
+from tkinter import ttk, filedialog, font as tkfont
 
 import config_store
 from operation_panel import OperationPanel
@@ -39,10 +39,21 @@ FG_COLOR = "#C8C8C8"
 ACCENT_COLOR = "#6FA3FF"
 SUBTLE_COLOR = "#3A3F46"
 TRANSLATION_COLOR = "#9AA0A6"   # 翻译行文字色（V1.11.0：略暗于主歌词）
-TRANSLATION_PREFIX = "译："      # 主界面翻译行前缀（V1.11.2；仅真实翻译，占位不加）
+TRANSLATION_PREFIX = "译："      # 旧版主界面翻译行前缀（V1.11.2；V1.12.12 起已不使用，保留以备回退）
 BUTTON_WIDTH = 10
 TICK_INTERVAL_MS = 10
+OVERLAY_IDLE_HIDE_MS = 3000      # 浮层鼠标空闲后隐藏光标/跳转按钮的延迟（V1.12.13）
 INIT_STATUS_TEXT = "正在初始化…"     # 预热完成前的状态栏提示（V1.9.2）
+
+# 全窗口弹窗配色（V1.12.16）：kind → (遮罩背景, 强调色)
+DIALOG_KINDS = {
+    "info":     ("#242B33", ACCENT_COLOR),
+    "question": ("#242B33", ACCENT_COLOR),
+    "success":  ("#1E2F26", "#4CAF50"),
+    "warning":  ("#332C1C", "#FFD54F"),
+    "error":    ("#331F1F", "#FF5555"),
+    "danger":   ("#331F1F", "#FF5555"),
+}
 
 PLAY_MODES = [
     ("列表循环", "loop_all"),
@@ -88,6 +99,8 @@ class LrcPlayerApp:
         # 窗口标题（V1.11.1）：未加载曲目时「Player PRO Vx.y.z」，
         # 不再附加「缩小兼容模式」（小屏提示仅保留在状态栏）
         self._refresh_window_title()
+        # 标题栏配色（V1.12.13）：等窗口映射后再调 DWM（自实现，不用 pywinstyles）
+        self.root.after(0, self._apply_title_bar_style)
         self.root.configure(bg=BG_COLOR)
         self.root.minsize(self._px(1280), self._px(660))
         self.root.resizable(True, True)
@@ -119,6 +132,7 @@ class LrcPlayerApp:
         self._bg_cache_index = 0
         self._bg_cache_gen = 0
         self._first_scan_done = False
+        self._reload_restore_path: str | None = None   # 重载后待恢复高亮的曲目（V1.12.15）
         self._info_req_id = 0
         self.interlude_items: list[dict] = []
         self._cover_photo = None
@@ -138,6 +152,13 @@ class LrcPlayerApp:
         # 浮层底部进度块（V1.12.11）
         self._overlay_progress_bar = None
         self._overlay_progress_frac = -1.0
+        # 浮层鼠标空闲自动隐藏（V1.12.13）
+        self._overlay_idle_timer = None      # 空闲计时器 id
+        self._overlay_cursor_hidden = False  # 当前是否已隐藏光标
+        self._overlay_cursor_saved: list[tuple[tk.Misc, str]] = []
+        self._overlay_event_binds: list[tuple[str, str]] = []
+        # 全窗口弹窗开启标记（V1.12.16，防重入）
+        self._dialog_open = False
         self._overlay_cover_photo = None
         self._overlay_lyric_vars: list[tk.StringVar] = []
 
@@ -210,14 +231,17 @@ class LrcPlayerApp:
         # ---- 构建 ----
         self._configure_style()
         self._build_ui()
+        # 启动即显示底部面板（文件夹列表 + 歌曲列表）：否则未打开文件夹时
+        # 「尚未加载文件夹」提示根本看不到（V1.12.15）
+        self._ensure_bottom_shown()
 
         # 探测在后台预热完成后进行（V1.9.0，见 _on_heavy_modules_ready）：
         # 正常启动为 pending（未探测）；仅「已探测且失败」时在此警告
         self._backend_warned = False
         if self.engine.backend == "none":
             self._disable_audio_controls()
-            messagebox.showwarning(
-                "音频后端", "音频后端不可用（需 sounddevice）。")
+            self.show_dialog("音频后端", "音频后端不可用（需 sounddevice）。",
+                             kind="warning")
             self._backend_warned = True
 
         # 非 sounddevice 后端不支持倍速/保音高/平衡/增益，禁用对应控件
@@ -376,9 +400,9 @@ class LrcPlayerApp:
         lbl_cfg = dict(bg=SUBTLE_COLOR, fg=FG_COLOR, font=status_font,
                        anchor="w", padx=6)
 
-        # 程序状态 + 文字进度条（w=210）
+        # 程序状态 + 文字进度条（w=630：V1.12.16 就绪栏加宽到 3 倍）
         prog_frame = tk.Frame(bar, bg=SUBTLE_COLOR,
-                              width=self._px(210), height=self._px(24))
+                              width=self._px(630), height=self._px(24))
         prog_frame.pack(side="left")
         prog_frame.pack_propagate(False)
         self._prog_var = tk.StringVar(value="就绪")
@@ -478,6 +502,9 @@ class LrcPlayerApp:
             # 始终把实际置顶同步为用户意图，杜绝残留
             self.root.attributes("-topmost", self.always_on_top)
             self.op.refresh_topmost_buttons()
+            # 退出全屏时 Windows 会重建窗口框并丢失 DWM 属性（标题栏变白），
+            # 延迟一点重新应用配色（V1.12.14）
+            self.root.after(60, self._apply_title_bar_style)
 
     def _build_header(self, parent: tk.Frame) -> None:
         """顶部：当前歌词行 + 音视频信息行。"""
@@ -746,9 +773,18 @@ class LrcPlayerApp:
         tk.Label(parent, text="文件夹", bg=BG_COLOR, fg=FG_COLOR,
                  font=self.list_font, anchor="w").pack(anchor="w")
 
+        # 「重载」按钮（V1.12.15）：重新扫描全部文件夹，应对文件新增/删除；
+        # 先 pack 在底部，列表区域自然缩短一点高度
+        self.folder_reload_btn = tk.Button(
+            parent, text="重载", command=self._reload_all_folders,
+            bg=SUBTLE_COLOR, fg=FG_COLOR,
+            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
+            relief="flat", bd=0, padx=6, pady=2,
+            font=self.button_font_sm)
+        self.folder_reload_btn.pack(side="bottom", fill="x", pady=(4, 0))
+
         inner = tk.Frame(parent, bg=BG_COLOR)
         inner.pack(fill="both", expand=True, pady=(2, 0))
-
         self.folder_list = tk.Listbox(
             inner,
             bg=BG_COLOR, fg=FG_COLOR, font=self.list_font,
@@ -782,6 +818,20 @@ class LrcPlayerApp:
     # ==================================================================
     # 多文件夹：刷新 / 添加 / 选中 / 删除
     # ==================================================================
+
+    def _reload_all_folders(self) -> None:
+        """重新扫描全部已打开文件夹（V1.12.15，应对文件新增/删除）。
+
+        保留当前播放（扫描不影响播放），扫描完成后若正在播放的曲目仍在
+        列表里则恢复高亮/选中（见 `_restore_reload_highlight`）。
+        """
+        if not self.folder_tabs:
+            self._hint_status("尚未打开文件夹")
+            return
+        self._reload_restore_path = self.audio_path
+        self._hint_status(f"正在重载 {len(self.folder_tabs)} 个文件夹…")
+        for i in range(len(self.folder_tabs)):
+            self._start_folder_scan(i)
 
     def _refresh_folder_list(self) -> None:
         """重建文件夹列表显示，并同步高亮当前选中项。"""
@@ -1419,8 +1469,9 @@ class LrcPlayerApp:
             self._disable_audio_controls()
             if not self._backend_warned:
                 self._backend_warned = True
-                messagebox.showwarning(
-                    "音频后端", "音频后端不可用（需 sounddevice）。")
+                self.show_dialog(
+                    "音频后端", "音频后端不可用（需 sounddevice）。",
+                    kind="warning")
         elif self.engine.backend != "sounddevice":
             self._disable_op_controls()
         self._audio_var.set(self._read_audio_info())
@@ -1711,7 +1762,33 @@ class LrcPlayerApp:
             self._refresh_song_list()
             self._update_controls_state()
             self._start_bg_cache()
+            self._restore_reload_highlight()   # 重载后恢复播放曲目高亮（V1.12.15）
         self._refresh_folder_list()
+
+    def _restore_reload_highlight(self) -> None:
+        """「重载」后把正在播放的曲目重新高亮（V1.12.15）。
+
+        文件仍存在 → 选中并滚动到该行；已被删除 → 清除待恢复标记，
+        播放继续但列表无高亮。
+        """
+        path = getattr(self, "_reload_restore_path", None)
+        if not path:
+            return
+        self._reload_restore_path = None
+        key = os.path.normcase(path)
+        for i, item in enumerate(self.audio_items):
+            if os.path.normcase(str(item.get("path") or "")) == key:
+                self.current_song_index = i
+                self.viewed_song_index = i
+                try:
+                    self.song_list.selection_clear(0, "end")
+                    self.song_list.selection_set(i)
+                    self.song_list.see(i)
+                except tk.TclError:
+                    pass
+                self._update_controls_state()
+                self._refresh_il_buttons()
+                return
 
     def _start_bg_cache(self) -> None:
         """启动后台时长缓存（针对当前 audio_items，静默后台，不占用主状态条）。
@@ -1961,7 +2038,7 @@ class LrcPlayerApp:
         if not path:
             return
         if not self._load_audio_file(path):
-            messagebox.showerror("加载音频", "无法加载音频文件。")
+            self.show_dialog("加载音频", "无法加载音频文件。", kind="error")
             return
         self._auto_load_lrc(path)
 
@@ -2057,7 +2134,7 @@ class LrcPlayerApp:
         """加载并解析 LRC 歌词文件。"""
         content = read_text_file(path)
         if content is None:
-            messagebox.showerror("加载歌词", "无法读取 LRC 文件。")
+            self.show_dialog("加载歌词", "无法读取 LRC 文件。", kind="error")
             self._clear_lrc()
             return
         self.lrc_lines, self.lrc_trans_lines = LrcParser.parse_full(content)
@@ -2124,6 +2201,155 @@ class LrcPlayerApp:
         except tk.TclError:
             pass
 
+    def _apply_title_bar_style(self) -> None:
+        """设置窗口标题栏配色（V1.12.13，Windows DWM；V1.12.14 可重复调用）。
+
+        不再使用 pywinstyles：其 `detect()` 用 `GetParent(winfo_id())`，对 Tk
+        根窗口常返回 0（应走 `GetAncestor(..., GA_ROOT)`），且把 `#RRGGBB`
+        直接当 COLORREF 传入（DWM 需要 `0x00BBGGRR`）。这里直接调 DWM 属性：
+        20=深色模式（Win10 1809+）、35=标题栏背景、36=标题文字（Win11）。
+        非 Windows 或调用失败时静默退化为系统默认外观。
+        """
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            import ctypes.wintypes as wintypes
+            user32 = ctypes.windll.user32
+            dwm = ctypes.windll.dwmapi
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            self.root.update_idletasks()   # 确保顶层 wrapper HWND 已建立
+            hwnd = (user32.GetAncestor(self.root.winfo_id(), 2)   # GA_ROOT
+                    or self.root.winfo_id())
+
+            def _colorref(hex_color: str) -> int:
+                r = int(hex_color[1:3], 16)
+                g = int(hex_color[3:5], 16)
+                b = int(hex_color[5:7], 16)
+                return r | (g << 8) | (b << 16)
+
+            def _set(attr: int, value: int) -> None:
+                val = ctypes.c_int(value)
+                dwm.DwmSetWindowAttribute(
+                    wintypes.HWND(hwnd), ctypes.c_uint(attr),
+                    ctypes.byref(val), ctypes.sizeof(val))
+
+            _set(20, 1)                     # DWMWA_USE_IMMERSIVE_DARK_MODE
+            _set(35, _colorref(BG_COLOR))   # DWMWA_CAPTION_COLOR（Win11+）
+            _set(36, _colorref(FG_COLOR))   # DWMWA_TEXT_COLOR（Win11+）
+        except Exception:
+            pass
+
+    # ==================================================================
+    # 歌词偏移写入文件（V1.12.15）
+    # ==================================================================
+
+    def _confirm_apply_lrc_offset(self, offset_units: float) -> None:
+        """「应用」歌词偏移前的全窗口二次确认（V1.12.15；V1.12.16 改用 show_dialog）。
+
+        offset_units 与滑块单位一致（10ms/格，正值=歌词延后）。确认后把该
+        偏移永久写入当前 `.lrc` 的所有带时间戳的行（含 `[tr]` 翻译行；文件
+        第一行标题不处理），再把偏移重置为 0（歌词显示时机不变）。
+        """
+        if not self.lrc_path or not os.path.isfile(self.lrc_path):
+            self._hint_status("当前没有歌词文件，无法应用偏移")
+            return
+        if self._dialog_open:
+            return
+        ms = int(round(offset_units * 10))
+        name = os.path.basename(self.lrc_path)
+        if ms == 0:
+            body = f"{name}\n\n当前偏移为 0ms，歌词时间戳不会改变。\n\n是否继续？"
+        else:
+            body = (f"{name}\n\n"
+                    f"将把 {ms:+d}ms 写入歌词文件：除第一行标题外，所有带时间戳\n"
+                    "的行（含翻译行）都按此值调整，然后把偏移重置为 0\n"
+                    "（歌词显示时机保持不变）。\n\n是否继续？")
+        ans = self.show_dialog(
+            "应用歌词偏移", body, kind="success",
+            buttons=(("应用", "apply"), ("取消", "cancel")))
+        if ans == "apply":
+            self._do_apply_lrc_offset(offset_units)
+
+    def _do_apply_lrc_offset(self, offset_units: float) -> None:
+        """确认后执行：写回歌词时间戳并把偏移归 0（V1.12.15）。"""
+        ok, msg = self._apply_lrc_offset_to_file(offset_units)
+        self._hint_status(msg)
+        if not ok:
+            return
+        self.lrc_offset = 0
+        try:
+            self.op.lrc_offset_var.set(0)
+            self.op.lrc_offset_val.config(
+                text="0ms", fg=self.op.lrc_offset_color(0))
+        except Exception:
+            pass
+        self._schedule_config_save()
+        self._sync_lyrics(self._current_time())
+
+    def _apply_lrc_offset_to_file(self,
+                                  offset_units: float) -> tuple[bool, str]:
+        """把偏移量（单位 10ms）写入歌词文件时间戳（V1.12.15）。
+
+        规则：跳过第 1 行（标题）；其余行里所有 `[mm:ss(.xx)]` 与
+        `[tr mm:ss(.xx)]` 时间标签统一 +offset；无时间戳的行保持原样。
+        """
+        path = self.lrc_path
+        if not path or not os.path.isfile(path):
+            return False, "当前没有歌词文件，无法应用偏移"
+        import re
+        delta = offset_units * 10 / 1000.0          # 秒
+        try:
+            text = read_text_file(path)
+        except Exception:
+            return False, "读取歌词文件失败"
+        time_tag = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+        tr_tag = re.compile(r"\[\s*tr\s+(\d+):(\d+(?:\.\d+)?)\s*\]",
+                            re.IGNORECASE)
+        changed = 0
+
+        def _fmt(seconds: float) -> str:
+            total = int(round(max(0.0, seconds) * 1000))
+            minutes, rem = divmod(total, 60000)
+            secs, millis = divmod(rem, 1000)
+            return f"{minutes:02d}:{secs:02d}.{millis:03d}"
+
+        def _shift_tr(match) -> str:
+            nonlocal changed
+            changed += 1
+            t = int(match.group(1)) * 60 + float(match.group(2)) + delta
+            return f"[tr {_fmt(t)}]"
+
+        def _shift_time(match) -> str:
+            nonlocal changed
+            changed += 1
+            t = int(match.group(1)) * 60 + float(match.group(2)) + delta
+            return f"[{_fmt(t)}]"
+
+        out: list[str] = []
+        for idx, line in enumerate(text.splitlines()):
+            if idx == 0 or not line.strip():
+                out.append(line)      # 第一行标题 / 空行不处理
+                continue
+            new_line = tr_tag.sub(_shift_tr, line)
+            new_line = time_tag.sub(_shift_time, new_line)
+            out.append(new_line)
+        if changed == 0:
+            return False, "歌词文件里没有可调整的时间戳"
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as fp:
+                fp.write("\n".join(out) + "\n")
+        except Exception:
+            return False, "写入歌词文件失败"
+        # 重新加载（时间轴已改，稍后偏移归 0 → 显示时机不变）
+        try:
+            self._load_lrc_file(path)
+        except Exception:
+            pass
+        ms = int(round(offset_units * 10))
+        return True, f"已应用 {ms:+d}ms 到歌词文件（{changed} 处时间戳）"
+
     def _refresh_footer_info(self) -> None:
         """刷新操作栏底部「已陪伴你 X 小时时光」（V1.12.0，圆整小时）。"""
         hours = int(max(0.0, self._played_seconds) // 3600)
@@ -2161,6 +2387,140 @@ class LrcPlayerApp:
         self._cancel_frame.place_forget()
         if not self._is_pointer_in_cancel():
             self._seek_to(target)
+
+    def show_dialog(self, title: str, message: str, kind: str = "info",
+                    buttons: tuple[tuple[str, str], ...] | None = None,
+                    confirm_twice: bool = False) -> str:
+        """全窗口模态弹窗（替代所有 `messagebox`，V1.12.16）。
+
+        实现：覆盖主窗口的 Toplevel 遮罩 + 居中对话框；`grab_set` 与
+        `wait_window` 保证模态同步返回。
+        - `kind` 决定配色（info/question 蓝、success 绿、warning 黄、
+          error/danger 红，见 `DIALOG_KINDS`）；
+        - `buttons` 为 `(文字, 返回值)` 序列，返回被点击项的返回值；
+          Esc 等同点最后一项（通常是「取消」）；
+        - `confirm_twice=True`：第一个按钮需点两次（第二次变红），
+          3 秒未再点自动复原。
+        """
+        if buttons is None:
+            buttons = (("确定", "ok"),)
+        bg, accent = DIALOG_KINDS.get(kind, DIALOG_KINDS["info"])
+        panel_bg = SUBTLE_COLOR
+        result: dict[str, str | None] = {"value": None}
+        self._dialog_open = True
+
+        top = tk.Toplevel(self.root)
+        top.withdraw()
+        try:
+            top.transient(self.root)
+            top.overrideredirect(True)
+        except tk.TclError:
+            pass
+        top.configure(bg=bg)
+        # 覆盖主窗口（启动早期窗口未映射时覆盖整屏）
+        try:
+            self.root.update_idletasks()
+            viewable = bool(self.root.winfo_viewable())
+        except tk.TclError:
+            viewable = False
+        if viewable and self.root.winfo_width() > 1:
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        else:
+            w, h = self.screen_w, self.screen_h
+            x = y = 0
+        top.geometry(f"{w}x{h}{x:+d}{y:+d}")
+
+        wrap = max(260, min(int(w * 0.6), self._px(560)))
+        dlg = tk.Frame(top, bg=panel_bg, padx=24, pady=20,
+                       highlightthickness=1, highlightbackground=accent)
+        dlg.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(dlg, text=title, bg=panel_bg, fg=accent,
+                 font=self.title_font).pack(pady=(0, 12))
+        tk.Label(dlg, text=message, bg=panel_bg, fg=FG_COLOR,
+                 font=self.info_font, justify="center",
+                 wraplength=wrap).pack(pady=(0, 16))
+
+        row = tk.Frame(dlg, bg=panel_bg)
+        row.pack()
+        state = {"armed": not confirm_twice}
+
+        def _close(value: str) -> None:
+            result["value"] = value
+            try:
+                top.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                top.destroy()
+            except tk.TclError:
+                pass
+
+        shell: dict[str, tk.Button] = {}
+
+        def _rearm() -> None:
+            state["armed"] = False
+            btn = shell.get("primary")
+            if btn is not None:
+                try:
+                    btn.config(text=buttons[0][0], fg=BG_COLOR)
+                except tk.TclError:
+                    pass
+
+        def _on_primary(value: str) -> None:
+            if not state["armed"]:
+                state["armed"] = True
+                btn = shell.get("primary")
+                if btn is not None:
+                    try:
+                        btn.config(text="确定？再点一次", fg="#7A1010")
+                    except tk.TclError:
+                        pass
+                self.root.after(3000, _rearm)
+                return
+            _close(value)
+
+        # 按钮排布（V1.12.19）：取消类固定最左，主按钮（buttons[0]）放最右
+        # 并用强调色作底色，其余按钮居中
+        primary_item = buttons[0]
+        others = list(buttons[1:])
+        cancel_items = [b for b in others
+                        if b[1] == "cancel" or b[0] == "取消"]
+        middle_items = [b for b in others if b not in cancel_items]
+        ordered = (cancel_items + middle_items + [primary_item]
+                   if len(buttons) > 1 else [primary_item])
+        for text, value in ordered:
+            is_primary = (text, value) == primary_item
+            if is_primary and confirm_twice:
+                cmd = lambda v=value: _on_primary(v)
+            else:
+                cmd = lambda v=value: _close(v)
+            if is_primary:
+                btn = tk.Button(
+                    row, text=text, command=cmd,
+                    bg=accent, fg=BG_COLOR, font=self.button_font,
+                    activebackground=BG_COLOR, activeforeground=accent,
+                    relief="flat", padx=18, pady=5)
+                shell["primary"] = btn
+            else:
+                btn = tk.Button(
+                    row, text=text, command=cmd,
+                    bg=BG_COLOR, fg=FG_COLOR, font=self.button_font,
+                    activebackground=accent, activeforeground=BG_COLOR,
+                    relief="flat", padx=18, pady=5)
+            btn.pack(side="left", padx=8)
+        top.bind("<Escape>", lambda e: _close(buttons[-1][1]))
+        try:
+            top.deiconify()
+            top.lift()
+            top.grab_set()
+            top.focus_force()
+        except tk.TclError:
+            pass
+        self.root.wait_window(top)
+        self._dialog_open = False
+        return result["value"] or buttons[-1][1]
 
     def _is_pointer_in_cancel(self,
                               cancel_widget: tk.Widget | None = None) -> bool:
@@ -2695,79 +3055,17 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _toggle_reset(self) -> None:
-        """点「重置应用」：弹出全屏覆盖确认框（确认需点 2 次）。"""
-        if getattr(self, "_reset_overlay", None) is not None:
+        """点「重置应用」：全窗口危险配色弹窗（确认需点 2 次，V1.12.16）。"""
+        if self._dialog_open:
             return
-        overlay = tk.Frame(self.root, bg=BG_COLOR)
-        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self._reset_overlay = overlay
-        mask = tk.Frame(overlay, bg="#14171C")
-        mask.place(relx=0, rely=0, relwidth=1, relheight=1)
-        mask.bind("<Button-1>", lambda e: self._close_reset_overlay())
-
-        dlg = tk.Frame(overlay, bg=SUBTLE_COLOR, padx=24, pady=20,
-                       highlightthickness=1, highlightbackground=ACCENT_COLOR)
-        dlg.place(relx=0.5, rely=0.5, anchor="center")
-
-        tk.Label(dlg, text="重置所有设置", bg=SUBTLE_COLOR, fg=ACCENT_COLOR,
-                 font=self.title_font).pack(pady=(0, 12))
-        tk.Label(dlg,
-                 text="所有配置和打开的文件夹都会被清除\n"
-                      "（文件不会被删除）\n\n是否继续？",
-                 bg=SUBTLE_COLOR, fg=FG_COLOR, font=self.info_font,
-                 justify="center").pack(pady=(0, 16))
-
-        row = tk.Frame(dlg, bg=SUBTLE_COLOR)
-        row.pack()
-        self._reset_confirm_btn = tk.Button(
-            row, text="重置", command=self._on_reset_confirm,
-            bg=BG_COLOR, fg=FG_COLOR, font=self.button_font,
-            activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
-            relief="flat", padx=18, pady=5)
-        self._reset_confirm_btn.pack(side="left", padx=8)
-        tk.Button(row, text="取消", command=self._close_reset_overlay,
-                  bg=BG_COLOR, fg=FG_COLOR, font=self.button_font,
-                  activebackground=ACCENT_COLOR, activeforeground=BG_COLOR,
-                  relief="flat", padx=18, pady=5).pack(side="left", padx=8)
-        self._reset_confirm_timer = None
-        self._reset_confirm_active = False
-
-    def _on_reset_confirm(self) -> None:
-        """确认按钮：需点 2 次（第二次变红后执行）。"""
-        if self._reset_confirm_active:
+        ans = self.show_dialog(
+            "重置所有设置",
+            "所有配置和打开的文件夹都会被清除\n（文件不会被删除）\n\n是否继续？",
+            kind="danger",
+            buttons=(("重置", "reset"), ("取消", "cancel")),
+            confirm_twice=True)
+        if ans == "reset":
             self._do_reset_all()
-            self._close_reset_overlay()
-            return
-        self._reset_confirm_active = True
-        self._reset_confirm_btn.config(text="确定？再点一次", fg="#FF5555")
-        if self._reset_confirm_timer:
-            self.root.after_cancel(self._reset_confirm_timer)
-        self._reset_confirm_timer = self.root.after(
-            3000, self._reset_reset_confirm)
-
-    def _reset_reset_confirm(self) -> None:
-        """3 秒未二次确认则恢复按钮。"""
-        self._reset_confirm_active = False
-        self._reset_confirm_timer = None
-        if self._reset_confirm_btn is not None:
-            self._reset_confirm_btn.config(text="重置", fg=FG_COLOR)
-
-    def _close_reset_overlay(self) -> None:
-        """关闭重置确认浮层。"""
-        if self._reset_confirm_timer:
-            try:
-                self.root.after_cancel(self._reset_confirm_timer)
-            except Exception:
-                pass
-            self._reset_confirm_timer = None
-        self._reset_confirm_active = False
-        ov = getattr(self, "_reset_overlay", None)
-        if ov is not None:
-            try:
-                ov.destroy()
-            except Exception:
-                pass
-            self._reset_overlay = None
 
     def _do_reset_all(self) -> None:
         """执行重置：清除配置、文件夹、当前播放/插播状态（不删除文件）。"""
@@ -2931,7 +3229,7 @@ class LrcPlayerApp:
         条翻译为止。**无翻译时段**（首条翻译之前 / 整首无翻译 / 命中
         `[tr mm:ss.xxx]` 后方无内容的空行）改为显示**下一句主歌词**作为
         占位提示；末句之后没有下一句则不显示（V1.11.1）。
-        真实翻译在主界面加「译：」前缀，占位不加；浮层不加前缀（V1.11.2）。
+        主界面、浮层与复制均**不带**任何前缀（V1.12.12 起移除「译：」）。
         仅在显示内容或占位状态变化时刷新控件，避免每帧重绘。
         """
         if current_time is None:
@@ -2952,10 +3250,9 @@ class LrcPlayerApp:
             return
         self._cur_trans_text = text
         self._cur_trans_is_placeholder = placeholder
-        # 主界面：真实翻译加「译：」前缀；占位（下一句歌词）不加（V1.11.2）
-        self.trans_line_var.set(
-            text if placeholder else (TRANSLATION_PREFIX + text if text else ""))
-        # 浮层保持原样（不加前缀）；复制用 _cur_trans_text（纯正文）
+        # 主界面直接显示正文（V1.12.12 起不再加「译：」前缀）
+        self.trans_line_var.set(text)
+        # 浮层同样不带前缀；复制用 _cur_trans_text（纯正文）
         # 无翻译/占位时浮层隐藏该行（V1.11.3）
         self._set_overlay_translation(text, placeholder)
 
@@ -3110,6 +3407,115 @@ class LrcPlayerApp:
                                         relwidth=0.0)
         self._overlay_progress_frac = -1.0
         self._update_overlay_progress()
+
+        # 鼠标无操作 3s 后自动隐藏光标与跳转按钮（V1.12.13）
+        self._bind_overlay_idle_events()
+        self._schedule_overlay_idle_hide()
+
+    def _bind_overlay_idle_events(self) -> None:
+        """绑定鼠标活动事件（V1.12.13）。
+
+        绑在 root 上：Tk 的默认 bindtags 中顶层窗口在子控件之后，
+        子控件的 `<Motion>` 等事件仍会到达 root 级绑定。
+        """
+        if self._overlay_event_binds:
+            return
+        for seq in ("<Motion>", "<ButtonPress>", "<ButtonRelease>",
+                    "<MouseWheel>", "<TouchpadScroll>", "<Enter>"):
+            try:
+                bid = self.root.bind(seq, self._on_overlay_activity, add="+")
+                self._overlay_event_binds.append((seq, bid))
+            except tk.TclError:
+                pass
+
+    def _unbind_overlay_idle_events(self) -> None:
+        """解绑鼠标活动事件（V1.12.13）。"""
+        for seq, bid in self._overlay_event_binds:
+            try:
+                self.root.unbind(seq, bid)
+            except Exception:
+                pass
+        self._overlay_event_binds = []
+
+    def _schedule_overlay_idle_hide(self) -> None:
+        """重置空闲计时器（V1.12.13）。"""
+        if self._lyric_overlay is None:
+            return
+        self._cancel_overlay_idle_hide()
+        try:
+            self._overlay_idle_timer = self.root.after(
+                OVERLAY_IDLE_HIDE_MS, self._on_overlay_idle_hide)
+        except tk.TclError:
+            self._overlay_idle_timer = None
+
+    def _cancel_overlay_idle_hide(self) -> None:
+        """取消空闲计时器（V1.12.13）。"""
+        timer = self._overlay_idle_timer
+        self._overlay_idle_timer = None
+        if timer is not None:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:
+                pass
+
+    def _on_overlay_activity(self, _event: tk.Event | None = None) -> None:
+        """鼠标有任何活动：恢复光标并重新计时（V1.12.13）。"""
+        if self._lyric_overlay is None:
+            return
+        self._set_overlay_cursor(False)
+        self._schedule_overlay_idle_hide()
+
+    def _on_overlay_idle_hide(self) -> None:
+        """空闲超时：隐藏光标并收起跳转按钮（V1.12.13）。"""
+        self._overlay_idle_timer = None
+        if self._lyric_overlay is None:
+            return
+        # 光标不会离开控件，不会触发 <Leave>，需主动收起悬停行的时间按钮
+        self._overlay_hover_row = None
+        for lbl in getattr(self, "_overlay_time_labels", []):
+            try:
+                lbl.configure(text="")
+            except tk.TclError:
+                pass
+        self._set_overlay_cursor(True)
+
+    def _set_overlay_cursor(self, hidden: bool) -> None:
+        """隐藏/恢复浮层内所有控件的光标（V1.12.13）。
+
+        光标由最内层控件决定，因此需递归设置每个子控件；隐藏前先记录
+        各自的 cursor 取值，恢复时原样写回。
+        """
+        overlay = self._lyric_overlay
+        if overlay is None:
+            return
+        if hidden:
+            if self._overlay_cursor_hidden:
+                return
+            saved: list[tuple[tk.Misc, str]] = []
+            stack = [overlay]
+            while stack:
+                widget = stack.pop()
+                try:
+                    saved.append((widget, str(widget.cget("cursor"))))
+                    widget.configure(cursor="none")
+                except (tk.TclError, ValueError):
+                    pass
+                try:
+                    stack.extend(widget.winfo_children())
+                except tk.TclError:
+                    pass
+            self._overlay_cursor_saved = saved
+            self._overlay_cursor_hidden = True
+            return
+        if not self._overlay_cursor_hidden:
+            return
+        for widget, cursor in self._overlay_cursor_saved:
+            try:
+                widget.configure(cursor=cursor or "")
+            except tk.TclError:
+                pass
+        self._overlay_cursor_saved = []
+        self._overlay_cursor_hidden = False
 
     def _update_overlay_progress(self) -> None:
         """更新浮层底部进度块宽度（V1.12.11，仅展示不交互）。"""
@@ -3441,6 +3847,9 @@ class LrcPlayerApp:
         if self._lyric_overlay is None:
             return
         self._close_cover_fullscreen()   # 先关全屏封面（V1.12.7）
+        self._cancel_overlay_idle_hide()          # 停空闲计时（V1.12.13）
+        self._set_overlay_cursor(False)           # 恢复光标（V1.12.13）
+        self._unbind_overlay_idle_events()        # 解绑鼠标事件（V1.12.13）
         timer = getattr(self, "_overlay_rows_timer", None)
         if timer:
             try:
@@ -3895,7 +4304,6 @@ class LrcPlayerApp:
             return
         if rebuild_text or self._lyric_bar_text is None:
             self._lyric_bar_text = self._current_stem_line_text()
-            self._lyric_bar_var.set(self._lyric_bar_text)
         text = self._lyric_bar_text or ""
         try:
             need = self.lyric_bar_font.measure(text) + self._px(40)
@@ -3905,7 +4313,11 @@ class LrcPlayerApp:
         width = min(self.screen_w, max(base, need))
         height = self.lyric_bar_font.metrics("linespace") + self._px(18)
         self._lyric_bar_size = (width, height)
+        # 先应用位置/尺寸，再写入歌词文本（V1.12.13）：
+        # 先改文本会让窗口“先显示新歌词、后移动”，视觉上抖动一下
         self._place_lyric_bar(width, height)
+        if rebuild_text or self._lyric_bar_var.get() != text:
+            self._lyric_bar_var.set(text)
 
     # ==================================================================
     # 主循环

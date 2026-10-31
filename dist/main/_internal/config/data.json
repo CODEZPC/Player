@@ -9,14 +9,14 @@
     "gain": 1.0,
     "play_mode": "shuffle",
     "global_mode": true,
-    "play_seconds": 6922,
+    "play_seconds": 11734,
     "always_on_top": false,
-    "lyric_bar": "top",
+    "lyric_bar": "off",
     "lyric_anchor": "c",
     "lyric_x": 0,
     "lyric_y": 0,
     "lyric_alpha": 85,
-    "lyric_width": 30,
+    "lyric_width": 25,
     "lyric_font": 18
   },
   "folders": [
@@ -26,5 +26,5 @@
     "D:\\codefile\\File\\Music\\MSC\\Phigros-OST",
     "D:\\codefile\\File\\Music\\MSC\\PhiloDeka-OST"
   ],
-  "active_folder": "D:\\codefile\\File\\Music\\MSC\\HoYoMix"
+  "active_folder": "D:\\codefile\\File\\Music\\MSC\\Codelib"
 }

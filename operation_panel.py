@@ -601,8 +601,15 @@ class OperationPanel:
 
         self.lyric_opt_reset = tk.Frame(lyr_frame, bg="#1F3A8A",
                                         height=self._px(36))
-        tk.Label(self.lyric_opt_reset, text="重置", bg="#1F3A8A", fg="#6FA3FF",
-                 font=self.app.button_font_sm).pack(expand=True)
+        # 左半「重置」/ 右半「应用」（绿色，V1.12.15）：松手落在哪一半就执行哪个
+        self.lyric_opt_reset_left = tk.Label(
+            self.lyric_opt_reset, text="重置", bg="#1F3A8A", fg="#6FA3FF",
+            font=self.app.button_font_sm)
+        self.lyric_opt_reset_left.pack(side="left", fill="both", expand=True)
+        self.lyric_opt_apply = tk.Label(
+            self.lyric_opt_reset, text="应用", bg="#2E7D32", fg="#C8F0C8",
+            font=self.app.button_font_sm)
+        self.lyric_opt_apply.pack(side="left", fill="both", expand=True)
 
         # 歌词偏移（±600ms，10ms 步进）
         (self.lrc_offset_var, self.lrc_offset_scale,
@@ -846,6 +853,15 @@ class OperationPanel:
                                  relx=0, rely=0, relwidth=1, relheight=1)
         else:
             self._lyric_opt_active = key
+            # 记录拖动前的原值（「应用」时用它写入歌词文件，V1.12.15）
+            self._lrc_drag_origin = float(self.app.lrc_offset)
+            # 「应用」仅在调整歌词偏移时显示；其他项只显示占满整行的「重置」（V1.12.16）
+            if key == "lrc":
+                if not self.lyric_opt_apply.winfo_ismapped():
+                    self.lyric_opt_apply.pack(side="left", fill="both",
+                                              expand=True)
+            else:
+                self.lyric_opt_apply.pack_forget()
             self.lyric_opt_reset.place(in_=self.lyric_opt_cancel_row,
                                        relx=0, rely=0, relwidth=1,
                                        relheight=1)
@@ -861,9 +877,22 @@ class OperationPanel:
                 self._reset_adv(self._adv_active)
         else:
             key = self._lyric_opt_active
+            # 必须先判定指针位置，再隐藏覆盖条：place_forget 后子控件
+            # ismapped 变 0，会导致「应用」永远判定不成立（V1.12.17）
+            in_reset = self.app._is_pointer_in_cancel(
+                self.lyric_opt_reset_left)
+            in_apply = (key == "lrc" and self.lyric_opt_apply.winfo_ismapped()
+                        and self.app._is_pointer_in_cancel(self.lyric_opt_apply))
             self.lyric_opt_reset.place_forget()
-            if self.app._is_pointer_in_cancel(self.lyric_opt_reset):
+            if in_reset:
                 self._reset_lyric_opt(key)
+            elif in_apply:
+                # 应用：把拖动前的原值写入歌词文件（二次确认），V1.12.18 回退到 V1.12.15 语义
+                origin = float(getattr(self, "_lrc_drag_origin", 0.0))
+                self.set_lrc_offset_display(origin)
+                self.app.lrc_offset = origin
+                self.app._sync_lyrics(self.app._current_time())
+                self.app._confirm_apply_lrc_offset(origin)
             if key == "width":
                 # 宽度调整完成：重算并刷新 X/Y 范围与数值（拖动中不更新）
                 self.app._finalize_lyric_bar_width()
@@ -929,12 +958,29 @@ class OperationPanel:
         """歌词偏移：正值=歌词延后，负值=歌词提前（步进 10ms）。"""
         v = round(float(value) / 1) * 1
         v = max(-60, min(60, v))
+        # 指针落入「应用」区：回显拖动前的原值（V1.12.15 原方案；
+        # V1.12.17 的「冻结最后拖到的值」已在 V1.12.18 回退）
+        if (self._lyric_opt_active == "lrc"
+                and self.app._is_pointer_in_cancel(self.lyric_opt_apply)):
+            origin = float(getattr(self, "_lrc_drag_origin", 0.0))
+            self.set_lrc_offset_display(origin)
+            self.app.lrc_offset = origin
+            self.app._sync_lyrics(self.app._current_time())
+            return
         self.lrc_offset_var.set(v)
         self.app.lrc_offset = v
         self.lrc_offset_val.config(text=f"{v * 10}ms",
                                    fg=self.lrc_offset_color(v))
         self.app._sync_lyrics(self.app._current_time())
         self.app._schedule_config_save()
+
+    def set_lrc_offset_display(self, v: float) -> None:
+        """回写歌词偏移滑块与数值显示（同值不重设，防递归；V1.12.15）。"""
+        iv = int(round(v))
+        if int(round(float(self.lrc_offset_var.get()))) != iv:
+            self.lrc_offset_var.set(iv)
+        self.lrc_offset_val.config(text=f"{iv * 10}ms",
+                                   fg=self.lrc_offset_color(iv))
 
     def lrc_offset_color(self, v: float) -> str:
         """歌词偏移数值颜色：随偏移量增大由灰转红（警示）。"""
