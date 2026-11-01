@@ -37,6 +37,9 @@ class PlayerConsole:
     HELP = (
         "可用指令：\n"
         "  open <path>                       打开文件或文件夹\n"
+        "  folder switch <序号|文件夹名>      切换当前文件夹（并列出其中歌曲）\n"
+        "  folder close <序号|文件夹名>       关闭文件夹（并列出当前文件夹歌曲）\n"
+        "  folder reload                     重载全部文件夹\n"
         "  play <序号|歌名>                  播放第 N 首 / 按歌名（前缀唯一匹配，同名多目录则询问）\n"
         "  song step <秒>                    前进 N 秒\n"
         "  song time <分> <秒>               跳转到 分:秒\n"
@@ -58,6 +61,7 @@ class PlayerConsole:
         "  app floatlayer                    开关歌词浮层\n"
         "  app lyricbar <off|top|bottom|custom>   桌面歌词条（关闭/顶部/底部/自定义）\n"
         "  app exit                          退出程序\n"
+        "  IPC <on|off>                      开/关 IPC 服务（关闭后释放端口，不持久化）\n"
         "  interlude add <song...>           添加多首到插播\n"
         "  interlude clear                   清空插播\n"
         "  interlude insert <a> <b>          把 a 插入到插播中 b 之前\n"
@@ -197,6 +201,8 @@ class PlayerConsole:
             return self.HELP
         if head == "open":
             return self._cmd_open(cmd, parts)
+        if head == "folder":
+            return self._cmd_folder(parts)
         if head == "play":
             return self._cmd_play(parts)
         if head == "song":
@@ -205,6 +211,8 @@ class PlayerConsole:
             return self._cmd_set(parts)
         if head == "app":
             return self._cmd_app(parts)
+        if head == "ipc":
+            return self._cmd_ipc(parts)
         if head == "interlude":
             return self._cmd_interlude(parts)
         if head == "console":
@@ -245,6 +253,98 @@ class PlayerConsole:
             self.app._auto_load_lrc(path)
             return f"已打开: {os.path.basename(path)}"
         return f"路径不存在: {path}"
+
+    # ------------------------------------------------------------------
+    # folder（V1.13.4）
+    # ------------------------------------------------------------------
+
+    def _cmd_folder(self, parts: list) -> str:
+        """folder switch / close / reload：操作后返回当前文件夹歌曲摘要。"""
+        if len(parts) < 2:
+            return ("用法: folder switch <序号|文件夹名> / "
+                    "folder close <序号|文件夹名> / folder reload")
+        sub = parts[1].lower()
+        app = self.app
+
+        if sub == "reload":
+            if not app.folder_tabs:
+                return "尚未打开任何文件夹"
+            app._reload_all_folders()
+            return "已开始重载全部文件夹…\n" + self._folder_songs()
+
+        if sub not in ("switch", "close"):
+            return f"未知 folder 子指令: {sub}"
+        if len(parts) < 3:
+            return f"用法: folder {sub} <序号|文件夹名>"
+
+        idx, title = self._resolve_folder(" ".join(parts[2:]))
+        if idx is None:
+            return title                       # 出错信息字符串
+        if sub == "switch":
+            app._select_folder_by_index(idx)
+            return f"已切换文件夹: {title}\n" + self._folder_songs()
+        app._remove_folder_by_index(idx)
+        return f"已关闭文件夹: {title}\n" + self._folder_songs()
+
+    def _resolve_folder(self, ref: str):
+        """解析 <序号|文件夹名> 为 (索引, 标题)；失败返回 (None, 错误信息)。
+
+        序号 1 起；名字按标题/目录名大小写不敏感匹配（完全优先，其次前缀），
+        多个匹配时提示用序号。
+        """
+        tabs = self.app.folder_tabs
+        if not tabs:
+            return None, "尚未打开任何文件夹"
+        try:
+            val = int(ref.strip())
+        except ValueError:
+            val = None
+        if val is not None:
+            idx = val - 1
+            if idx < 0 or idx >= len(tabs):
+                return None, f"序号超出范围（1~{len(tabs)}）"
+            return idx, (tabs[idx].get("title") or tabs[idx].get("path") or "")
+
+        q = ref.strip().lower()
+        if not q:
+            return None, "用法: folder <switch|close> <序号|文件夹名>"
+
+        def names(tab: dict) -> tuple:
+            return ((tab.get("title") or "").lower(),
+                    os.path.basename(tab.get("path") or "").lower())
+
+        exact = [i for i, t in enumerate(tabs) if q in names(t)]
+        hits = exact if exact else [i for i, t in enumerate(tabs)
+                                    if any(n.startswith(q) for n in names(t))]
+        if len(hits) == 1:
+            i = hits[0]
+            return i, (tabs[i].get("title") or tabs[i].get("path") or "")
+        if not hits:
+            return None, f"未找到文件夹: {ref}"
+        cands = "\n".join(f"  {n}. {tabs[i].get('title') or ''}"
+                          for n, i in enumerate(hits, 1))
+        return None, (f"“{ref}” 匹配到 {len(hits)} 个文件夹，"
+                      f"请用序号或更精确的名字：\n{cands}")
+
+    def _folder_songs(self, limit: int = 20) -> str:
+        """当前文件夹歌曲摘要：前 limit 首 + 总数（V1.13.4）。"""
+        app = self.app
+        if app.active_folder_index is None:
+            return "当前未选中文件夹"
+        tab = (app.folder_tabs[app.active_folder_index]
+               if 0 <= app.active_folder_index < len(app.folder_tabs) else {})
+        if tab.get("status") == "loading":
+            return "当前文件夹正在扫描，稍后再试（folder reload 可重新扫描）"
+        items = app.audio_items
+        if not items:
+            return "当前文件夹暂无歌曲"
+        lines = [f"当前文件夹共 {len(items)} 首歌曲："]
+        for i, it in enumerate(items[:limit], 1):
+            name = it.get("display") or os.path.basename(it.get("path") or "")
+            lines.append(f"  {i}. {name}")
+        if len(items) > limit:
+            lines.append(f"  …（其余 {len(items) - limit} 首未显示）")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # play
@@ -624,6 +724,16 @@ class PlayerConsole:
         return f"未知 app 子指令: {sub}"
 
     # ------------------------------------------------------------------
+    # IPC（V1.13.4）
+    # ------------------------------------------------------------------
+
+    def _cmd_ipc(self, parts: list) -> str:
+        """IPC <on|off>：开/关 IPC 服务（不持久化；关闭后释放端口）。"""
+        if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+            return "用法: IPC <on|off>"
+        return self.app._set_ipc_enabled(parts[1].lower() == "on")
+
+    # ------------------------------------------------------------------
     # interlude
     # ------------------------------------------------------------------
 
@@ -829,9 +939,15 @@ class PlayerConsole:
         words = text.split()
         n = len(words) if text.strip() else 0
         if n <= 1:
-            return [w for w in ("app", "console", "help", "interlude",
-                                "open", "play", "set", "song")
+            return [w for w in ("app", "console", "folder", "help",
+                                "interlude", "ipc", "open", "play", "set",
+                                "song")
                     if w.startswith(token)]
+        if words[0] == "folder" and n == 2:
+            return [w for w in ("switch", "close", "reload")
+                    if w.startswith(token)]
+        if words[0] == "ipc" and n == 2:
+            return [w for w in ("on", "off") if w.startswith(token)]
         if words[0] == "song" and n == 2:
             return [w for w in ("step", "time", "change", "pause", "stop")
                     if w.startswith(token)]

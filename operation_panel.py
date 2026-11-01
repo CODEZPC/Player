@@ -287,6 +287,7 @@ class OperationPanel:
         self.mode_btns: dict[str, tk.Button] = {}
         self.topmost_btns: dict[bool, tk.Button] = {}
         self.global_btns: dict[bool, tk.Button] = {}   # 全局模式（V1.12.0）
+        self.ipc_btns: dict[bool, tk.Button] = {}      # IPC 服务开关（V1.13.4）
         self.FOOTER_FG = "#6E747C"                     # 底部信息灰色（V1.12.0）
         self._footer_hours = -1
 
@@ -534,6 +535,13 @@ class OperationPanel:
             self.topmost_btns[val] = self._make_seam_button(
                 box, text, lambda v=val: self.app._set_topmost(v))
         self.refresh_topmost_buttons()
+
+        # IPC 服务：开 / 关（V1.13.4；不持久化，关闭后释放端口）
+        box = self._build_option_row(opt_frame, "IPC")
+        for text, val in (("开", True), ("关", False)):
+            self.ipc_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self.app._set_ipc_enabled(v))
+        self.refresh_ipc_buttons()
 
     def _build_footer(self, parent: tk.Frame) -> None:
         """操作区底部（V1.12.0）：空出一行，再以灰色显示版本号与陪伴时长。"""
@@ -1203,6 +1211,18 @@ class OperationPanel:
                     bg=self.ACCENT_COLOR if active else self.SUBTLE_COLOR,
                     fg=self.BG_COLOR if active else self.FG_COLOR,
                     disabledforeground="#666C74")
+            except tk.TclError:
+                pass
+
+    def refresh_ipc_buttons(self) -> None:
+        """刷新 IPC 开关按钮组（V1.13.4）：高亮当前状态。"""
+        running = getattr(self.app, "_ipc_server", None) is not None
+        for val, btn in self.ipc_btns.items():
+            active = (bool(val) == running)
+            try:
+                btn.config(
+                    bg=self.ACCENT_COLOR if active else self.SUBTLE_COLOR,
+                    fg=self.BG_COLOR if active else self.FG_COLOR)
             except tk.TclError:
                 pass
 

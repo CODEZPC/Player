@@ -145,6 +145,10 @@ class LrcPlayerApp:
         self._clear_confirm_active = False
         self._clear_confirm_timer: str | None = None
 
+        # ---- IPC 服务（V1.13.4，运行时可开关，不持久化）----
+        self._ipc_server = None
+        self._ipc_thread: threading.Thread | None = None
+
         # ---- 歌词浮层 ----
         self._lyric_overlay = None  # 全窗口歌词浮层 Frame
         self._cover_fullscreen = None        # 全屏封面 Frame（V1.12.7）
@@ -299,6 +303,132 @@ class LrcPlayerApp:
         else:
             # 引擎尚未就绪（预热未完成等）：挂起，预热完成后重试（V1.9.2）
             self._pending_play_file = path
+
+    # ==================================================================
+    # IPC 服务（V1.13.4：可在运行时开关，不持久化）
+    # ==================================================================
+
+    def start_ipc_server(self, server=None) -> tuple[bool, str]:
+        """启动 IPC 监听（accept 线程）。返回 (是否成功, 错误信息)。
+
+        server 为启动最早期（main.py）已绑定的 socket（V1.8.7），
+        主窗口构建期间到达的通知由 listen backlog 缓存，不会丢失；
+        为 None 时此处重新绑定（端口被占用则失败）。
+        """
+        if self._ipc_server is not None:
+            return True, ""
+        import ipc
+        srv = server if server is not None else ipc.create_server()
+        if srv is None:
+            return False, "端口已被其他程序或实例占用"
+        self._ipc_server = srv
+        self._ipc_thread = threading.Thread(
+            target=self._ipc_listen_loop, args=(srv,), daemon=True)
+        self._ipc_thread.start()
+        self._refresh_ipc_ui()   # V1.13.5：启动时面板按钮需同步为「开」
+        return True, ""
+
+    def stop_ipc_server(self) -> None:
+        """停止 IPC 监听并释放端口（V1.13.4）。"""
+        srv = self._ipc_server
+        self._ipc_server = None
+        self._ipc_thread = None
+        if srv is not None:
+            try:
+                srv.close()     # accept 抛 OSError，监听线程随即退出
+            except OSError:
+                pass
+
+    def _refresh_ipc_ui(self) -> None:
+        """同步选项区 IPC 开关按钮高亮（V1.13.5，op 未建时静默跳过）。"""
+        op = getattr(self, "op", None)
+        if op is None:
+            return
+        try:
+            op.refresh_ipc_buttons()
+        except Exception:
+            pass
+
+    def _ipc_listen_loop(self, srv) -> None:
+        """IPC 服务端循环（后台线程）：SHOW 唤醒窗口 / OPEN 打开文件。"""
+        import socket as _socket
+        while self._ipc_server is srv:
+            try:
+                conn, _ = srv.accept()
+            except _socket.timeout:
+                continue
+            except OSError:
+                break           # socket 已被 stop_ipc_server 关闭
+            except Exception:
+                break
+            try:
+                data = conn.recv(1024).decode("utf-8", "ignore")
+            except Exception:
+                data = ""
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if not data:
+                continue
+            parts = data.split("|", 1)
+            action = parts[0]
+            path = parts[1] if len(parts) > 1 else ""
+            try:
+                if action == "SHOW":
+                    self.root.after(0, self._bring_to_front)
+                elif action == "OPEN" and path and os.path.exists(path):
+                    self.root.after(
+                        0, lambda p=path: self.handle_external_file(p))
+            except Exception:
+                pass
+        try:
+            srv.close()
+        except OSError:
+            pass
+
+    def _bring_to_front(self) -> None:
+        """把主窗口提到前台（IPC SHOW，主线程执行）。"""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+            self.root.attributes("-topmost", True)
+            self.root.after(
+                200, lambda: self.root.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+
+    def _set_ipc_enabled(self, on: bool) -> str:
+        """开/关 IPC 服务（V1.13.4，不持久化）。返回提示文本。
+
+        开启失败（端口被占用）时以全窗口弹窗报错，并保持关闭状态。
+        """
+        if on:
+            if self._ipc_server is not None:
+                msg = "IPC 服务已处于开启状态"
+            else:
+                ok, err = self.start_ipc_server()
+                if ok:
+                    msg = "IPC 服务已开启"
+                else:
+                    msg = f"IPC 服务开启失败：{err}"
+                    self.show_dialog(
+                        "IPC 服务",
+                        f"无法开启 IPC 服务：{err}。\n\n"
+                        "该端口（17345）已被其他程序或实例占用，"
+                        "请关闭占用方后重试。",
+                        kind="error")
+        else:
+            if self._ipc_server is None:
+                msg = "IPC 服务已处于关闭状态"
+            else:
+                self.stop_ipc_server()
+                msg = "IPC 服务已关闭（端口已释放）"
+        self._refresh_ipc_ui()
+        self._hint_status(msg)
+        return msg
 
     # ==================================================================
     # 字体 & 样式

@@ -27,41 +27,14 @@ def _bring_to_front(window: tk.Tk) -> None:
 
 def _start_ipc_listener(app_instance: LrcPlayerApp,
                         server: socket.socket | None = None) -> None:
-    """在后台线程中启动 IPC 服务端（accept 循环）。
+    """启动 IPC 服务端（accept 循环）。
 
-    server 为启动最早期（main.py）已绑定的 socket（V1.8.7）——主窗口构建
-    期间到达的通知由 listen backlog 缓存，不会丢失；为 None 时兜底重绑一次
-    （端口被非常规占用等异常情形，失败则无 IPC 静默继续）。
+    V1.13.4：监听逻辑移交 `LrcPlayerApp.start_ipc_server`（支持运行时开关
+    与端口释放），此处仅保留启动调用与失败兜底（失败则无 IPC 静默继续）。
     """
-
-    def listener() -> None:
-        srv = server if server is not None else create_server()
-        if srv is None:
-            return
-
-        while True:
-            try:
-                conn, _ = srv.accept()
-                data = conn.recv(1024).decode("utf-8")
-                conn.close()
-                if not data:
-                    continue
-
-                parts = data.split("|", 1)
-                action = parts[0]
-                path = parts[1] if len(parts) > 1 else ""
-
-                if action == "SHOW":
-                    app_instance.root.after(0, lambda: _bring_to_front(app_instance.root))
-                elif action == "OPEN" and os.path.exists(path):
-                    app_instance.root.after(0, lambda p=path: app_instance.handle_external_file(p))
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-        srv.close()
-
-    threading.Thread(target=listener, daemon=True).start()
+    ok, err = app_instance.start_ipc_server(server)
+    if not ok:
+        print(f"[IPC] {err}，本次启动无 IPC 服务")
 
 
 # 主窗口显示后延迟多久开始后台预热（先用少量时间让首帧渲染完成）
