@@ -280,6 +280,7 @@ class OperationPanel:
         self._adv_dragging = False
         self._adv_active: str | None = None
         self._lyric_opt_active: str | None = None
+        self._dragging_key: str | None = None   # 正在拖动的滑块 key（V1.13.6）
 
         # 选项区按钮组
         self.lyric_mode_btns: dict[str, tk.Button] = {}
@@ -854,6 +855,7 @@ class OperationPanel:
     def _on_slider_press(self, _event: tk.Event, key: str,
                          group: str) -> None:
         """滑块拖动开始：记录所在组与项，显示小组标题行的蓝色重置条。"""
+        self._dragging_key = key   # V1.13.6：拖动中禁止回写 Scale 的 var
         if group == "adv":
             self._adv_dragging = True
             self._adv_active = key
@@ -876,6 +878,8 @@ class OperationPanel:
 
     def _on_slider_release(self, _event: tk.Event, group: str) -> None:
         """滑块拖动结束：松手在重置条内则仅重置该项，否则保持当前值。"""
+        # 先解除拖动锁定：此后的回写（重置/对齐）才能写入 var（V1.13.6）
+        self._dragging_key = None
         if group == "adv":
             if not self._adv_dragging:
                 return
@@ -904,6 +908,16 @@ class OperationPanel:
             if key == "width":
                 # 宽度调整完成：重算并刷新 X/Y 范围与数值（拖动中不更新）
                 self.app._finalize_lyric_bar_width()
+            # 松手后把滑块对齐到取整后的实际值（拖动中已跳过回写，V1.13.6）
+            if key == "alpha":
+                self.set_lyric_alpha_display(
+                    int(round(self.app._lyric_bar_alpha)))
+            elif key == "width":
+                self.set_lyric_width_display(
+                    int(round(self.app._lyric_bar_width_pct)))
+            elif key == "font":
+                self.set_lyric_font_display(
+                    int(round(self.app._lyric_bar_font_size)))
             self._lyric_opt_active = None
 
     def _reset_adv(self, key: str | None) -> None:
@@ -1025,21 +1039,33 @@ class OperationPanel:
         self.app._set_lyric_bar_font_size(v)
 
     def set_lyric_alpha_display(self, v: int) -> None:
-        """同步透明度滑块显示（同值时跳过，避免递归触发）。"""
-        if int(round(float(self.lyric_alpha_var.get()))) != v:
-            self.lyric_alpha_var.set(v)
+        """同步透明度滑块显示（同值时跳过；拖动中不写回 var，V1.13.6）。"""
+        if self._dragging_key != "alpha":
+            try:
+                if int(round(float(self.lyric_alpha_var.get()))) != v:
+                    self.lyric_alpha_var.set(v)
+            except (tk.TclError, ValueError):
+                pass
         self.lyric_alpha_val.config(text=f"{v}%")
 
     def set_lyric_width_display(self, v: int) -> None:
-        """同步默认宽度滑块显示（同值时跳过）。"""
-        if int(round(float(self.lyric_width_var.get()))) != v:
-            self.lyric_width_var.set(v)
+        """同步默认宽度滑块显示（同值时跳过；拖动中不写回 var，V1.13.6）。"""
+        if self._dragging_key != "width":
+            try:
+                if int(round(float(self.lyric_width_var.get()))) != v:
+                    self.lyric_width_var.set(v)
+            except (tk.TclError, ValueError):
+                pass
         self.lyric_width_val.config(text=f"{v}%")
 
     def set_lyric_font_display(self, v: int) -> None:
-        """同步字体大小滑块显示（同值时跳过）。"""
-        if int(round(float(self.lyric_font_var.get()))) != v:
-            self.lyric_font_var.set(v)
+        """同步字体大小滑块显示（同值时跳过；拖动中不写回 var，V1.13.6）。"""
+        if self._dragging_key != "font":
+            try:
+                if int(round(float(self.lyric_font_var.get()))) != v:
+                    self.lyric_font_var.set(v)
+            except (tk.TclError, ValueError):
+                pass
         self.lyric_font_val.config(text=f"{v}px")
 
     # ---- 自定义锚点与 X/Y 位置 ----

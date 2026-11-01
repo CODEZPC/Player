@@ -46,6 +46,11 @@ TICK_INTERVAL_MS = 10
 OVERLAY_IDLE_HIDE_MS = 3000      # 浮层鼠标空闲后隐藏光标/跳转按钮的延迟（V1.12.13）
 INIT_STATUS_TEXT = "正在初始化…"     # 预热完成前的状态栏提示（V1.9.2）
 
+# 状态栏提示背景闪动（V1.13.6；V1.13.7 删除强调色停留）：白闪 → 直接中速淡出
+STATUS_FLASH_WHITE_MS = 70       # 白闪持续
+STATUS_FLASH_FADE_MS = 450       # 淡出总时长
+STATUS_FLASH_STEP_MS = 24        # 淡出帧间隔
+
 # 全窗口弹窗配色（V1.12.16）：kind → (遮罩背景, 强调色)
 DIALOG_KINDS = {
     "info":     ("#242B33", ACCENT_COLOR),
@@ -212,6 +217,7 @@ class LrcPlayerApp:
         self._played_seconds = 0.0            # 累计播放秒数（V1.12.0，持久化）
         self._footer_sec_snapshot = -1        # 底部陪伴时长上次刷新的整秒值（V1.12.0）
         self._status_hint_timer = None        # 状态栏临时提示定时器（V1.8.5）
+        self._status_flash_id = None          # 状态栏背景闪动 after id（V1.13.6）
         # 封面尺寸：与左栏上部底边对齐（V1.8.9，首次布局后由 _align_cover 校准）
         self._cover_size = self._px(205)
 
@@ -405,6 +411,7 @@ class LrcPlayerApp:
 
         开启失败（端口被占用）时以全窗口弹窗报错，并保持关闭状态。
         """
+        hint_kind = "info"
         if on:
             if self._ipc_server is not None:
                 msg = "IPC 服务已处于开启状态"
@@ -412,8 +419,10 @@ class LrcPlayerApp:
                 ok, err = self.start_ipc_server()
                 if ok:
                     msg = "IPC 服务已开启"
+                    hint_kind = "success"
                 else:
                     msg = f"IPC 服务开启失败：{err}"
+                    hint_kind = "error"
                     self.show_dialog(
                         "IPC 服务",
                         f"无法开启 IPC 服务：{err}。\n\n"
@@ -426,8 +435,9 @@ class LrcPlayerApp:
             else:
                 self.stop_ipc_server()
                 msg = "IPC 服务已关闭（端口已释放）"
+                hint_kind = "success"
         self._refresh_ipc_ui()
-        self._hint_status(msg)
+        self._hint_status(msg, kind=hint_kind)
         return msg
 
     # ==================================================================
@@ -549,6 +559,8 @@ class LrcPlayerApp:
         prog_lbl = tk.Label(prog_frame, textvariable=self._prog_var, **lbl_cfg)
         prog_lbl.pack(fill="both", expand=True)
         bind_tooltip(prog_lbl, self._prog_var, self, status_font)
+        self._prog_frame = prog_frame   # 提示背景闪动（V1.13.6）
+        self._prog_lbl = prog_lbl
 
         status_sep(bar)
 
@@ -709,20 +721,20 @@ class LrcPlayerApp:
         """点击当前歌词行：复制**整句主干歌词**（逐字中间态也复制完整句）。"""
         text = self._current_stem_text()
         if not text:
-            self._hint_status("当前无歌词可复制")
+            self._hint_status("当前无歌词可复制", kind="warning")
             return
         if self._copy_to_clipboard(text):
-            self._hint_status("已复制歌词到剪贴板")
+            self._hint_status("已复制歌词到剪贴板", kind="success")
 
     def _copy_current_translation(
             self, _event: tk.Event | None = None) -> None:
         """点击翻译行：复制当前翻译；无翻译（含「下一句」占位）时不复制。"""
         text = self._cur_trans_text.strip()
         if not text or self._cur_trans_is_placeholder:
-            self._hint_status("当前无翻译可复制")
+            self._hint_status("当前无翻译可复制", kind="warning")
             return
         if self._copy_to_clipboard(text):
-            self._hint_status("已复制翻译到剪贴板")
+            self._hint_status("已复制翻译到剪贴板", kind="success")
 
     def _build_button_rows(self, parent: tk.Frame) -> None:
         """两行按钮，每行 4 个。包裹在容器中供取消条覆盖。"""
@@ -808,8 +820,104 @@ class LrcPlayerApp:
             fg=FG_COLOR,
             font=self.info_font,
             padx=10,
+            cursor="hand2",
         )
         time_label.pack(side="right")
+        time_label.bind("<Button-1>", self._begin_time_edit)
+        self.time_label = time_label
+
+        # 点击时间标签 → 就地变输入框（V1.13.6，只编辑当前时间）
+        self.time_entry = tk.Entry(
+            progress_row, bg="#2B2F37", fg=FG_COLOR, font=self.info_font,
+            insertbackground=FG_COLOR, relief="flat", highlightthickness=1,
+            highlightbackground=SUBTLE_COLOR, highlightcolor=ACCENT_COLOR,
+            justify="center", width=9)
+        self.time_entry.bind("<Return>", self._commit_time_edit)
+        self.time_entry.bind("<Escape>", self._cancel_time_edit)
+        self.time_entry.bind("<FocusOut>", self._cancel_time_edit)
+        self._time_editing = False
+
+    # ------------------------------------------------------------------
+    # 时间输入（V1.13.6：点击播放条右侧时间就地编辑跳转）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_time_text(text: str) -> float | None:
+        """解析时间输入：纯秒（90）/ 分:秒（1:30）/ 分:秒.毫秒（1:30.500）。
+
+        非法或负数返回 None。
+        """
+        s = (text or "").strip()
+        if not s:
+            return None
+        try:
+            if ":" in s:
+                parts = s.split(":")
+                if len(parts) != 2:
+                    return None
+                minutes = int(parts[0].strip())
+                seconds = float(parts[1].strip())
+                if minutes < 0 or seconds < 0:
+                    return None
+                return minutes * 60 + seconds
+            val = float(s)
+            return None if val < 0 else val
+        except ValueError:
+            return None
+
+    def _begin_time_edit(self, _event: tk.Event | None = None) -> str:
+        """点击时间标签：切换为输入框（只编辑当前时间，右侧总长不变）。"""
+        if self._time_editing:
+            return "break"
+        if not getattr(self, "time_entry", None):
+            return "break"
+        if not self.audio_path:
+            self._hint_status("尚未加载歌曲，无法输入时间", kind="warning")
+            return "break"
+        self._time_editing = True
+        try:
+            self.time_label.pack_forget()
+            self.time_entry.delete(0, "end")
+            self.time_entry.insert(0, format_time(self._current_time()))
+            self.time_entry.pack(side="right", padx=(10, 0))
+            self.time_entry.focus_set()
+            self.time_entry.select_range(0, "end")
+        except tk.TclError:
+            self._time_editing = False
+        return "break"
+
+    def _end_time_edit(self) -> None:
+        """退出时间编辑状态（恢复为只读标签）。"""
+        self._time_editing = False
+        try:
+            self.time_entry.pack_forget()
+            self.time_label.pack(side="right")
+        except tk.TclError:
+            pass
+
+    def _cancel_time_edit(self, _event: tk.Event | None = None) -> str:
+        """Esc / 失焦：放弃输入并恢复标签。"""
+        if self._time_editing:
+            self._end_time_edit()
+        return "break"
+
+    def _commit_time_edit(self, _event: tk.Event | None = None) -> str:
+        """回车：解析输入并跳转（超出时长钳制到末尾）。"""
+        if not self._time_editing:
+            return "break"
+        text = self.time_entry.get()
+        self._end_time_edit()
+        target = self._parse_time_text(text)
+        if target is None:
+            self._hint_status(
+                "时间格式无效（可用 90 / 1:30 / 1:30.500）", kind="error")
+            return "break"
+        duration = float(self.duration or 0.0)
+        if duration > 0:
+            target = max(0.0, min(duration, target))
+        self._seek_to(target)
+        self._hint_status(f"已跳转到 {format_time(target)}", kind="success")
+        return "break"
 
     def _build_bottom_panels(self, parent: tk.Frame) -> None:
         """底部纵向布局：中部（左=文件夹列表 + 右=歌曲列表）+ 歌曲信息条。"""
@@ -968,7 +1076,7 @@ class LrcPlayerApp:
         列表里则恢复高亮/选中（见 `_restore_reload_highlight`）。
         """
         if not self.folder_tabs:
-            self._hint_status("尚未打开文件夹")
+            self._hint_status("尚未打开文件夹", kind="warning")
             return
         self._reload_restore_path = self.audio_path
         self._hint_status(f"正在重载 {len(self.folder_tabs)} 个文件夹…")
@@ -2395,7 +2503,7 @@ class LrcPlayerApp:
         第一行标题不处理），再把偏移重置为 0（歌词显示时机不变）。
         """
         if not self.lrc_path or not os.path.isfile(self.lrc_path):
-            self._hint_status("当前没有歌词文件，无法应用偏移")
+            self._hint_status("当前没有歌词文件，无法应用偏移", kind="warning")
             return
         if self._dialog_open:
             return
@@ -2417,7 +2525,7 @@ class LrcPlayerApp:
     def _do_apply_lrc_offset(self, offset_units: float) -> None:
         """确认后执行：写回歌词时间戳并把偏移归 0（V1.12.15）。"""
         ok, msg = self._apply_lrc_offset_to_file(offset_units)
-        self._hint_status(msg)
+        self._hint_status(msg, kind="success" if ok else "error")
         if not ok:
             return
         self.lrc_offset = 0
@@ -2857,21 +2965,111 @@ class LrcPlayerApp:
         """歌词编辑期间阻止切歌/打开文件：状态栏提示并返回 True（已阻止）。"""
         if not self._play_mode_locked:
             return False
-        self._hint_status(f"歌词编辑中，已阻止{what}")
+        self._hint_status(f"歌词编辑中，已阻止{what}", kind="warning")
         return True
 
-    def _hint_status(self, text: str) -> None:
-        """状态栏临时提示（约 2.5 秒后自动恢复「就绪」）。"""
+    def _hint_status(self, text: str, kind: str = "info") -> None:
+        """状态栏临时提示（约 2.5 秒后自动恢复「就绪」）。
+
+        kind（V1.13.6）：info / success / warning / error，决定背景闪动的
+        强调色（与 `DIALOG_KINDS` 同色）。
+        """
         try:
             self._prog_var.set(text)
         except Exception:
             return
+        self._flash_status_bar(kind)
         if self._status_hint_timer is not None:
             try:
                 self.root.after_cancel(self._status_hint_timer)
             except Exception:
                 pass
         self._status_hint_timer = self.root.after(2500, self._clear_status_hint)
+
+    def _set_prog_bg(self, bg: str, fg: str = FG_COLOR) -> None:
+        """设置状态栏「就绪」段背景/前景色（V1.13.6，闪动动画用）。
+
+        注意：`tk.Frame` 没有 `fg` 选项，必须与 Label 分开配置，否则
+        `config(bg=..., fg=...)` 整体抛 TclError 导致背景不生效。
+        """
+        frame = getattr(self, "_prog_frame", None)
+        lbl = getattr(self, "_prog_lbl", None)
+        if frame is not None:
+            try:
+                frame.config(bg=bg)
+            except tk.TclError:
+                pass
+        if lbl is not None:
+            try:
+                lbl.config(bg=bg, fg=fg)
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _mix_color(c1: str, c2: str, t: float) -> str:
+        """在两个 #RRGGBB 颜色之间线性插值（t=0 → c1，t=1 → c2）。"""
+        t = max(0.0, min(1.0, t))
+        try:
+            a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+            b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        except (ValueError, IndexError):
+            return c2
+        return "#{:02x}{:02x}{:02x}".format(
+            *[int(round(x + (y - x) * t)) for x, y in zip(a, b)])
+
+    def _cancel_status_flash(self) -> None:
+        """停止状态栏闪动并恢复常态配色（V1.13.6）。"""
+        if self._status_flash_id is not None:
+            try:
+                self.root.after_cancel(self._status_flash_id)
+            except Exception:
+                pass
+            self._status_flash_id = None
+        self._set_prog_bg(SUBTLE_COLOR, FG_COLOR)
+
+    def _flash_status_bar(self, kind: str = "info") -> None:
+        """状态栏背景闪动（V1.13.6）：先白闪一瞬 → 强调色 → 中速淡出。
+
+        强调色取自 `DIALOG_KINDS`（info 蓝 / success 绿 / warning 黄 /
+        error 红），淡出时长 `STATUS_FLASH_FADE_MS`。
+        """
+        accent = DIALOG_KINDS.get(kind, DIALOG_KINDS["info"])[1]
+        if self._status_flash_id is not None:
+            try:
+                self.root.after_cancel(self._status_flash_id)
+            except Exception:
+                pass
+            self._status_flash_id = None
+        # 阶段 1：白闪（极短，文字转深色保证可读）
+        self._set_prog_bg("#FFFFFF", BG_COLOR)
+        self._status_flash_id = self.root.after(
+            STATUS_FLASH_WHITE_MS,
+            lambda: self._flash_status_accent(accent))
+
+    def _flash_status_accent(self, accent: str) -> None:
+        """闪动阶段 2：切到强调色并立即开始淡出（V1.13.7 删除停留阶段）。"""
+        self._status_flash_id = None
+        self._set_prog_bg(accent, BG_COLOR)
+        self._flash_status_fade(accent)
+
+    def _flash_status_fade(self, accent: str) -> None:
+        """闪动阶段 3：强调色 → 常态底色中速淡出（ease-out）。"""
+        t0 = time.monotonic()
+
+        def step() -> None:
+            self._status_flash_id = None
+            t = min(1.0, (time.monotonic() - t0) * 1000.0
+                    / max(1, STATUS_FLASH_FADE_MS))
+            k = 1 - (1 - t) ** 3
+            self._set_prog_bg(
+                self._mix_color(accent, SUBTLE_COLOR, k),
+                self._mix_color(BG_COLOR, FG_COLOR, k))
+            if t < 1.0:
+                self._status_flash_id = self.root.after(STATUS_FLASH_STEP_MS, step)
+            else:
+                self._set_prog_bg(SUBTLE_COLOR, FG_COLOR)
+
+        step()
 
     def _clear_status_hint(self) -> None:
         """清除状态栏临时提示（若有）并恢复「就绪」（幂等）。"""
@@ -2882,6 +3080,7 @@ class LrcPlayerApp:
         except Exception:
             pass
         self._status_hint_timer = None
+        self._cancel_status_flash()
         self._set_status_ready()
 
     def _set_edit_lock_buttons(self, locked: bool) -> None:
@@ -3995,13 +4194,13 @@ class LrcPlayerApp:
             return
         data = extract_cover_art(self.audio_path) if self.audio_path else None
         if not data:
-            self._hint_status("当前歌曲无封面")
+            self._hint_status("当前歌曲无封面", kind="warning")
             return
         avail_w = max(80, self.root.winfo_width())
         avail_h = max(80, self.root.winfo_height())
         photo = cover_to_fill_image(data, avail_w, avail_h)
         if photo is None:
-            self._hint_status("封面加载失败")
+            self._hint_status("封面加载失败", kind="error")
             return
         frame = tk.Frame(self._lyric_overlay, bg=BG_COLOR)
         frame.place(x=0, y=0, relwidth=1, relheight=1)
