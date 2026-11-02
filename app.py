@@ -2,6 +2,7 @@
 
 import os
 import random
+import sys
 import threading
 import time
 from bisect import bisect_right
@@ -45,6 +46,10 @@ BUTTON_WIDTH = 10
 TICK_INTERVAL_MS = 10
 OVERLAY_IDLE_HIDE_MS = 3000      # 浮层鼠标空闲后隐藏光标/跳转按钮的延迟（V1.12.13）
 INIT_STATUS_TEXT = "正在初始化…"     # 预热完成前的状态栏提示（V1.9.2）
+
+# 状态栏提示重复触发弹窗（V1.13.8）：同一文本在窗口内出现达到次数即弹一次
+HINT_REPEAT_WINDOW_MS = 3000     # 重复判定时间窗
+HINT_REPEAT_COUNT = 5            # 窗口内第 5 次弹窗
 
 # 状态栏提示背景闪动（V1.13.6；V1.13.7 删除强调色停留）：白闪 → 直接中速淡出
 STATUS_FLASH_WHITE_MS = 70       # 白闪持续
@@ -153,6 +158,7 @@ class LrcPlayerApp:
         # ---- IPC 服务（V1.13.4，运行时可开关，不持久化）----
         self._ipc_server = None
         self._ipc_thread: threading.Thread | None = None
+        self._config_save_blocked = False    # IPC 关闭期间暂停写配置（V1.13.9）
 
         # ---- 歌词浮层 ----
         self._lyric_overlay = None  # 全窗口歌词浮层 Frame
@@ -218,6 +224,7 @@ class LrcPlayerApp:
         self._footer_sec_snapshot = -1        # 底部陪伴时长上次刷新的整秒值（V1.12.0）
         self._status_hint_timer = None        # 状态栏临时提示定时器（V1.8.5）
         self._status_flash_id = None          # 状态栏背景闪动 after id（V1.13.6）
+        self._hint_history: dict[str, list[float]] = {}   # 提示重复检测（V1.13.8）
         # 封面尺寸：与左栏上部底边对齐（V1.8.9，首次布局后由 _align_cover 校准）
         self._cover_size = self._px(205)
 
@@ -406,10 +413,25 @@ class LrcPlayerApp:
         except tk.TclError:
             pass
 
+    def _confirm_disable_ipc(self) -> bool:
+        """关闭 IPC 前的警告确认（V1.13.9）。返回 True 表示确认关闭。"""
+        if self._dialog_open:
+            return False
+        result = self.show_dialog(
+            "关闭 IPC 服务",
+            "关闭 IPC 的时段内将不记录配置，包括时长统计，\n"
+            "直到重新开启 IPC，原有的配置将被覆盖。\n\n"
+            "确定要关闭 IPC 服务吗？",
+            kind="warning",
+            buttons=(("确定", "yes"), ("取消", "no")))
+        return result == "yes"
+
     def _set_ipc_enabled(self, on: bool) -> str:
         """开/关 IPC 服务（V1.13.4，不持久化）。返回提示文本。
 
         开启失败（端口被占用）时以全窗口弹窗报错，并保持关闭状态。
+        V1.13.9：关闭前二次警告确认；关闭期间**不写配置**（含时长统计），
+        重新开启时以当前内存状态覆盖写盘。
         """
         hint_kind = "info"
         if on:
@@ -420,6 +442,14 @@ class LrcPlayerApp:
                 if ok:
                     msg = "IPC 服务已开启"
                     hint_kind = "success"
+                    if self._config_save_blocked:
+                        # 恢复写盘：以本实例内存状态覆盖磁盘配置（V1.13.9）
+                        self._config_save_blocked = False
+                        try:
+                            config_store.save(self._collect_persist())
+                        except Exception:
+                            pass
+                        msg = "IPC 服务已开启，配置记录已恢复"
                 else:
                     msg = f"IPC 服务开启失败：{err}"
                     hint_kind = "error"
@@ -432,9 +462,14 @@ class LrcPlayerApp:
         else:
             if self._ipc_server is None:
                 msg = "IPC 服务已处于关闭状态"
+            elif not self._confirm_disable_ipc():
+                return ""           # 用户取消：保持开启，不输出提示
             else:
                 self.stop_ipc_server()
-                msg = "IPC 服务已关闭（端口已释放）"
+                # 关闭后停止写盘（挂起中的保存也一并作废，V1.13.9）
+                self._config_save_blocked = True
+                self._config_save_pending = False
+                msg = "IPC 服务已关闭（端口已释放，配置暂停记录）"
                 hint_kind = "success"
         self._refresh_ipc_ui()
         self._hint_status(msg, kind=hint_kind)
@@ -2451,6 +2486,16 @@ class LrcPlayerApp:
         except tk.TclError:
             pass
 
+    @staticmethod
+    def _is_windows_11() -> bool:
+        """是否 Windows 11（build ≥ 22000；V1.13.8）。"""
+        if os.name != "nt":
+            return False
+        try:
+            return sys.getwindowsversion().build >= 22000
+        except Exception:
+            return False
+
     def _apply_title_bar_style(self) -> None:
         """设置窗口标题栏配色（V1.12.13，Windows DWM；V1.12.14 可重复调用）。
 
@@ -2459,8 +2504,11 @@ class LrcPlayerApp:
         直接当 COLORREF 传入（DWM 需要 `0x00BBGGRR`）。这里直接调 DWM 属性：
         20=深色模式（Win10 1809+）、35=标题栏背景、36=标题文字（Win11）。
         非 Windows 或调用失败时静默退化为系统默认外观。
+        **V1.13.8：非 Win11 完全不调 DWM**，标题栏保持系统默认外观。
         """
         if os.name != "nt":
+            return
+        if not self._is_windows_11():
             return
         try:
             import ctypes
@@ -2985,6 +3033,32 @@ class LrcPlayerApp:
             except Exception:
                 pass
         self._status_hint_timer = self.root.after(2500, self._clear_status_hint)
+        self._check_hint_repeat(text, kind)
+
+    def _check_hint_repeat(self, text: str, kind: str) -> None:
+        """重复提示检测（V1.13.8）：3 秒内同一文本达 5 次 → 弹窗一次。"""
+        if not text:
+            return
+        now = time.monotonic()
+        hist = self._hint_history.setdefault(text, [])
+        cutoff = now - HINT_REPEAT_WINDOW_MS / 1000.0
+        while hist and hist[0] < cutoff:
+            hist.pop(0)
+        hist.append(now)
+        if len(hist) < HINT_REPEAT_COUNT:
+            return
+        hist.clear()                     # 弹过后重新计数，避免连续弹窗
+        # 异步弹（不在提示调用链里同步阻塞），已有弹窗时跳过
+        self.root.after(0, lambda: self._prompt_repeat_hint(text, kind))
+
+    def _prompt_repeat_hint(self, text: str, kind: str) -> None:
+        """对重复出现的信息弹一次全窗口提示（V1.13.8）。"""
+        if self._dialog_open:
+            return
+        self.show_dialog(
+            "重复提示",
+            f"{text}\n\n该信息在短时间内重复触发，请留意。",
+            kind=kind if kind in DIALOG_KINDS else "info")
 
     def _set_prog_bg(self, bg: str, fg: str = FG_COLOR) -> None:
         """设置状态栏「就绪」段背景/前景色（V1.13.6，闪动动画用）。
@@ -3318,7 +3392,12 @@ class LrcPlayerApp:
         return data
 
     def _schedule_config_save(self) -> None:
-        """改动即时保存（合并短时间内的多次改动；退出时 on_close 兜底）。"""
+        """改动即时保存（合并短时间内的多次改动；退出时 on_close 兜底）。
+
+        V1.13.9：IPC 关闭期间不写配置（`_config_save_blocked`）。
+        """
+        if getattr(self, "_config_save_blocked", False):
+            return
         if getattr(self, "_config_save_pending", False):
             return
         self._config_save_pending = True
@@ -3328,10 +3407,15 @@ class LrcPlayerApp:
             self._flush_config_save()
 
     def _flush_config_save(self) -> None:
-        """把挂起的配置写入 data.json（幂等）。"""
+        """把挂起的配置写入 data.json（幂等）。
+
+        V1.13.9：IPC 关闭期间直接丢弃本次保存（不写盘）。
+        """
         if not getattr(self, "_config_save_pending", False):
             return
         self._config_save_pending = False
+        if getattr(self, "_config_save_blocked", False):
+            return
         config_store.save(self._collect_persist())
 
     def _apply_config_values(self, cfg: dict) -> None:
@@ -3544,9 +3628,10 @@ class LrcPlayerApp:
         self._update_songlist_title()
         self._refresh_il_buttons()
         self._update_controls_state()
-        # 配置恢复默认并持久化（文件夹已空）
+        # 配置恢复默认并持久化（文件夹已空；IPC 关闭期间不写盘，V1.13.9）
         self._apply_default_config()
-        config_store.save(self._collect_persist())
+        if not getattr(self, "_config_save_blocked", False):
+            config_store.save(self._collect_persist())
         self._refresh_status_bar()
         self._prog_var.set("已重置")
 
