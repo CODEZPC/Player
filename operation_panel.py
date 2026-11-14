@@ -288,13 +288,26 @@ class OperationPanel:
         self.mode_btns: dict[str, tk.Button] = {}
         self.topmost_btns: dict[bool, tk.Button] = {}
         self.global_btns: dict[bool, tk.Button] = {}   # 全局模式（V1.12.0）
-        self.ipc_btns: dict[bool, tk.Button] = {}      # IPC 服务开关（V1.13.4）
+        self.ipc_btns: dict[bool, tk.Button] = {}      # IPC 服务开关（V1.13.4；V1.14.0 移到「其他」）
+        self.pitch_fix_btns: dict[bool, tk.Button] = {}   # 保音高（V1.14.0）
+        self.exp_btns: dict[bool, tk.Button] = {}      # 实验性功能（V1.14.0）
+        self.trans_btns: dict[bool, tk.Button] = {}    # 歌词自动翻译（V1.14.0）
+        self.subtitle_btns: dict[bool, tk.Button] = {}  # 自动字幕（V1.14.0，锁定）
+        self.dev_btns: dict[bool, tk.Button] = {}      # 开发者选项（V1.14.0）
         self.FOOTER_FG = "#6E747C"                     # 底部信息灰色（V1.12.0）
         self._footer_hours = -1
 
         # 「歌词选项」行引用（模式变化时控制显隐/重排）
         self._lyric_mode_row: tk.Frame | None = None
         self.lyric_anchor_row: tk.Frame | None = None
+        # 「其他」区子行引用（V1.14.0：按开关状态控制显隐）
+        self._other_exp_row: tk.Frame | None = None
+        self._other_dev_row: tk.Frame | None = None
+        self._other_trans_row: tk.Frame | None = None
+        self._other_engine_row: tk.Frame | None = None
+        self._other_subtitle_row: tk.Frame | None = None
+        self._other_ipc_row: tk.Frame | None = None
+        self._other_console_row: tk.Frame | None = None
 
         # 滚动容器（内容不超一屏时滚动条自动隐藏）
         self.scroller = SmoothScrollFrame(
@@ -309,7 +322,9 @@ class OperationPanel:
         self._build_advanced(inner)
         self._build_options(inner)
         self._build_lyric_options(inner)
+        self._build_other(inner)           # 其他：实验性/开发者（V1.14.0）
         self._build_footer(inner)          # 底部版本/陪伴时长（V1.12.0）
+        self._build_reset_app(inner)       # 重置应用（面板最下方居中，V1.14.0）
         self.scroller.bind_wheel()
 
     # ---------------- 便捷引用 ----------------
@@ -330,15 +345,6 @@ class OperationPanel:
         tk.Label(self.speed_cancel_row, text="倍速", bg=self.BG_COLOR,
                  fg=self.ACCENT_COLOR,
                  font=self.app.button_font).pack(side="left")
-        self.pitch_btn = tk.Button(
-            self.speed_cancel_row, text="保音高: 关",
-            command=self._toggle_pitch_fix,
-            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
-            font=self.app.button_font_sm,
-            activebackground=self.ACCENT_COLOR,
-            activeforeground=self.BG_COLOR,
-            relief="flat", padx=6, pady=2)
-        self.pitch_btn.pack(side="right")
 
         slider_row = tk.Frame(speed_frame, bg=self.BG_COLOR)
         slider_row.pack(fill="x", pady=(2, 0))
@@ -354,6 +360,13 @@ class OperationPanel:
             slider_row, text="1.00x", width=6, bg=self.BG_COLOR,
             fg=self.FG_COLOR, font=self.app.info_font, anchor="e")
         self.speed_preview.pack(side="right", padx=(10, 0))
+
+        # 保音高：开 / 关（V1.14.0：从标题行移出，独立一行置于倍速条下方）
+        box = self._build_option_row(speed_frame, "保音高")
+        for text, val in (("开", True), ("关", False)):
+            self.pitch_fix_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self._set_pitch_fix(v))
+        self.refresh_pitch_fix_buttons()
 
         # 拖拽条（拖动时覆盖标题行）：左半取消（红）/ 右半重置（蓝）
         self.speed_drag_bar = tk.Frame(speed_frame, height=self._px(36))
@@ -433,37 +446,16 @@ class OperationPanel:
         tk.Label(self.adv_cancel_row, text="高级功能", bg=self.BG_COLOR,
                  fg=self.ACCENT_COLOR,
                  font=self.app.button_font).pack(side="left")
-        # 右侧按钮（side="right" 依 pack 顺序从右往左排布）：
-        # 视觉顺序（左→右）= [重置应用] [控制台] [重置]
-        # 区块「重置」：声道平衡/响度增益恢复默认（最右）
+        # 「重置」：声道平衡/响度增益恢复默认（V1.14.0 改为「↺」，背景透明）
         self.adv_reset_btn = tk.Button(
-            self.adv_cancel_row, text="重置",
+            self.adv_cancel_row, text="↺",
             command=self._on_reset_adv_all,
-            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+            bg=self.BG_COLOR, fg=self.FG_COLOR,
             font=self.app.button_font_sm,
             activebackground=self.ACCENT_COLOR,
             activeforeground=self.BG_COLOR,
-            relief="flat", padx=6, pady=2)
+            relief="flat", bd=0, highlightthickness=0, padx=6, pady=0)
         self.adv_reset_btn.pack(side="right")
-        # 控制台
-        self.console_btn = tk.Button(
-            self.adv_cancel_row, text="控制台",
-            command=self.app._toggle_console,
-            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
-            font=self.app.button_font_sm,
-            activebackground=self.ACCENT_COLOR,
-            activeforeground=self.BG_COLOR,
-            relief="flat", padx=6, pady=2)
-        self.console_btn.pack(side="right")
-        # 「重置应用」：清全部配置/文件夹/播放状态（确认需点 2 次，最左）
-        self.reset_btn = tk.Button(
-            self.adv_cancel_row, text="重置应用",
-            command=self.app._toggle_reset,
-            bg=self.SUBTLE_COLOR, fg="#FF9A9A",
-            font=self.app.button_font_sm,
-            activebackground="#6B1010", activeforeground="#FF5555",
-            relief="flat", padx=6, pady=2)
-        self.reset_btn.pack(side="right")
 
         self.adv_reset = tk.Frame(adv_frame, bg="#1F3A8A",
                                   height=self._px(36))
@@ -537,12 +529,7 @@ class OperationPanel:
                 box, text, lambda v=val: self.app._set_topmost(v))
         self.refresh_topmost_buttons()
 
-        # IPC 服务：开 / 关（V1.13.4；不持久化，关闭后释放端口）
-        box = self._build_option_row(opt_frame, "IPC")
-        for text, val in (("开", True), ("关", False)):
-            self.ipc_btns[val] = self._make_seam_button(
-                box, text, lambda v=val: self.app._set_ipc_enabled(v))
-        self.refresh_ipc_buttons()
+        # IPC 服务开关已移至「其他 → 开发者选项」（V1.14.0）
 
     def _build_footer(self, parent: tk.Frame) -> None:
         """操作区底部（V1.12.0）：空出一行，再以灰色显示版本号与陪伴时长。"""
@@ -587,15 +574,15 @@ class OperationPanel:
         tk.Label(self.lyric_opt_cancel_row, text="歌词选项",
                  bg=self.BG_COLOR, fg=self.ACCENT_COLOR,
                  font=self.app.button_font).pack(side="left")
-        # 「重置」：全部歌词选项恢复默认（含桌面歌词模式与锚点）
+        # 「↺」：全部歌词选项恢复默认（V1.14.0 文案与背景调整）
         self.lyric_reset_btn = tk.Button(
-            self.lyric_opt_cancel_row, text="重置",
+            self.lyric_opt_cancel_row, text="↺",
             command=self._on_reset_lyric_all,
-            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+            bg=self.BG_COLOR, fg=self.FG_COLOR,
             font=self.app.button_font_sm,
             activebackground=self.ACCENT_COLOR,
             activeforeground=self.BG_COLOR,
-            relief="flat", padx=6, pady=2)
+            relief="flat", bd=0, highlightthickness=0, padx=6, pady=0)
         self.lyric_reset_btn.pack(side="right")
         # 「编辑歌词」：打开歌词编辑器（叠加在歌曲选择区；位于重置左侧）
         self.lyric_edit_btn = tk.Button(
@@ -691,6 +678,204 @@ class OperationPanel:
 
         # 依当前模式初始化显隐（关闭时隐藏参数行）
         self.sync_lyric_custom_rows()
+
+    # ------------------------------------------------------------------
+    # 「其他」区：实验性功能 / 开发者选项（V1.14.0）
+    # ------------------------------------------------------------------
+
+    def _build_other(self, parent: tk.Frame) -> None:
+        """「其他」区：实验性功能（含自动翻译/自动字幕）、开发者选项（含 IPC/控制台）。"""
+        from tran import ENGINE_LABELS, ENGINES
+
+        other_frame = tk.Frame(parent, bg=self.BG_COLOR)
+        other_frame.pack(side="top", fill="x", pady=(18, 4))
+        self._other_frame = other_frame
+
+        tk.Label(other_frame, text="其他", bg=self.BG_COLOR,
+                 fg=self.ACCENT_COLOR,
+                 font=self.app.button_font, anchor="w").pack(anchor="w")
+
+        # 实验性功能：开 / 关（默认关；开启需警告确认）
+        box = self._build_option_row(other_frame, "实验性功能")
+        self._other_exp_row = box.master
+        for text, val in (("开", True), ("关", False)):
+            self.exp_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self.app._set_experimental(v))
+
+        # 歌词自动翻译（仅实验性开时显示）
+        box = self._build_option_row(other_frame, "自动翻译")
+        self._other_trans_row = box.master
+        for text, val in (("开", True), ("关", False)):
+            self.trans_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self.app._set_auto_translate(v))
+
+        # 翻译引擎下拉（仅自动翻译开时显示）
+        row = tk.Frame(other_frame, bg=self.BG_COLOR)
+        self._other_engine_row = row
+        tk.Label(row, text="翻译引擎", bg=self.BG_COLOR, fg=self.FG_COLOR,
+                 font=self.app.list_font, anchor="w",
+                 width=8).pack(side="left")
+        try:
+            style = ttk.Style()
+            style.configure("LRC.TCombobox",
+                            fieldbackground=self.SUBTLE_COLOR,
+                            background=self.SUBTLE_COLOR,
+                            foreground=self.FG_COLOR,
+                            arrowcolor=self.FG_COLOR, borderwidth=0)
+            style.map("LRC.TCombobox",
+                      fieldbackground=[("readonly", self.SUBTLE_COLOR)],
+                      foreground=[("readonly", self.FG_COLOR)],
+                      selectbackground=[("readonly", self.SUBTLE_COLOR)],
+                      selectforeground=[("readonly", self.FG_COLOR)])
+            self.app.root.option_add(
+                "*TCombobox*Listbox.background", self.SUBTLE_COLOR)
+            self.app.root.option_add(
+                "*TCombobox*Listbox.foreground", self.FG_COLOR)
+            self.app.root.option_add(
+                "*TCombobox*Listbox.selectBackground", self.ACCENT_COLOR)
+            self.app.root.option_add(
+                "*TCombobox*Listbox.selectForeground", self.BG_COLOR)
+        except tk.TclError:
+            pass
+        self.trans_engine_var = tk.StringVar(
+            value=ENGINE_LABELS.get(
+                getattr(self.app, "translate_engine", "bing"), "Bing"))
+        self.trans_engine_box = ttk.Combobox(
+            row, textvariable=self.trans_engine_var, state="readonly",
+            values=[ENGINE_LABELS[e] for e in ENGINES], width=10,
+            style="LRC.TCombobox", font=self.app.button_font_sm)
+        self.trans_engine_box.pack(side="right")
+        self.trans_engine_box.bind("<<ComboboxSelected>>",
+                                   self._on_engine_selected)
+
+        # 自动字幕（听力辅助）：UI 已建，接口未接入 → 锁定不可点
+        box = self._build_option_row(other_frame, "自动字幕")
+        self._other_subtitle_row = box.master
+        for text, val in (("开", True), ("关", False)):
+            btn = self._make_seam_button(
+                box, text, lambda: self.app._hint_status(
+                    "自动字幕接口暂未接入，功能已锁定", kind="warning"))
+            btn.config(state="disabled", disabledforeground="#666C74")
+            self.subtitle_btns[val] = btn
+
+        # 开发者选项：开 / 关（默认关、非持久化；关闭时重置子项）
+        box = self._build_option_row(other_frame, "开发者选项")
+        self._other_dev_row = box.master
+        for text, val in (("开", True), ("关", False)):
+            self.dev_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self.app._set_dev_options(v))
+
+        # IPC 服务（V1.13.4；V1.14.0 移入开发者选项，仅开发者开时显示）
+        box = self._build_option_row(other_frame, "IPC")
+        self._other_ipc_row = box.master
+        for text, val in (("开", True), ("关", False)):
+            self.ipc_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self.app._set_ipc_enabled(v))
+        self.refresh_ipc_buttons()
+
+        # 控制台（仅开发者开时显示）：右侧按钮，点击时警告确认
+        row = tk.Frame(other_frame, bg=self.BG_COLOR)
+        self._other_console_row = row
+        tk.Label(row, text="控制台", bg=self.BG_COLOR, fg=self.FG_COLOR,
+                 font=self.app.list_font, anchor="w",
+                 width=8).pack(side="left")
+        self.console_btn = tk.Button(
+            row, text="打开控制台",
+            command=self.app._toggle_console_with_warning,
+            bg=self.SUBTLE_COLOR, fg=self.FG_COLOR,
+            font=self.app.button_font_sm,
+            activebackground=self.ACCENT_COLOR,
+            activeforeground=self.BG_COLOR,
+            relief="flat", padx=6, pady=2)
+        self.console_btn.pack(side="right")
+
+        self.sync_other_rows()
+        self.refresh_other_buttons()
+
+    def _on_engine_selected(self, _event: tk.Event | None = None) -> None:
+        """下拉选择翻译引擎（V1.14.0）。"""
+        from tran import ENGINE_LABELS
+        label = self.trans_engine_var.get()
+        for eng, lbl in ENGINE_LABELS.items():
+            if lbl == label:
+                self.app._set_translate_engine(eng)
+                return
+
+    def sync_other_rows(self) -> None:
+        """按开关状态重排「其他」区子行显隐（V1.14.0）。
+
+        先全部 pack_forget 再按固定顺序重 pack，避免隐藏后重显导致行序错位。
+        """
+        exp = bool(getattr(self.app, "experimental_enabled", False))
+        dev = bool(getattr(self.app, "dev_options_enabled", False))
+        trans = exp and bool(getattr(self.app, "auto_translate_enabled", False))
+        order = (
+            (getattr(self, "_other_exp_row", None), True),
+            (getattr(self, "_other_trans_row", None), exp),
+            (getattr(self, "_other_engine_row", None), trans),
+            (getattr(self, "_other_subtitle_row", None), exp),
+            (getattr(self, "_other_dev_row", None), True),
+            (getattr(self, "_other_ipc_row", None), dev),
+            (getattr(self, "_other_console_row", None), dev),
+        )
+        for row, _ in order:
+            if row is None:
+                continue
+            try:
+                row.pack_forget()
+            except tk.TclError:
+                pass
+        for row, show in order:
+            if row is None or not show:
+                continue
+            try:
+                row.pack(fill="x", pady=(2, 0))
+            except tk.TclError:
+                pass
+
+    def _refresh_btn_group(self, btns: dict, current: bool) -> None:
+        """按当前值刷新一组「开/关」按钮的高亮（V1.14.0）。"""
+        for val, btn in btns.items():
+            active = (bool(val) == bool(current))
+            try:
+                btn.config(
+                    bg=self.ACCENT_COLOR if active else self.SUBTLE_COLOR,
+                    fg=self.BG_COLOR if active else self.FG_COLOR)
+            except tk.TclError:
+                pass
+
+    def refresh_other_buttons(self) -> None:
+        """刷新「其他」区各开关按钮与引擎下拉（V1.14.0）。"""
+        from tran import ENGINE_LABELS
+        app = self.app
+        self._refresh_btn_group(
+            self.exp_btns, getattr(app, "experimental_enabled", False))
+        self._refresh_btn_group(
+            self.trans_btns, getattr(app, "auto_translate_enabled", False))
+        self._refresh_btn_group(
+            self.subtitle_btns, getattr(app, "auto_subtitle_enabled", False))
+        self._refresh_btn_group(
+            self.dev_btns, getattr(app, "dev_options_enabled", False))
+        try:
+            label = ENGINE_LABELS.get(
+                getattr(app, "translate_engine", "bing"), "Bing")
+            if self.trans_engine_var.get() != label:
+                self.trans_engine_var.set(label)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _build_reset_app(self, parent: tk.Frame) -> None:
+        """「重置应用」按钮（V1.14.0）：面板最下方、居中、背景与主背景一致。"""
+        wrap = tk.Frame(parent, bg=self.BG_COLOR)
+        wrap.pack(side="top", fill="x", pady=(0, 16))
+        self.reset_btn = tk.Button(
+            wrap, text="重置应用",
+            command=self.app._toggle_reset,
+            bg=self.BG_COLOR, fg="#FF9A9A",
+            font=self.app.button_font_sm,
+            activebackground="#6B1010", activeforeground="#FF5555",
+            relief="flat", bd=0, highlightthickness=0, padx=10, pady=2)
+        self.reset_btn.pack(anchor="center")
 
     def _build_option_row(self, parent: tk.Frame, title: str) -> tk.Frame:
         """「选项」区一行：左侧定宽标签 + 右侧无缝按钮容器（返回容器）。"""
@@ -801,12 +986,30 @@ class OperationPanel:
     # 音高（移调）交互
     # ==================================================================
 
-    def _toggle_pitch_fix(self) -> None:
-        """切换保音高模式（变速不变调）。"""
-        on = not self.app.engine.get_pitch_fix()
-        self.app.engine.set_pitch_fix(on)
-        self.pitch_btn.config(text="保音高: 开" if on else "保音高: 关")
+    def _set_pitch_fix(self, on: bool) -> None:
+        """设置保音高（V1.14.0：选项区「开/关」无缝按钮组）。"""
+        on = bool(on)
+        try:
+            self.app.engine.set_pitch_fix(on)
+        except Exception:
+            pass
+        self.refresh_pitch_fix_buttons()
         self.app._schedule_config_save()
+
+    def refresh_pitch_fix_buttons(self) -> None:
+        """刷新保音高按钮高亮（V1.14.0）。"""
+        try:
+            cur = bool(self.app.engine.get_pitch_fix())
+        except Exception:
+            cur = False
+        for val, btn in self.pitch_fix_btns.items():
+            active = (bool(val) == cur)
+            try:
+                btn.config(
+                    bg=self.ACCENT_COLOR if active else self.SUBTLE_COLOR,
+                    fg=self.BG_COLOR if active else self.FG_COLOR)
+            except tk.TclError:
+                pass
 
     def _on_pitch_press(self, _event: tk.Event) -> None:
         """音高滑块拖动开始：显示蓝色重置条覆盖标题行。"""
@@ -1282,11 +1485,10 @@ class OperationPanel:
         self.speed_var.set(speed)
         self.speed_preview.config(text=f"{speed:.2f}x")
 
-        self.pitch_btn.config(
-            text="保音高: 开" if pitch_fix else "保音高: 关")
         self.pitch_var.set(pitch_shift)
         self.pitch_preview.config(text=f"{pitch_shift:+d}",
                                   fg=self.pitch_color(pitch_shift))
+        self.refresh_pitch_fix_buttons()
 
         self.vol_var.set(volume)
         self.update_vol_preview()

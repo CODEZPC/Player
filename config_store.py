@@ -41,6 +41,10 @@ DEFAULTS: dict = {
         "lyric_width": 25,       # 歌词条初始宽度（占屏幕 %）
         "lyric_font": 18,        # 歌词条字体大小（px）
         "play_seconds": 0,       # 累计播放秒数（V1.12.0：操作栏底部「已陪伴你 X 小时」）
+        "experimental": False,   # 实验性功能（V1.14.0）
+        "auto_translate": False,  # 歌词自动翻译（V1.14.0）
+        "translate_engine": "bing",  # 翻译引擎：bing / bilibili（V1.14.0）
+        "auto_subtitle": False,  # 自动字幕（V1.14.0；接口未接入）
     },
 }
 

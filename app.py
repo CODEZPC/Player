@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, font as tkfont
 
 import config_store
+import tran
 import utils
 from operation_panel import OperationPanel
 from lrc_parser import LrcParser
@@ -159,6 +160,16 @@ class LrcPlayerApp:
         self._ipc_server = None
         self._ipc_thread: threading.Thread | None = None
         self._config_save_blocked = False    # IPC 关闭期间暂停写配置（V1.13.9）
+
+        # ---- 其他：实验性功能 / 开发者选项（V1.14.0）----
+        self.experimental_enabled = False      # 实验性功能（持久化）
+        self._busy_status_text = ""            # 后台任务常驻状态（V1.14.2）
+        self.auto_translate_enabled = False    # 歌词自动翻译（持久化）
+        self.translate_engine = tran.DEFAULT_ENGINE   # bing / bilibili
+        self.auto_subtitle_enabled = False     # 自动字幕（持久化；接口未接入）
+        self.dev_options_enabled = False       # 开发者选项（**不持久化**）
+        self._trans_gen = 0                    # 自动翻译世代（切歌/关闭即失效）
+        self._trans_thread: threading.Thread | None = None
 
         # ---- 歌词浮层 ----
         self._lyric_overlay = None  # 全窗口歌词浮层 Frame
@@ -1427,6 +1438,262 @@ class LrcPlayerApp:
     #   实例见 _build_ui 中的 self.op
     # ==================================================================
 
+    # ==================================================================
+    # 其他：实验性功能 / 开发者选项（V1.14.0）
+    # ==================================================================
+
+    def _sync_other_ui(self) -> None:
+        """刷新「其他」区行显隐与按钮高亮（V1.14.0）。"""
+        op = getattr(self, "op", None)
+        if op is None:
+            return
+        try:
+            op.sync_other_rows()
+            op.refresh_other_buttons()
+        except Exception:
+            pass
+
+    def _set_experimental(self, on: bool) -> None:
+        """实验性功能开关（默认关；开启需警告确认；关闭时子项一并关为关）。"""
+        on = bool(on)
+        if on and not self.experimental_enabled:
+            if self._dialog_open:
+                return
+            ans = self.show_dialog(
+                "实验性功能",
+                "启用实验性功能后，可以使用一些尚在测试阶段的功能，"
+                "但可能不稳定或出现非预期的错误。\n\n确定要启用吗？",
+                kind="warning",
+                buttons=(("确定", "yes"), ("取消", "no")))
+            if ans != "yes":
+                self._sync_other_ui()
+                return
+        self.experimental_enabled = on
+        if not on:
+            # 关闭实验性功能：子项（自动翻译 / 自动字幕）一并关为关
+            self.auto_translate_enabled = False
+            self.auto_subtitle_enabled = False
+            self._cancel_auto_translate()
+        else:
+            self._maybe_auto_translate()
+        self._sync_other_ui()
+        self._schedule_config_save()
+
+    def _set_auto_translate(self, on: bool) -> None:
+        """歌词自动翻译开关（默认关；开启需警告确认）。"""
+        on = bool(on)
+        if on and not self.auto_translate_enabled:
+            if self._dialog_open:
+                return
+            ans = self.show_dialog(
+                "歌词自动翻译",
+                "启用歌词自动翻译后，将自动对无翻译的外语歌词进行翻译，"
+                "此过程需要联网，会消耗数据流量，且翻译不一定契合原文意思。"
+                "\n\n确定要启用吗？",
+                kind="warning",
+                buttons=(("确定", "yes"), ("取消", "no")))
+            if ans != "yes":
+                self._sync_other_ui()
+                return
+        self.auto_translate_enabled = on
+        self._sync_other_ui()
+        self._schedule_config_save()
+        if on:
+            self._maybe_auto_translate()
+        else:
+            self._cancel_auto_translate()
+
+    def _set_translate_engine(self, engine: str) -> None:
+        """设置翻译引擎（bing / bilibili，V1.14.0）。"""
+        self.translate_engine = (engine if engine in tran.ENGINES
+                                 else tran.DEFAULT_ENGINE)
+        self._sync_other_ui()
+        self._schedule_config_save()
+
+    def _set_dev_options(self, on: bool) -> None:
+        """开发者选项开关（默认关、非持久化；关闭时重置：IPC 恢复 + 关控制台）。"""
+        on = bool(on)
+        if on and not self.dev_options_enabled:
+            if self._dialog_open:
+                return
+            ans = self.show_dialog(
+                "开发者选项",
+                "开发者选项仅供开发测试使用，可能导致程序不稳定或出现"
+                "非预期的错误。\n\n确定要启用吗？",
+                kind="warning",
+                buttons=(("确定", "yes"), ("取消", "no")))
+            if ans != "yes":
+                self._sync_other_ui()
+                return
+        self.dev_options_enabled = on
+        if not on:
+            if self._ipc_server is None:        # IPC 恢复开启
+                self._set_ipc_enabled(True)
+            console = getattr(self, "console", None)   # 关闭控制台窗口
+            if console is not None:
+                try:
+                    if console.win.winfo_viewable():
+                        console._hide()
+                except tk.TclError:
+                    pass
+        self._sync_other_ui()
+
+    def _toggle_console_with_warning(self) -> None:
+        """打开控制台前警告确认（V1.14.0；已打开时直接切换为隐藏）。"""
+        console = getattr(self, "console", None)
+        if console is not None:
+            self._toggle_console()
+            return
+        if self._dialog_open:
+            return
+        ans = self.show_dialog(
+            "控制台",
+            "启用控制台后，可以通过命令控制程序行为，也能对某些设置进行"
+            "超出一定限度的修改，但可能导致程序不稳定或出现非预期的错误。"
+            "\n\n确定要打开控制台吗？",
+            kind="warning",
+            buttons=(("确定", "yes"), ("取消", "no")))
+        if ans == "yes":
+            self._toggle_console()
+
+    # ---------------- 歌词自动翻译（V1.14.0）----------------
+
+    def _cancel_auto_translate(self) -> None:
+        """作废进行中的自动翻译（世代 +1，后台线程自行退出）。"""
+        self._trans_gen += 1
+        self._busy_status_text = ""
+
+    def _stem_translate_items(self) -> list[tuple[float, str]]:
+        """构造自动翻译项（V1.14.1）：只取主干行，时间戳对齐「组首字」。
+
+        逐字歌词每句由多行（逐字递增）组成，只翻译每组的**完整句**（
+        `_build_lyric_stem` 保留的末行），并把时间戳换成组首行（上一主干行
+        之后的第一行）的时间，使译文从第一字开始就显示。
+        非逐字歌词时「组首行」即自身，行为不变。
+        """
+        if not self.lrc_lines:
+            return []
+        stem = self._build_lyric_stem(self.lrc_lines)
+        items: list[tuple[float, str]] = []
+        for gi, idx in enumerate(stem):
+            text = (self.lrc_lines[idx][1] or "").strip()
+            if not text:
+                continue
+            start = (stem[gi - 1] + 1) if gi > 0 else 0
+            start = min(max(start, 0), idx)
+            items.append((self.lrc_lines[start][0], text))
+        return items
+
+    def _maybe_auto_translate(self) -> None:
+        """满足条件时启动自动翻译：实验性开 + 自动翻译开 + 无翻译 + 外语歌词。"""
+        if not (self.experimental_enabled and self.auto_translate_enabled):
+            return
+        if not self.lrc_lines or self.lrc_trans_lines:
+            return
+        items = self._stem_translate_items()
+        texts = [t for _, t in items]
+        if not texts or not tran.is_foreign_lyric(texts):
+            return
+        self._start_auto_translate()
+
+    def _start_auto_translate(self) -> None:
+        """后台线程逐行翻译主干歌词（边翻边显示，V1.14.0；V1.14.1 仅主干行）。
+
+        V1.14.2：状态栏持续显示进度「正在自动翻译 k/N」。
+        """
+        self._cancel_auto_translate()
+        gen = self._trans_gen
+        items = self._stem_translate_items()
+        if not items:
+            return
+        engine = self.translate_engine
+        total = len(items)
+        self._set_busy_status(
+            f"正在自动翻译歌词 0/{total}（引擎 "
+            f"{tran.ENGINE_LABELS.get(engine, engine)}）…")
+
+        def worker() -> None:
+            results: list[tuple[float, str]] = []
+            done = 0
+            for ts, txt in items:
+                if gen != self._trans_gen:
+                    return
+                ok, out = tran.translate(txt, engine=engine)
+                if gen != self._trans_gen:
+                    return
+                done += 1
+                if ok:
+                    results.append((ts, out))
+                    snapshot = list(results)
+                    try:
+                        self.root.after(
+                            0, lambda s=snapshot, g=gen:
+                            self._apply_auto_translation(s, g))
+                    except Exception:
+                        return
+                d = done
+                try:
+                    self.root.after(
+                        0, lambda k=d, g=gen, t=total:
+                        self._update_translate_progress(k, t, g))
+                except Exception:
+                    return
+            try:
+                self.root.after(
+                    0, lambda g=gen: self._finish_auto_translation(g))
+            except Exception:
+                pass
+
+        self._trans_thread = threading.Thread(target=worker, daemon=True)
+        self._trans_thread.start()
+
+    def _set_busy_status(self, text: str) -> None:
+        """设置常驻状态文本（不自动恢复「就绪」，V1.14.2）。
+
+        供后台任务（自动翻译等）显示进度；任务结束时再由 `_hint_status`
+        恢复常规提示流程。
+        """
+        if self._status_hint_timer is not None:
+            try:
+                self.root.after_cancel(self._status_hint_timer)
+            except Exception:
+                pass
+            self._status_hint_timer = None
+        self._busy_status_text = text
+        try:
+            self._prog_var.set(text)
+        except Exception:
+            pass
+
+    def _update_translate_progress(self, done: int, total: int,
+                                   gen: int) -> None:
+        """更新状态栏自动翻译进度（主线程，V1.14.2）。"""
+        if gen != self._trans_gen:
+            return
+        self._set_busy_status(f"正在自动翻译歌词 {done}/{total} …")
+
+    def _apply_auto_translation(self, results, gen: int) -> None:
+        """把已翻译的行写入翻译轴并刷新显示（主线程）。"""
+        if gen != self._trans_gen or not results:
+            return
+        self.lrc_trans_lines = sorted(results, key=lambda x: x[0])
+        self.lrc_trans_times = [ts for ts, _ in self.lrc_trans_lines]
+        # 强制刷新缓存（用哨兵而非 None，避免其他处 .strip() 抛错）
+        self._cur_trans_text = "\x00"
+        self._cur_trans_is_placeholder = None
+        self._sync_translation(self._current_time())
+
+    def _finish_auto_translation(self, gen: int) -> None:
+        """自动翻译结束提示（主线程）。"""
+        if gen != self._trans_gen:
+            return
+        self._busy_status_text = ""
+        n = len(self.lrc_trans_lines)
+        if n:
+            self._hint_status(f"歌词自动翻译完成（{n} 行）", kind="success")
+        else:
+            self._hint_status("歌词自动翻译未获得结果", kind="warning")
+
     def _toggle_console(self) -> None:
         """打开/关闭控制台窗口。"""
         if getattr(self, "console", None) is not None:
@@ -1782,7 +2049,8 @@ class LrcPlayerApp:
 
     def _disable_op_controls(self) -> None:
         """非 sounddevice 后端时禁用倍速/保音高/音高/平衡/增益控件（音量保留）。"""
-        for w in (self.op.speed_scale, self.op.pitch_btn, self.op.pitch_scale,
+        for w in (self.op.speed_scale, *self.op.pitch_fix_btns.values(),
+                  self.op.pitch_scale,
                   self.op.balance_scale, self.op.gain_scale):
             try:
                 w.config(state="disabled")
@@ -1809,7 +2077,7 @@ class LrcPlayerApp:
             w.config(state=track_state)
 
         # 倍速/保音高/音高/平衡/增益：仅 sounddevice 后端可用
-        op_widgets = (self.op.speed_scale, self.op.pitch_btn,
+        op_widgets = (self.op.speed_scale, *self.op.pitch_fix_btns.values(),
                       self.op.pitch_scale, self.op.balance_scale,
                       self.op.gain_scale)
         if self.engine.backend == "sounddevice":
@@ -1895,7 +2163,12 @@ class LrcPlayerApp:
         「音频后端不可用」；否则 → 「就绪」。扫描进行中不调用本方法
         （「解析中」优先）；由扫描结束（`_on_scan_finished`）与预热完成
         回调（`_on_heavy_modules_ready`）触发。
+        V1.14.2：存在后台任务常驻状态（如自动翻译进度）时优先显示它。
         """
+        if getattr(self, "_busy_status_text", ""):
+            self._prog_var.set(self._busy_status_text)
+            self._refresh_status_bar()
+            return
         if not self._preheat_done:
             self._prog_var.set(INIT_STATUS_TEXT)
         elif not self.engine.ready:
@@ -2430,6 +2703,7 @@ class LrcPlayerApp:
         self.lrc_path = path
         self._refresh_lyric_display()
         self._update_info()
+        self._maybe_auto_translate()   # 外语歌词自动翻译（V1.14.0）
 
     def _clear_lrc(self) -> None:
         """清除当前歌词数据（含独立翻译时间轴，V1.12.0）。"""
@@ -3376,6 +3650,11 @@ class LrcPlayerApp:
             "lyric_alpha": self._lyric_bar_alpha,
             "lyric_width": self._lyric_bar_width_pct,
             "lyric_font": self._lyric_bar_font_size,
+            # 其他区开关（V1.14.0；开发者选项不持久化）
+            "experimental": bool(self.experimental_enabled),
+            "auto_translate": bool(self.auto_translate_enabled),
+            "translate_engine": self.translate_engine,
+            "auto_subtitle": bool(self.auto_subtitle_enabled),
         }
 
     def _collect_persist(self) -> dict:
@@ -3532,6 +3811,16 @@ class LrcPlayerApp:
         # 桌面歌词条模式（persist=False：不触发保存）
         self._set_lyric_bar_mode(str(cfg.get("lyric_bar", "off")),
                                   persist=False)
+
+        # 其他区开关（V1.14.0；开发者选项不持久化，恒为关）
+        self.experimental_enabled = bool(cfg.get("experimental", False))
+        self.auto_translate_enabled = bool(cfg.get("auto_translate", False))
+        eng = str(cfg.get("translate_engine", tran.DEFAULT_ENGINE))
+        self.translate_engine = (eng if eng in tran.ENGINES
+                                 else tran.DEFAULT_ENGINE)
+        self.auto_subtitle_enabled = bool(cfg.get("auto_subtitle", False))
+        self.dev_options_enabled = False
+        self._sync_other_ui()
 
     def _load_persisted_state(self) -> None:
         """启动时读取 data.json：应用配置；计划恢复文件夹（后台自动扫描，跳过缺失）。"""
