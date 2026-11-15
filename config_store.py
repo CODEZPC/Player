@@ -44,7 +44,8 @@ DEFAULTS: dict = {
         "experimental": False,   # 实验性功能（V1.14.0）
         "auto_translate": False,  # 歌词自动翻译（V1.14.0）
         "translate_engine": "bing",  # 翻译引擎：bing / bilibili（V1.14.0）
-        "auto_subtitle": False,  # 自动字幕（V1.14.0；接口未接入）
+        "auto_subtitle": False,  # 自动字幕（V1.14.0；V1.14.3 接入转写）
+        "translate_parallel": 7,  # 翻译并行度 1~10（V1.14.3）
     },
 }
 

@@ -14,6 +14,7 @@
    并在主窗口显示后调度重量级模块的后台预热（cmd_analyze._preheat_heavy_modules）。
 """
 
+import multiprocessing
 import sys
 import threading
 import time
@@ -50,6 +51,9 @@ def _pump_until(root: tk.Tk, preload_done: threading.Event) -> None:
 
 
 def main() -> None:
+    # 窗口版程序无控制台：第三方库（如 translators 经 exejs 调 node.exe）
+    # 启动的控制台子进程会闪出黑窗 → 统一注入 CREATE_NO_WINDOW（V1.14.19）
+    utils.suppress_child_console_windows()
     initial_file = sys.argv[1] if len(sys.argv) > 1 else None
 
     # 0. 最早期单实例互斥：绑定 IPC 端口（毫秒级；一旦成功，端口即被占用，
@@ -89,4 +93,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # PyInstaller 打包后 multiprocessing（spawn）启的子进程是同一个 exe：
+    # freeze_support() 必须最先调用，由其截获 `--multiprocessing-fork` 并进入
+    # 语音转写 worker 主循环，而不是又开一个播放器（V1.14.7）
+    multiprocessing.freeze_support()
     main()

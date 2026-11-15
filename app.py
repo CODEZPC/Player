@@ -57,6 +57,10 @@ STATUS_FLASH_WHITE_MS = 70       # 白闪持续
 STATUS_FLASH_FADE_MS = 450       # 淡出总时长
 STATUS_FLASH_STEP_MS = 24        # 淡出帧间隔
 
+# 语音转写子进程轮询间隔（V1.14.7）：兼做「已用时长」刷新节拍
+SUBTITLE_POLL_MS = 100
+SUBTITLE_TICK_SEC = 1.0          # 「已用 x 秒」刷新间隔
+
 # 全窗口弹窗配色（V1.12.16）：kind → (遮罩背景, 强调色)
 DIALOG_KINDS = {
     "info":     ("#242B33", ACCENT_COLOR),
@@ -164,12 +168,34 @@ class LrcPlayerApp:
         # ---- 其他：实验性功能 / 开发者选项（V1.14.0）----
         self.experimental_enabled = False      # 实验性功能（持久化）
         self._busy_status_text = ""            # 后台任务常驻状态（V1.14.2）
+        self._busy_owner = ""                  # subtitle / translate（V1.14.6）
+        self.translate_parallel = 7            # 翻译并行度 1~10（V1.14.3）
+        # ---- 语音转写（自动字幕）——V1.14.7 改为独立子进程 ----
+        self._subtitle_gen = 0                 # 转写世代（切歌/关闭即失效）
+        self._subtitle_worker = None          # audio_to_text.SubtitleWorker（懒创建）
+        self._subtitle_path = ""               # 正在转写的音频路径（空=无任务）
+        self._subtitle_phase = ""              # prepare / transcribe
+        self._subtitle_t0 = 0.0                # 任务开始时刻（算已用时长）
+        self._subtitle_last_tick = 0.0         # 上次刷新已用时长的时刻
+        self._subtitle_seg_text = ""           # 分段进度文本 "k/N"（V1.14.8）
+        self._subtitle_partial: list = []      # 已到达的逐段结果（V1.14.9）
+        # ---- 底部任务框（V1.14.14）：转写/翻译进度不再占用状态栏 ----
+        self._tasks: dict[str, str] = {}       # 保序：任务 key → 显示文本
+        self._task_boxes: dict[str, tuple] = {}  # key → (frame, label)，就地更新（V1.14.17）
+        self._task_area_packed = False
+        self._subtitle_poll_id = None          # 子进程消息轮询 after id
+        self._subtitle_cache: dict[str, list] = {}   # 路径 → 转写结果（本次运行内）
         self.auto_translate_enabled = False    # 歌词自动翻译（持久化）
         self.translate_engine = tran.DEFAULT_ENGINE   # bing / bilibili
         self.auto_subtitle_enabled = False     # 自动字幕（持久化；接口未接入）
         self.dev_options_enabled = False       # 开发者选项（**不持久化**）
         self._trans_gen = 0                    # 自动翻译世代（切歌/关闭即失效）
         self._trans_thread: threading.Thread | None = None
+        # 翻译增量队列（V1.14.16）：逐段转写完的歌词可随时加入
+        self._trans_queue: list[tuple[float, str]] = []
+        self._trans_lock = threading.Lock()
+        self._trans_done_ts: set[float] = set()   # 已翻译的时间戳（去重）
+        self._trans_done_count = 0                # 本批次已翻行数（任务框显示）
 
         # ---- 歌词浮层 ----
         self._lyric_overlay = None  # 全窗口歌词浮层 Frame
@@ -580,11 +606,100 @@ class LrcPlayerApp:
         op_col.grid(row=0, column=2, sticky="nsew", padx=(self._px(12), 0))
         op_col.pack_propagate(False)  # 子控件为 pack，须用 pack_propagate 保持定宽
         self.op_col = op_col   # 编辑器面板右边界参照（不覆盖操作区，V1.8.8）
+        # 任务框区（V1.14.14）：必须先于 OperationPanel 建（pack 顺序决定优先级），
+        # 无任务时高度为 0，不会占位；有任务时操作面板让出底部空间
+        self._build_task_area(op_col)
         # 操作区面板（自包含滚动容器 + 倍速/音高/音量/高级/选项，见 operation_panel.py）
         self.op = OperationPanel(self, op_col)
 
         # ---- 状态栏 ----
         self._build_status_bar()
+
+    # ---------------- 底部任务框（V1.14.14）----------------
+
+    def _build_task_area(self, parent: tk.Frame) -> None:
+        """创建底部任务框容器（转写/翻译进度展示区，V1.14.14）。
+
+        配色参考全窗口弹窗：`DIALOG_KINDS["info"]` 的深底 + 强调蓝边框。
+        无任务时不 pack（不占高度）；有任务时以 `before=操作面板` 插在它前面，
+        保证先分到空间、面板自动向上缩小。
+        """
+        self._task_area = tk.Frame(parent, bg=BG_COLOR)
+
+    def _set_task(self, key: str, text: str) -> None:
+        """新增/更新一个任务框（V1.14.14）；文本相同则不重绘。"""
+        if not text:
+            self._clear_task(key)
+            return
+        if self._tasks.get(key) == text:
+            return
+        self._tasks[key] = text
+        self._sync_task_boxes()
+
+    def _clear_task(self, key: str) -> None:
+        """移除某个任务框（幂等）。"""
+        if key in self._tasks:
+            del self._tasks[key]
+            self._sync_task_boxes()
+
+    def _sync_task_boxes(self) -> None:
+        """按 `_tasks` **就地**同步任务框（V1.14.17 修频闪）。
+
+        旧实现在每次文本变化时销毁并重建全部方框，而进度每秒/每行都会变
+        （转写已用时、翻译计数）——表现为框体不断闪烁。现改为：
+        已存在的框只改 Label 文字，仅在任务增删时才创建/销毁。
+        """
+        area = getattr(self, "_task_area", None)
+        if area is None:
+            return
+        boxes = self._task_boxes
+        # 1) 移除已不存在的任务框
+        for key in [k for k in boxes if k not in self._tasks]:
+            frame, _label = boxes.pop(key)
+            try:
+                frame.destroy()
+            except tk.TclError:
+                pass
+        # 2) 新增或就地更新
+        panel_bg = DIALOG_KINDS["info"][0]        # 与全窗口弹窗同一深底
+        for key, text in self._tasks.items():
+            entry = boxes.get(key)
+            if entry is None:
+                frame = tk.Frame(area, bg=panel_bg,
+                                 highlightbackground=ACCENT_COLOR,
+                                 highlightcolor=ACCENT_COLOR,
+                                 highlightthickness=max(1, self._px(1)))
+                label = tk.Label(frame, text=text, bg=panel_bg, fg=FG_COLOR,
+                                 font=self.info_font, anchor="w",
+                                 justify="left", padx=self._px(8),
+                                 pady=self._px(4))
+                label.pack(fill="x")
+                frame.pack(fill="x", pady=(0, self._px(6)))
+                boxes[key] = (frame, label)
+            else:
+                _frame, label = entry
+                try:
+                    if label.cget("text") != text:
+                        label.config(text=text)
+                except tk.TclError:
+                    pass
+        # 3) 区域显隐（仅在状态切换时 pack/pack_forget，避免重复重排）
+        try:
+            if not self._tasks:
+                if self._task_area_packed:
+                    area.pack_forget()
+                    self._task_area_packed = False
+            elif not self._task_area_packed:
+                scroller = getattr(getattr(self, "op", None), "scroller", None)
+                if scroller is not None:
+                    # before= 操作面板：保持「任务区先分空间、面板占剩余高度」
+                    area.pack(side="bottom", fill="x",
+                              pady=(self._px(8), 0), before=scroller)
+                else:
+                    area.pack(side="bottom", fill="x", pady=(self._px(8), 0))
+                self._task_area_packed = True
+        except tk.TclError:
+            pass
 
     def _build_status_bar(self) -> None:
         """窗口底部状态栏：程序状态、音频信息、音量、列表统计。"""
@@ -1510,6 +1625,88 @@ class LrcPlayerApp:
         self._sync_other_ui()
         self._schedule_config_save()
 
+    def _set_translate_parallel(self, n: int) -> None:
+        """设置翻译并行度（1~10，默认 7；V1.14.3）。"""
+        try:
+            v = int(round(float(n)))
+        except Exception:
+            v = 7
+        self.translate_parallel = max(1, min(10, v))
+        self._schedule_config_save()
+
+    def _set_auto_subtitle(self, on: bool) -> None:
+        """自动字幕（听力辅助）开关（V1.14.3；开启需警告确认）。
+
+        V1.14.7：已是目标开关状态时直接返回——否则再点一次「开」会重新
+        启动一遍转写。
+        V1.14.20：转写组件/模型缺失时，在警告确认之后再加一道**蓝色**确认
+        （将下载约 2.8GB），取消则不启用。
+        """
+        on = bool(on)
+        if on == self.auto_subtitle_enabled:
+            self._sync_other_ui()
+            return
+        if on and not self.auto_subtitle_enabled:
+            if self._dialog_open:
+                return
+            ans = self.show_dialog(
+                "自动字幕（听力辅助）",
+                "启用自动字幕开关（听力辅助）后，将自动对无歌词文件的音频"
+                "进行语音转写，此过程需要联网上传音频文件，会消耗数据流量，"
+                "需要一定的处理时间，且对歌曲的转写易出错。\n\n确定要启用吗？",
+                kind="warning",
+                buttons=(("确定", "yes"), ("取消", "no")))
+            if ans != "yes":
+                self._sync_other_ui()
+                return
+            if not self._confirm_download_extensions():
+                self._sync_other_ui()
+                return
+        self.auto_subtitle_enabled = on
+        self._sync_other_ui()
+        self._schedule_config_save()
+        if on:
+            self._maybe_auto_subtitle()
+        else:
+            self._cancel_auto_subtitle()
+
+    def _confirm_download_extensions(self) -> bool:
+        """转写组件/模型缺失时的二次确认（蓝色，V1.14.20）。
+
+        仅当 `_internal/extensions` 里缺组件或模型时才弹；文案按**实际缺失项**
+        组合（都缺时合计约 2.8GB）。返回 True 表示继续启用（缺什么会在后台
+        自动下载），False 表示放弃启用。
+        """
+        try:
+            import audio_to_text
+            missing = audio_to_text.missing_packages()
+        except Exception:
+            return True                 # 拿不到信息就不拦
+        if not missing:
+            return True
+        lines: list[str] = []
+        total_gb = 0.0
+        try:
+            comp_gb = float(audio_to_text.COMPONENT_SIZE_GB)
+            model_gb = float(audio_to_text.MODEL_SIZE_GB)
+        except Exception:
+            comp_gb, model_gb = 0.3, 2.5
+        if "component" in missing:
+            lines.append(f"· 转写程序包 audio_to_text.zip（约 {comp_gb:.1f}GB）")
+            total_gb += comp_gb
+        if "model" in missing:
+            lines.append(f"· 语音模型包 modelscope.zip（约 {model_gb:.1f}GB）")
+            total_gb += model_gb
+        body = ("使用自动字幕需要先下载以下组件（只需下载一次，"
+                "之后可离线使用）：\n\n"
+                + "\n".join(lines)
+                + f"\n\n共约 {total_gb:.1f}GB。下载在后台进行，"
+                "期间可以继续播放。\n\n确定要现在下载吗？")
+        ans = self.show_dialog(
+            "下载转写组件", body, kind="info",
+            buttons=(("确定下载", "yes"), ("取消", "no")))
+        return ans == "yes"
+
     def _set_dev_options(self, on: bool) -> None:
         """开发者选项开关（默认关、非持久化；关闭时重置：IPC 恢复 + 关控制台）。"""
         on = bool(on)
@@ -1559,9 +1756,17 @@ class LrcPlayerApp:
     # ---------------- 歌词自动翻译（V1.14.0）----------------
 
     def _cancel_auto_translate(self) -> None:
-        """作废进行中的自动翻译（世代 +1，后台线程自行退出）。"""
+        """作废进行中的自动翻译（世代 +1，队列清空，worker 自行退出）。"""
         self._trans_gen += 1
-        self._busy_status_text = ""
+        with self._trans_lock:
+            self._trans_queue.clear()
+        self._trans_done_count = 0
+        self._clear_task("translate")      # 任务框移除（V1.14.14）
+        if getattr(self, "_busy_owner", "") == "translate":
+            self._busy_status_text = ""
+            self._busy_owner = ""
+            if hasattr(self, "_prog_var"):
+                self._refresh_idle_status()
 
     def _stem_translate_items(self) -> list[tuple[float, str]]:
         """构造自动翻译项（V1.14.1）：只取主干行，时间戳对齐「组首字」。
@@ -1585,114 +1790,480 @@ class LrcPlayerApp:
         return items
 
     def _maybe_auto_translate(self) -> None:
-        """满足条件时启动自动翻译：实验性开 + 自动翻译开 + 无翻译 + 外语歌词。"""
+        """满足条件时把（尚未翻译的）主干行放进翻译队列（V1.14.16）。"""
         if not (self.experimental_enabled and self.auto_translate_enabled):
             return
-        if not self.lrc_lines or self.lrc_trans_lines:
+        if not self.lrc_lines:
             return
-        items = self._stem_translate_items()
-        texts = [t for _, t in items]
-        if not texts or not tran.is_foreign_lyric(texts):
-            return
-        self._start_auto_translate()
+        self._enqueue_translation(self._stem_translate_items())
 
-    def _start_auto_translate(self) -> None:
-        """后台线程逐行翻译主干歌词（边翻边显示，V1.14.0；V1.14.1 仅主干行）。
+    @staticmethod
+    def _rotate_by_position(items, position: float):
+        """（V1.14.13 引入，V1.14.14 已被 `utils.next_forward_index()` 取代，保留备用）
 
-        V1.14.2：状态栏持续显示进度「正在自动翻译 k/N」。
+        把待处理项从当前播放位置所在行开始环形重排。
         """
-        self._cancel_auto_translate()
-        gen = self._trans_gen
-        items = self._stem_translate_items()
+        if not items or not position or position <= 0 or len(items) <= 1:
+            return list(items)
+        idx = 0
+        for i, (ts, _text) in enumerate(items):
+            if ts <= position:
+                idx = i
+            else:
+                break
+        return items[idx:] + items[:idx]
+
+    def _enqueue_translation(self, items) -> None:
+        """把需要翻译的行加入翻译队列，并确保 worker 在跑（V1.14.16）。
+
+        - **逐行判定**：`tran.needs_translate()` —— 整句没有任何中文才翻译
+          （日语里的汉字按需求不算中文）；纯中文句不提交，译文文本为空；
+        - 已翻译过（`_trans_done_ts`）与队列中已有的行不重复加入；
+        - 转写逐段完成时会用本方法把**该段**立刻排进队列（见
+          `_append_subtitle_items`）。
+        """
+        if not (self.experimental_enabled and self.auto_translate_enabled):
+            return
         if not items:
             return
-        engine = self.translate_engine
-        total = len(items)
-        self._set_busy_status(
-            f"正在自动翻译歌词 0/{total}（引擎 "
-            f"{tran.ENGINE_LABELS.get(engine, engine)}）…")
+        added = 0
+        with self._trans_lock:
+            # 队列空且无 worker → 视为新批次，计数归零（含中文句计入的总量）
+            if not self._trans_queue and not (
+                    self._trans_thread is not None
+                    and self._trans_thread.is_alive()):
+                self._trans_done_count = 0
+            queued = {round(ts, 3) for ts, _text in self._trans_queue}
+            for ts, text in items:
+                key = round(float(ts), 3)
+                if key in queued or key in self._trans_done_ts:
+                    continue
+                if not tran.needs_translate(text):
+                    # 中文句（或仅数字/符号）：不提交翻译，但计入进度（V1.14.17）
+                    self._trans_done_ts.add(key)
+                    self._trans_done_count += 1
+                    continue
+                self._trans_queue.append((float(ts), str(text).strip()))
+                queued.add(key)
+                added += 1
+        if not added:
+            return
+        self._ensure_trans_worker()
 
-        def worker() -> None:
-            results: list[tuple[float, str]] = []
-            done = 0
-            for ts, txt in items:
-                if gen != self._trans_gen:
-                    return
-                ok, out = tran.translate(txt, engine=engine)
-                if gen != self._trans_gen:
-                    return
-                done += 1
-                if ok:
-                    results.append((ts, out))
-                    snapshot = list(results)
+    def _ensure_trans_worker(self) -> None:
+        """确保翻译 worker 在跑（队列非空而线程已退出时重新拉起）。"""
+        th = self._trans_thread
+        if th is not None and th.is_alive():
+            self._update_translate_progress(self._trans_gen)
+            return
+        gen = self._trans_gen
+        self._trans_thread = threading.Thread(
+            target=self._trans_worker, args=(gen,), daemon=True)
+        self._trans_thread.start()
+
+    def _pop_trans_item(self):
+        """按当前播放位置从队列取一行（往后最近；拖动后实时跟随，V1.14.14）。"""
+        with self._trans_lock:
+            if not self._trans_queue:
+                return None
+            try:
+                pos = float(self._current_time() or 0.0)
+            except Exception:
+                pos = 0.0
+            times = [ts for ts, _text in self._trans_queue]
+            idx = utils.next_forward_index(
+                set(range(len(times))), times, pos)
+            return self._trans_queue.pop(idx)
+
+    def _trans_queue_empty(self) -> bool:
+        with self._trans_lock:
+            return not self._trans_queue
+
+    def _trans_worker(self, gen: int) -> None:
+        """翻译 worker（后台线程）：并行拉取队列，边翻边落地（V1.14.16）。
+
+        - 每次补并发槽前重新读播放位置 → 拖动进度条后立即从新位置继续；
+        - 队列空即退出（后续 `_enqueue_translation()` 会重新拉起）。
+        """
+        from concurrent.futures import (ThreadPoolExecutor,
+                                        FIRST_COMPLETED, wait)
+
+        engine = self.translate_engine
+        parallel = max(1, min(10, int(self.translate_parallel or 7)))
+        pool = ThreadPoolExecutor(max_workers=parallel)
+        running: dict = {}
+        translated = 0
+        try:
+            while gen == self._trans_gen:
+                while len(running) < parallel:
+                    item = self._pop_trans_item()
+                    if item is None:
+                        break
+                    ts, text = item
+                    running[pool.submit(
+                        tran.translate, text, engine=engine)] = ts
+                if not running:
+                    break                       # 队列空 → 退出
+                finished, _ = wait(list(running), timeout=0.15,
+                                   return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    ts = running.pop(fut, None)
+                    if ts is None:
+                        continue
+                    try:
+                        ok, out = fut.result()
+                    except Exception:
+                        ok, out = False, ""
+                    if ok:
+                        translated += 1
+                        try:
+                            self.root.after(
+                                0, lambda t=ts, o=out, g=gen:
+                                self._apply_one_translation(t, o, g))
+                        except Exception:
+                            return
                     try:
                         self.root.after(
-                            0, lambda s=snapshot, g=gen:
-                            self._apply_auto_translation(s, g))
+                            0, lambda g=gen: self._update_translate_progress(g))
                     except Exception:
                         return
-                d = done
-                try:
-                    self.root.after(
-                        0, lambda k=d, g=gen, t=total:
-                        self._update_translate_progress(k, t, g))
-                except Exception:
-                    return
+        finally:
+            pool.shutdown(wait=False)
+        if gen == self._trans_gen:
             try:
                 self.root.after(
-                    0, lambda g=gen: self._finish_auto_translation(g))
+                    0, lambda g=gen, n=translated:
+                    self._finish_translate_batch(g, n))
             except Exception:
                 pass
 
-        self._trans_thread = threading.Thread(target=worker, daemon=True)
-        self._trans_thread.start()
+    # ---------------- 自动字幕（语音转写，V1.14.3）----------------
 
-    def _set_busy_status(self, text: str) -> None:
-        """设置常驻状态文本（不自动恢复「就绪」，V1.14.2）。
+    def _cancel_auto_subtitle(self) -> None:
+        """作废进行中的语音转写：世代 +1、终止子进程、移除任务框。
 
-        供后台任务（自动翻译等）显示进度；任务结束时再由 `_hint_status`
-        恢复常规提示流程。
+        V1.14.7：改为**真正终止子进程**；V1.14.14：进度改在底部任务框，
+        取消即移除任务框（状态栏不再承载任务信息）。
         """
+        self._subtitle_gen += 1
+        self._stop_subtitle_poll()
+        self._subtitle_path = ""
+        self._subtitle_phase = ""
+        self._subtitle_seg_text = ""
+        self._subtitle_partial = []
+        self._clear_task("subtitle")
+        worker = getattr(self, "_subtitle_worker", None)
+        if worker is not None:
+            try:
+                # 正在转写 → terminate（真正取消）；空闲 → 保留已加载模型的热进程
+                worker.cancel()
+            except Exception:
+                pass
+        if getattr(self, "_busy_owner", "") == "subtitle":
+            self._busy_status_text = ""
+            self._busy_owner = ""
+            if hasattr(self, "_prog_var"):
+                self._refresh_idle_status()
+
+    def _ensure_subtitle_worker(self):
+        """懒创建转写子进程句柄（模块本身很轻，不导入 funasr）。"""
+        worker = getattr(self, "_subtitle_worker", None)
+        if worker is not None:
+            return worker
+        try:
+            import audio_to_text
+            self._subtitle_worker = audio_to_text.SubtitleWorker()
+        except Exception:
+            self._subtitle_worker = None
+        return self._subtitle_worker
+
+    def _maybe_auto_subtitle(self) -> None:
+        """满足条件时启动转写：实验性开 + 自动字幕开 + 无歌词文件。
+
+        V1.14.7：同一音频本次运行已转写过 → 直接复用缓存结果（切歌回来、
+        再次点「开」或重新播放都不再重转）；同一音频正在转写 → 不重复启动。
+        """
+        if not (self.experimental_enabled and self.auto_subtitle_enabled):
+            return
+        if not self.audio_path or self.lrc_path:
+            return          # 已有歌词文件无需转写
+        path = self.audio_path
+        cached = self._subtitle_cache.get(path)
+        if cached:
+            self._apply_subtitle_items(cached)
+            return
+        if path == self._subtitle_path:
+            return          # 该音频正在转写中
+        self._start_auto_subtitle()
+
+    def _start_auto_subtitle(self) -> None:
+        """在**独立子进程**中转写（V1.14.7），主线程只轮询进度。
+
+        子进程隔离后 funasr 不再与主进程抢 GIL/CPU 核心，播放中的音频不会
+        撕裂；状态栏进度由 `_poll_subtitle_worker()` 驱动。
+        V1.14.18：**取消内存检查/限制**（V1.14.10 引入的 3.5GB 门槛已移除）。
+        """
+        path = self.audio_path
+        if not path:
+            return
+        self._cancel_auto_subtitle()      # 作废旧任务（空闲则保留热进程）
+        gen = self._subtitle_gen
+        worker = self._ensure_subtitle_worker()
+        try:
+            start_at = float(self._current_time() or 0.0)
+        except Exception:
+            start_at = 0.0
+        if worker is None or not worker.submit(path, start_at):
+            self._hint_status("无法启动语音转写进程", kind="error")
+            return
+        self._subtitle_path = path
+        self._subtitle_phase = "prepare"
+        self._subtitle_partial = []
+        self._subtitle_t0 = time.monotonic()
+        self._subtitle_last_tick = 0.0
+        self._set_task("subtitle", "语音转写　正在准备…")   # V1.14.14：任务框
+        self._stop_subtitle_poll()
+        self._subtitle_poll_id = self.root.after(
+            SUBTITLE_POLL_MS, lambda: self._poll_subtitle_worker(gen))
+
+    def _stop_subtitle_poll(self) -> None:
+        """停止子进程消息轮询（幂等）。"""
+        pid = getattr(self, "_subtitle_poll_id", None)
+        self._subtitle_poll_id = None
+        if pid is not None:
+            try:
+                self.root.after_cancel(pid)
+            except Exception:
+                pass
+
+    def _poll_subtitle_worker(self, gen: int) -> None:
+        """主线程：取子进程消息 → 更新状态栏（兼做「已用时长」节拍，V1.14.7）。"""
+        self._subtitle_poll_id = None
+        if gen != self._subtitle_gen:
+            return
+        worker = getattr(self, "_subtitle_worker", None)
+        if worker is None:
+            return
+        # 持续把当前播放位置写给子进程：它在**模型加载完成后**重新读取，
+        # 保证优先转写的确实在此刻正在播放的段（V1.14.11）
+        try:
+            if self.audio_path == self._subtitle_path:
+                worker.set_position(self._current_time() or 0.0)
+        except Exception:
+            pass
+        while True:
+            msg = worker.poll()
+            if msg is None:
+                break
+            kind, payload = msg
+            if kind == "event":
+                ek, text = payload
+                self._on_subtitle_event(ek, text, gen)
+            elif kind == "partial":                 # 某段完成 → 立即显示（V1.14.9）
+                self._append_subtitle_items(payload, gen)
+            elif kind == "done":
+                self._finish_auto_subtitle(payload, gen, "")
+                return
+            else:                              # error
+                self._finish_auto_subtitle([], gen, str(payload))
+                return
+        # 组件下载/进程启动阶段还没创建进程句柄（busy 为 True），
+        # 此时不能按「进程已退出」处理（V1.14.20）
+        if not worker.alive() and not worker.busy():
+            self._finish_auto_subtitle([], gen, "转写进程异常退出")
+            return
+        self._tick_subtitle_elapsed(gen)
+        self._subtitle_poll_id = self.root.after(
+            SUBTITLE_POLL_MS, lambda: self._poll_subtitle_worker(gen))
+
+    def _on_subtitle_event(self, kind: str, text: str, gen: int) -> None:
+        """主线程：处理子进程上报的进度事件（V1.14.7 / V1.14.8）。"""
+        if gen != self._subtitle_gen:
+            return
+        if kind == "transcribe":
+            # 进入转写阶段：状态栏改为显示（段进度 +）已用时长
+            if self._subtitle_phase != "transcribe":
+                self._subtitle_phase = "transcribe"
+                self._subtitle_last_tick = 0.0     # 立刻刷新一次
+            return
+        if kind == "progress":                     # 分段进度 "k/N"
+            self._subtitle_seg_text = text
+            self._subtitle_phase = "transcribe"
+            self._subtitle_last_tick = 0.0
+            return
+        if text:                                   # download / load 阶段原文显示
+            self._set_task("subtitle", f"语音转写　{text}")
+
+    def _tick_subtitle_elapsed(self, gen: int) -> None:
+        """任务框显示「语音转写　第 k/N 段 · 已用 mm:ss」（V1.14.7 / V1.14.14）。
+
+        段号来自 V1.14.8 的真实分段；有段号时一并显示。
+        """
+        if gen != self._subtitle_gen or self._subtitle_phase != "transcribe":
+            return
+        now = time.monotonic()
+        if now - self._subtitle_last_tick < SUBTITLE_TICK_SEC:
+            return
+        self._subtitle_last_tick = now
+        used = format_time(now - self._subtitle_t0)
+        if self._subtitle_seg_text:
+            text = f"语音转写　第 {self._subtitle_seg_text} 段 · 已用 {used}"
+        else:
+            text = f"语音转写　已用 {used}"
+        self._set_task("subtitle", text)
+
+    def _force_busy_status(self, text: str, owner: str) -> None:
+        """直接写入状态栏任务进度（V1.14.6；V1.14.14 起转写/翻译已改用任务框，本方法备用）。
+
+        进度需要持续刷新，不能因为「提示优先」而停止更新；提示会在下一次
+        `_hint_status` 时重新插入，结束后仍回到本进度。
+        """
+        self._busy_status_text = text
+        self._busy_owner = owner
         if self._status_hint_timer is not None:
             try:
                 self.root.after_cancel(self._status_hint_timer)
             except Exception:
                 pass
             self._status_hint_timer = None
-        self._busy_status_text = text
         try:
             self._prog_var.set(text)
         except Exception:
             pass
 
-    def _update_translate_progress(self, done: int, total: int,
-                                   gen: int) -> None:
-        """更新状态栏自动翻译进度（主线程，V1.14.2）。"""
+    def _append_subtitle_items(self, items, gen: int) -> None:
+        """某一段转写完成 → 立即追加并刷新歌词显示（V1.14.9）。
+
+        不必等全部段转写完；用户能先看到已转出部分的字幕。
+        """
+        if gen != self._subtitle_gen or not items:
+            return
+        if self.audio_path != self._subtitle_path:
+            return
+        self._subtitle_partial.extend(items)
+        self._subtitle_partial.sort(key=lambda x: x[0])
+        if self.lrc_path:          # 期间加载了真实歌词文件 → 不覆盖
+            return
+        self.lrc_lines = [(float(t), str(txt)) for t, txt in self._subtitle_partial]
+        self.lrc_times = [t for t, _ in self.lrc_lines]
+        self.current_lrc_index = -1
+        self._cur_trans_is_placeholder = False
+        self._refresh_lyric_display()
+        self._sync_lyrics(self._current_time())
+        self._update_info()
+        # 本段转写完 → **立刻**把该段需要翻译的行加入翻译队列（V1.14.16）
+        self._enqueue_translation(items)
+
+    def _finish_auto_subtitle(self, items, gen: int, err: str) -> None:
+        """转写结束（主线程）：成功则把结果作为歌词时间轴显示并缓存。"""
+        if gen != self._subtitle_gen:
+            return
+        path = self._subtitle_path
+        self._subtitle_path = ""
+        self._subtitle_phase = ""
+        self._subtitle_seg_text = ""
+        self._subtitle_partial = []
+        self._stop_subtitle_poll()
+        self._clear_task("subtitle")      # 任务框移除（V1.14.14）
+        self._busy_status_text = ""
+        self._busy_owner = ""
+        if err:
+            self._hint_status(f"语音转写失败：{err}", kind="error")
+            return
+        if not items:
+            self._hint_status("语音转写未获得内容", kind="warning")
+            return
+        if path:
+            # 本次运行内缓存：切回该曲 / 重复播放不再重新转写（V1.14.7）
+            self._subtitle_cache[path] = list(items)
+        self._apply_subtitle_items(items)
+        self._hint_status(
+            f"自动字幕已生成（{len(self.lrc_lines)} 段）", kind="success")
+
+    def _apply_subtitle_items(self, items) -> None:
+        """把转写（或缓存）结果作为歌词时间轴显示（仅内存，不写文件）。"""
+        self.lrc_lines = [(float(t), str(txt)) for t, txt in items]
+        self.lrc_times = [t for t, _ in self.lrc_lines]
+        self.lrc_trans_lines = []
+        self.lrc_trans_times = []
+        self._cur_trans_text = ""
+        self._cur_trans_is_placeholder = False
+        self.current_lrc_index = -1
+        self.lrc_path = None          # 字幕无对应歌词文件
+        # 转写期间可能仍处于占位歌词状态：直接刷新显示与当前歌词同步
+        self._refresh_lyric_display()
+        self._sync_lyrics(self._current_time())
+        self._update_info()
+        self._maybe_auto_translate()
+
+    def _set_busy_status(self, text: str, owner: str = "") -> None:
+        """设置状态栏常驻状态文本（V1.14.2；V1.14.14 起转写/翻译改用任务框，本方法备用）。
+
+        供后台任务（自动翻译 / 自动字幕）显示进度；`owner` 用于区分任务，
+        取消任务时只清自己的忙时状态（V1.14.6）。
+        提示正在显示时不抢占（提示 2.5s 后由 `_clear_status_hint` 恢复本进度）。
+        """
+        self._busy_status_text = text
+        self._busy_owner = owner
+        if self._status_hint_timer is not None:
+            return          # 临时提示优先展示，结束后自动回到任务进度
+        try:
+            self._prog_var.set(text)
+        except Exception:
+            pass
+
+    def _update_translate_progress(self, gen: int) -> None:
+        """更新翻译进度任务框（主线程，V1.14.14 / V1.14.16 增量队列）。"""
         if gen != self._trans_gen:
             return
-        self._set_busy_status(f"正在自动翻译歌词 {done}/{total} …")
-
-    def _apply_auto_translation(self, results, gen: int) -> None:
-        """把已翻译的行写入翻译轴并刷新显示（主线程）。"""
-        if gen != self._trans_gen or not results:
+        with self._trans_lock:
+            remaining = len(self._trans_queue)
+        done = self._trans_done_count
+        total = done + remaining
+        if total <= 0:
             return
-        self.lrc_trans_lines = sorted(results, key=lambda x: x[0])
-        self.lrc_trans_times = [ts for ts, _ in self.lrc_trans_lines]
+        if remaining:
+            text = f"歌词翻译　{done}/{total}"
+        else:
+            text = f"歌词翻译　已完成 {done} 行"
+        self._set_task("translate", text)
+
+    def _apply_one_translation(self, ts: float, text: str, gen: int) -> None:
+        """单行译文落地（主线程）：追加进翻译轴并刷新显示（V1.14.16）。"""
+        if gen != self._trans_gen:
+            return
+        self._trans_done_ts.add(round(float(ts), 3))
+        self._trans_done_count += 1
+        self.lrc_trans_lines.append((float(ts), str(text)))
+        self.lrc_trans_lines.sort(key=lambda x: x[0])
+        self.lrc_trans_times = [t for t, _ in self.lrc_trans_lines]
         # 强制刷新缓存（用哨兵而非 None，避免其他处 .strip() 抛错）
         self._cur_trans_text = "\x00"
         self._cur_trans_is_placeholder = None
         self._sync_translation(self._current_time())
 
-    def _finish_auto_translation(self, gen: int) -> None:
-        """自动翻译结束提示（主线程）。"""
+    def _finish_translate_batch(self, gen: int, translated: int) -> None:
+        """翻译批次结束（主线程，V1.14.16）。
+
+        队列可能因为「转写又送来一段」而重新有内容 → 重新拉起 worker；
+        否则移除任务框；只有在**转写不在进行中**时才弹完成提示
+        （逐段翻译不逐段弹窗）。
+        """
         if gen != self._trans_gen:
             return
+        if not self._trans_queue_empty():
+            self._ensure_trans_worker()
+            return
+        self._clear_task("translate")
+        self._trans_done_count = 0        # 批次结束，计数归零（V1.14.17）
         self._busy_status_text = ""
+        self._busy_owner = ""
+        if translated <= 0:
+            return
+        if self._subtitle_path:
+            return          # 转写仍在进行：静默逐段翻译
         n = len(self.lrc_trans_lines)
-        if n:
-            self._hint_status(f"歌词自动翻译完成（{n} 行）", kind="success")
-        else:
-            self._hint_status("歌词自动翻译未获得结果", kind="warning")
+        self._hint_status(f"歌词自动翻译完成（{n} 行）", kind="success")
 
     def _toggle_console(self) -> None:
         """打开/关闭控制台窗口。"""
@@ -2660,7 +3231,11 @@ class LrcPlayerApp:
     # ==================================================================
 
     def _auto_load_lrc(self, audio_path: str) -> None:
-        """自动查找并加载与音频同目录同名的 .lrc 文件；缺失时用占位歌词。"""
+        """自动查找并加载与音频同目录同名的 .lrc 文件；缺失时用占位歌词。
+
+        V1.14.3：无歌词文件且启用了自动字幕时，后台转写生成歌词时间轴
+        （触发点在 `_apply_placeholder_lrc()`，覆盖所有无歌词路径，V1.14.5）。
+        """
         candidate = self._find_lrc_for_audio(audio_path)
         if candidate:
             self._load_lrc_file(candidate)
@@ -2680,6 +3255,12 @@ class LrcPlayerApp:
         self.lrc_path = None          # 无真实歌词文件
         self._refresh_lyric_display()
         self._update_info()
+        # 换曲（无歌词路径）：翻译轴与去重记录一并重置（V1.14.16）
+        self._trans_done_ts.clear()
+        self._trans_done_count = 0
+        # 无歌词文件 → 作废上一首的转写并尝试自动字幕（V1.14.5）
+        self._cancel_auto_subtitle()
+        self._maybe_auto_subtitle()
 
     @staticmethod
     def _find_lrc_for_audio(audio_path: str) -> str | None:
@@ -2703,6 +3284,9 @@ class LrcPlayerApp:
         self.lrc_path = path
         self._refresh_lyric_display()
         self._update_info()
+        self._cancel_auto_subtitle()   # 有真实歌词 → 作废进行中的转写（V1.14.5）
+        self._trans_done_ts.clear()    # 新歌词 → 翻译去重记录重置（V1.14.16）
+        self._trans_done_count = 0
         self._maybe_auto_translate()   # 外语歌词自动翻译（V1.14.0）
 
     def _clear_lrc(self) -> None:
@@ -2711,6 +3295,8 @@ class LrcPlayerApp:
         self.lrc_times.clear()
         self.lrc_trans_lines.clear()
         self.lrc_trans_times.clear()
+        self._trans_done_ts.clear()    # V1.14.16
+        self._trans_done_count = 0
         self._cur_trans_text = ""
         self.current_lrc_index = -1
         self.lrc_path = None
@@ -3429,7 +4015,14 @@ class LrcPlayerApp:
             pass
         self._status_hint_timer = None
         self._cancel_status_flash()
-        self._set_status_ready()
+        # 提示可临时插入：消失后若有后台任务进度则恢复它（V1.14.6）
+        if getattr(self, "_busy_status_text", ""):
+            try:
+                self._prog_var.set(self._busy_status_text)
+            except Exception:
+                pass
+        else:
+            self._set_status_ready()
 
     def _set_edit_lock_buttons(self, locked: bool) -> None:
         """歌词编辑锁定/解锁：禁用或恢复切歌相关按钮（上下曲/打开文件/播放此首）。"""
@@ -3655,6 +4248,7 @@ class LrcPlayerApp:
             "auto_translate": bool(self.auto_translate_enabled),
             "translate_engine": self.translate_engine,
             "auto_subtitle": bool(self.auto_subtitle_enabled),
+            "translate_parallel": int(self.translate_parallel),
         }
 
     def _collect_persist(self) -> dict:
@@ -3819,6 +4413,11 @@ class LrcPlayerApp:
         self.translate_engine = (eng if eng in tran.ENGINES
                                  else tran.DEFAULT_ENGINE)
         self.auto_subtitle_enabled = bool(cfg.get("auto_subtitle", False))
+        try:
+            self.translate_parallel = max(
+                1, min(10, int(round(float(cfg.get("translate_parallel", 7))))))
+        except Exception:
+            self.translate_parallel = 7
         self.dev_options_enabled = False
         self._sync_other_ui()
 
@@ -5258,6 +5857,12 @@ class LrcPlayerApp:
     def on_close(self) -> None:
         """窗口关闭时的清理。"""
         self._flush_config_save()   # 兜底保存最新配置/文件夹
+        worker = getattr(self, "_subtitle_worker", None)   # 回收转写子进程
+        if worker is not None:
+            try:
+                worker.shutdown()
+            except Exception:
+                pass
         self._destroy_lyric_bar()   # 先销毁独立歌词条小窗
         self.engine.quit()
         self.root.destroy()

@@ -15,7 +15,109 @@ if TYPE_CHECKING:   # 仅类型检查：app 依赖 utils，运行时导入会循
 # ===========================================================================
 
 APP_NAME = "Player PRO"
-APP_VERSION = "1.14.2"
+APP_VERSION = "1.14.20"
+
+
+# ===========================================================================
+# 系统资源
+# ===========================================================================
+
+def next_forward_index(pending, times, position: float) -> int:
+    """从当前播放位置起环找「下一个仍待处理」的下标（V1.14.14）。
+
+    用途：转写分段与歌词翻译在用户拖动进度条后**实时跟随新位置**——
+    先处理位置所在的那一项，然后依次向后，到末尾再回到开头。
+
+    Args:
+        pending: 仍待处理的下标集合（须为 `times` 的合法下标）。
+        times: 全部项的起始时间（升序）。
+        position: 当前播放位置（秒）。
+    """
+    if not pending:
+        raise ValueError("pending 不能为空")
+    n = len(times)
+    cur = 0
+    for i, ts in enumerate(times):
+        if ts <= position:
+            cur = i
+        else:
+            break
+    for k in range(n):
+        i = (cur + k) % n
+        if i in pending:
+            return i
+    return next(iter(pending))
+
+
+def available_physical_memory() -> int:
+    """当前可用物理内存（字节；V1.14.10）。
+
+    用 Windows `GlobalMemoryStatusEx` 的 `ullAvailPhys`（任务管理器「可用」）。
+    取不到时返回 -1（调用方应视为「未知」而非「不足」，避免误拦）。
+    注：V1.14.18 起转写前的内存门槛已取消，本函数暂无调用方，保留备用。
+    """
+    try:
+        import ctypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return -1
+        return int(status.ullAvailPhys)
+    except Exception:
+        return -1
+
+
+def suppress_child_console_windows(force: bool = False) -> None:
+    """禁止第三方库启动的**控制台子进程**弹出黑窗（V1.14.19，仅 Windows）。
+
+    背景：`translators` 的 Bing 引擎通过 `exejs` 调 `node.exe` 计算 token
+    （`server.get_tk` → `exejs.evaluate`），每次会 `subprocess.run` 一个
+    `node.exe`。打包成窗口程序（`--windowed`）后，控制台子进程会**闪出一个
+    黑色终端窗口**；并行翻译时同时出现多个，表现为「大量终端窗口一闪而过」。
+
+    做法：给 `subprocess.Popen.__init__` 统一注入 `CREATE_NO_WINDOW`
+    （`0x08000000`）。只在**自身没有控制台**（窗口版 / `pythonw`）时启用，
+    控制台开发环境保持原样；`force=True` 供「已把 stdout 换成哑对象」的
+    转写子进程显式启用。一次覆盖所有第三方库，无需改动它们。
+    """
+    if os.name != "nt":
+        return
+    if not force and sys.stdout is not None and sys.stderr is not None:
+        return                      # 有控制台（源码/控制台版），保持原行为
+    try:
+        import subprocess
+
+        orig_init = subprocess.Popen.__init__
+        if getattr(orig_init, "_no_window_patched", False):
+            return
+        create_no_window = 0x08000000   # CREATE_NO_WINDOW
+
+        def patched(self, *args, **kwargs):
+            try:
+                flags = int(kwargs.get("creationflags") or 0)
+                kwargs["creationflags"] = flags | create_no_window
+            except Exception:
+                pass
+            return orig_init(self, *args, **kwargs)
+
+        patched._no_window_patched = True           # type: ignore[attr-defined]
+        subprocess.Popen.__init__ = patched         # type: ignore[method-assign]
+    except Exception:
+        pass
 
 
 # ===========================================================================

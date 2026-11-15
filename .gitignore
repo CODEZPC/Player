@@ -6,3 +6,4 @@ web
 .vscode
 _internal/config
 dist/main/_internal/config
+dist/main/_internal/extensions

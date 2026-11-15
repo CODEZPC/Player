@@ -1,0 +1,5 @@
+Wheel-Version: 1.0
+Generator: maturin (1.14.1)
+Root-Is-Purelib: false
+Tag: cp315-abi3-win_amd64
+Tag: cp315-abi3t-win_amd64

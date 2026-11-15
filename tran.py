@@ -46,11 +46,66 @@ def is_foreign_lyric(lines) -> bool:
     """判断歌词是否为外语（少量单词不算）。
 
     lines 为歌词纯文本行序列；有效字符过少（<2）时返回 False（无法判定）。
+    注：V1.14.16 起逐行判定改用 `needs_translate()`，本函数仅保留备用。
     """
     text = "".join(lines or [])
     if len(re.sub(r"\s", "", text)) < 2:
         return False
     return cjk_ratio(text) < FOREIGN_CJK_RATIO
+
+
+# 日文假名（平假名 / 片假名 / 半角片假名）与日文符号
+_KANA = re.compile(r"[\u3040-\u309f\u30a0-\u30ff\uff66-\uff9d\u30fc]")
+# 中文汉字（CJK 统一表意文字）
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _effective_text(text: str) -> str:
+    """去掉数字、标点、符号、空白后的正文（用于语言判定，V1.14.17）。
+
+    需求：除了数字与符号之外全是外语的整句也要翻；反之只剩数字/符号的
+    句子去掉后为空 → 不需要翻译。
+    """
+    out = []
+    for ch in text or "":
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat[0] in ("P", "S", "Z", "C"):
+            continue            # 标点 / 符号 / 分隔 / 控制
+        if cat[0] == "N":
+            continue            # 数字（含全角、罗马数字、分数）
+        out.append(ch)
+    return "".join(out)
+
+
+def is_chinese_sentence(text: str) -> bool:
+    """判断一句是否属于「中文」（V1.14.16）。
+
+    规则（日语里的汉字**不算**中文）：
+    - 含假名 → 日语 → 不是中文；
+    - 否则含 CJK 汉字 → 中文；
+    - 既无假名又无汉字（英文/韩文/数字等）→ 不是中文。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    if _KANA.search(s):
+        return False
+    return bool(_HAN.search(s))
+
+
+def needs_translate(text: str) -> bool:
+    """该行是否需要翻译：**去掉数字与符号后仍无任何中文**才需要（V1.14.16/17）。
+
+    - 纯中文句（含仅有汉字无假名的日文句）→ 不翻（译文为空）；
+    - 只剩数字/符号的句（如 “12345”“!!!”）→ 不翻（去掉后无正文）；
+    - 其余（英文/日语假名句等）→ 翻译。
+    """
+    s = _effective_text(text)
+    if not s:
+        return False
+    return not is_chinese_sentence(s)
 
 
 # ----------------------------------------------------------------------

@@ -1,125 +1,1460 @@
+"""语音转写（自动字幕）：单文件双角色（V1.14.20）。
+
+**角色一：被主程序 import → `SubtitleWorker` 客户端**
+    - 确保外部转写组件 `_internal/extensions/audio_to_text.exe` 存在
+      （首次自动下载 `audio_to_text.zip` 并解压）；
+    - 以 `audio_to_text.exe --pipe` 启动它，通过 stdin/stdout 的
+      **JSON Lines** 协议收发消息（一次一行 JSON）。
+
+**角色二：被打包成 `audio_to_text.exe --pipe` 运行 → Worker**
+    - 确保模型缓存 `_internal/extensions/model/modelscope` 存在
+      （首次自动下载 `modelscope.zip` 并解压）；
+    - 动态加载 FunASR 模型，然后按协议逐行处理 `run` / `position` / `quit`。
+
+为什么要拆成独立 exe：FunASR + torch 体积巨大（>1GB），主程序要保持轻量
+（<150MB），因此重型依赖只在 Worker 侧、按需下载。主程序与 Worker 之间
+只用 JSON 行通信，互不依赖对方的 Python 环境。
+
+**顶层 import 限制**：只允许轻量模块（见下方 import 段）。`funasr` /
+`torch` / `modelscope` / `librosa` / `soundfile` / `numpy` 等一律在 Worker
+分支或函数内用 `importlib` 动态导入，主程序打包时用 spec 的 excludes 排除。
+本模块**不依赖** utils / tkinter。
+
+消息协议（Worker → 主程序，每行一个 JSON）：
+    {"type":"event","kind":"download|load|transcribe|progress|prepare","text":"…"}
+    {"type":"partial","items":[[开始秒,"文本"], …]}     # 某一段完成
+    {"type":"done","items":[[…]]}                       # 全部完成
+    {"type":"error","message":"…"}
+主程序 → Worker：
+    {"type":"run","path":"…","start_at":0.0}
+    {"type":"position","value":12.3}
+    {"type":"quit"}
+
+命令行：`python audio_to_text.py <音频路径>`（开发期自测，进程内转写）
+         `audio_to_text.exe --pipe`（Worker 模式）
 """
-MiMo-V2.5-ASR 语音识别（Gradio API 版）/ Speech Recognition (中文/English)
 
-通过小米官方的 Gradio API 调用 ASR 服务，无需本地模型、无需 API Key。
-Call Xiaomi's official ASR service via Gradio API — no local model, no API key needed.
-
-用法 / Usage:
-  python scripts/mimo_asr_api.py audio.wav                    # 自动检测 / auto
-  python scripts/mimo_asr_api.py audio.wav --language zh       # 中文 / Chinese
-  python scripts/mimo_asr_api.py audio.wav --language en       # 英文 / English
-  python scripts/mimo_asr_api.py audio.wav --output result.txt # 输出到文件 / to file
-"""
-
-import argparse
-import sys
-import os
+import ctypes
+import importlib
 import json
-import requests
+import logging
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zipfile
 
-# Windows GBK 兼容
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+# 模型缓存（懒加载；仅在使用它的那个进程内有效）
+_model = None
+_model_lock = threading.Lock()
+_model_device = ""
 
-API_BASE = "https://xiaomimimo-mimo-v2-5-asr.hf.space"
+# ---- 扩展组件（V1.14.20）----
+# 组件与模型的下载地址（GitHub Releases）；镜像前缀见 _mirror_prefixes()
+COMPONENT_URL = ("https://github.com/CODEZPC/Player/releases/download/"
+                 "Extensions/audio_to_text.zip")
+MODEL_URL = ("https://github.com/CODEZPC/Player/releases/download/"
+             "Model/modelscope.zip")
+COMPONENT_EXE = "audio_to_text.exe"
+WORKER_LOG = "asr_worker.log"
+
+# 界面提示用的体积估算（GB）：两者合计约 2.8GB
+COMPONENT_SIZE_GB = 0.3
+MODEL_SIZE_GB = 2.5
+
+# 镜像前缀（按顺序尝试，最后回退 GitHub 原始地址；可用环境变量覆盖）
+DEFAULT_MIRRORS = [
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+    "https://gh-proxy.com/",
+    "https://mirror.ghproxy.com/",
+    "https://ghproxy.cc/",
+    "",          # 空串 = 直接用原始 URL
+]
+MIRRORS_ENV = "PLAYER_GH_MIRRORS"
+
+# ---- 进度事件类型（V1.14.7）----
+# 注意：不上报「k/N 段」——funasr 内部分批进度条的 total 等于本批段数，
+# 恒为 k===N（表现为 1/1、12/12 跳动），无参考意义。
+EVENT_DOWNLOAD = "download"      # 下载（组件/模型/内部模型文件）
+EVENT_LOAD = "load"              # 正在加载语音模型
+EVENT_TRANSCRIBE = "transcribe"  # 开始转写（文本为空）
+EVENT_PROGRESS = "progress"      # 分段进度（文本形如 "2/5"）
+EVENT_PREPARE = "prepare"        # 启动前准备（检查模型等，V1.14.20）
+
+# ---- 静音切分参数（V1.14.8）----
+# 思路：用能量包络找出句间静音，在静音中段下刀，使每段不短于 1 分钟；
+# 若中段没有真静音（带伴奏的歌曲常见），则在每段 60~120s 窗口内取能量
+# 最低帧兜底下刀。分段逐段转写（缩短单次推理、显示真实段进度、降低峰值内存）。
+SEG_MIN_SEC = 60.0          # 每段最短时长（需求：最短 1min）
+SILENCE_FRAME_SEC = 0.05    # 能量包络帧长（50ms）
+SILENCE_MIN_SEC = 0.30      # 判为「静音」的最短持续时长
+SILENCE_REL_RATIO = 0.05    # 静音阈值 = 95 分位能量 × 该比例
+SILENCE_ABS_THRESH = 3e-4   # 静音阈值绝对下限（防全静音文件阈值过低）
+
+# ---- 进度日志解析（V1.14.6 / V1.14.7）----
+# 下载：`Downloading [model.pt]:  45%|...`；批量：`Processing 2 items: 100%|...`
+_RE_DOWNLOAD = re.compile(r"Downloading \[(?P<name>[^\]]+)\]")
+_RE_PCT = re.compile(r"(?P<pct>\d{1,3})%\|")
+_RE_GOT_FILES = re.compile(r"Got (?P<n>\d+) files")
+_RE_FILE_DONE = re.compile(r"Download model '[^']+' successfully")
+# 转写开始：`rtf_avg: 0.16: 100%|...| 14/45 [00:06<00:00, ...]`（只用于探测阶段）
+_RE_RTF_STEPS = re.compile(r"rtf_avg[^|]*\|.*?\|\s*\d+/\d+")
+_RE_LOADING = re.compile(r"Loading pretrained params|Loading ckpt")
 
 
-def upload_audio(filepath):
-    """上传音频文件到 Gradio 服务器"""
-    with open(filepath, 'rb') as f:
-        r = requests.post(f"{API_BASE}/gradio_api/upload", files={'files': f}, timeout=120, verify=False)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, list) and len(data) > 0:
-        return data[0]
-    return data
+# ===========================================================================
+# 空流 / 进程辅助（主程序与 Worker 共用）
+# ===========================================================================
+
+class _NullSink:
+    """空输出流：打包为窗口程序时 `sys.stdout` 为 None，以此兜底。"""
+
+    def write(self, s):
+        return len(s) if s else 0
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self):
+        raise OSError("no fileno")
 
 
-def call_transcribe(audio_data_url, language_tag):
-    """调用 transcribe API，返回 event_id"""
-    payload = {"data": [audio_data_url, None, language_tag]}
-    r = requests.post(f"{API_BASE}/gradio_api/call/transcribe", json=payload, timeout=30, verify=False)
-    r.raise_for_status()
-    data = r.json()
-    return data.get('event_id')
+# Windows SetPriorityClass：低于正常（0x00004000）——Worker 不与音频回调抢 CPU
+PRIORITY_BELOW_NORMAL = 0x00004000
 
 
-def poll_result(event_id):
-    """轮询 SSE 端点获取转录结果"""
-    url = f"{API_BASE}/gradio_api/call/transcribe/{event_id}"
-    # 用 stream 模式读 SSE
-    with requests.get(url, stream=True, timeout=180, verify=False) as r:
-        for line in r.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("data: "):
-                payload = line[6:].strip()
-                if payload == "[DONE]":
-                    break
+def _demote_priority() -> None:
+    """把当前（Worker）进程优先级降为「低于正常」（非 Windows 静默忽略）。"""
+    try:
+        kernel32 = ctypes.windll.kernel32       # type: ignore[attr-defined]
+        kernel32.SetPriorityClass(
+            kernel32.GetCurrentProcess(), PRIORITY_BELOW_NORMAL)
+    except Exception:
+        pass
+
+
+def _suppress_child_console_windows(force: bool = False) -> None:
+    """禁止第三方库启动的**控制台子进程**弹出黑窗（V1.14.19 内联版）。
+
+    背景：`translators` 用 `exejs` 调 `node.exe`；窗口版程序里每个控制台
+    子进程都会被分配一个控制台窗口 → 黑框一闪而过。给 `subprocess.Popen`
+    统一注入 `CREATE_NO_WINDOW`（`0x08000000`）即可。
+
+    `force=True` 供「已把 stdout 换成哑对象」的 Worker 显式启用。
+    """
+    if os.name != "nt":
+        return
+    if not force and sys.stdout is not None and sys.stderr is not None:
+        return                      # 有控制台（源码/控制台版），保持原行为
+    try:
+        orig_init = subprocess.Popen.__init__
+        if getattr(orig_init, "_no_window_patched", False):
+            return
+        create_no_window = 0x08000000   # CREATE_NO_WINDOW
+
+        def patched(self, *args, **kwargs):
+            try:
+                flags = int(kwargs.get("creationflags") or 0)
+                kwargs["creationflags"] = flags | create_no_window
+            except Exception:
+                pass
+            return orig_init(self, *args, **kwargs)
+
+        patched._no_window_patched = True           # type: ignore[attr-defined]
+        subprocess.Popen.__init__ = patched         # type: ignore[method-assign]
+    except Exception:
+        pass
+
+
+def _next_forward_index(pending, times, position: float) -> int:
+    """从当前播放位置起环找「下一个仍待处理」的下标（V1.14.14 内联版）。
+
+    先处理位置所在的那一项，然后依次向后，到末尾再回到开头。
+
+    Args:
+        pending: 仍待处理的下标集合（须为 `times` 的合法下标）。
+        times: 全部项的起始时间（升序）。
+        position: 当前播放位置（秒）。
+    """
+    if not pending:
+        raise ValueError("pending 不能为空")
+    n = len(times)
+    cur = 0
+    for i, ts in enumerate(times):
+        if ts <= position:
+            cur = i
+        else:
+            break
+    for k in range(n):
+        i = (cur + k) % n
+        if i in pending:
+            return i
+    return next(iter(pending))
+
+
+# ===========================================================================
+# 路径：主程序 / Worker 两侧的 _internal/extensions
+# ===========================================================================
+
+def _app_internal_dir() -> str:
+    """主程序所在目录下的 `_internal`（开发环境为脚本旁的 `_internal`）。"""
+    base = os.path.dirname(os.path.abspath(sys.argv[0] or "."))
+    candidate = os.path.join(base, "_internal")
+    if os.path.isdir(candidate):
+        return candidate
+    return getattr(sys, "_MEIPASS", base)      # onefile 兜底
+
+
+def _extensions_dir() -> str:
+    """扩展组件目录：`_internal/extensions`。"""
+    return os.path.join(_app_internal_dir(), "extensions")
+
+
+def _component_exe_path() -> str:
+    """转写组件 exe 的完整路径。"""
+    return os.path.join(_extensions_dir(), COMPONENT_EXE)
+
+
+def _model_cache_dir() -> str:
+    """主程序侧模型缓存目录：`_internal/extensions/model/modelscope`。"""
+    return os.path.join(_extensions_dir(), "model", "modelscope")
+
+
+def _worker_model_root() -> str:
+    """Worker 侧模型缓存根（优先环境变量，其次 exe 旁 `model/modelscope`）。"""
+    env = os.environ.get("MODELSCOPE_CACHE")
+    if env:
+        return env
+    base = os.path.dirname(os.path.abspath(sys.executable or sys.argv[0] or "."))
+    return os.path.join(base, "model", "modelscope")
+
+
+def missing_packages() -> list[str]:
+    """列出缺失的扩展组件 key（供界面提示，V1.14.20）。
+
+    Returns:
+        `["component"]` / `["model"]` / 两者 / 空列表（都齐全）。
+    """
+    missing: list[str] = []
+    if not os.path.isfile(_component_exe_path()):
+        missing.append("component")
+    model_dir = _model_cache_dir()
+    if not (os.path.isdir(model_dir) and os.listdir(model_dir)):
+        missing.append("model")
+    return missing
+
+
+# ===========================================================================
+# 下载与解压（镜像优先）
+# ===========================================================================
+
+def _mirror_prefixes() -> list[str]:
+    """镜像前缀列表：环境变量 `PLAYER_GH_MIRRORS`（分号分隔）优先。"""
+    raw = os.environ.get(MIRRORS_ENV, "").strip()
+    if raw:
+        items = [p.strip() for p in raw.split(";")]
+        return [p for p in items if p != ""] or [""]
+    return list(DEFAULT_MIRRORS)
+
+
+def _download_text(head: str, done: int, total: int) -> str:
+    """下载进度文本：有总长给百分比，否则给已下载 MB。"""
+    if total > 0:
+        return f"{head} {min(100, int(done * 100 / total))}%"
+    return f"{head} {done / 1048576:.1f} MB"
+
+
+def _validate_zip(path: str) -> bool:
+    """zip 是否可打开且无损坏。"""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return zf.testzip() is None
+    except Exception:
+        return False
+
+
+def _download_with_mirrors(url: str, dest: str, on_progress=None,
+                           timeout: tuple = (30, 300)) -> bool:
+    """按镜像优先级下载到 `dest`（先写 `.part`，校验 zip 后改名）。
+
+    Args:
+        url: GitHub 原始地址。
+        dest: 目标文件路径。
+        on_progress: `fn(done, total)`，已节流（百分比变化时才回调）。
+        timeout: `(连接, 读取)` 超时。
+    """
+    import requests          # 延迟导入：顶层只允许轻量模块
+
+    prefixes = _mirror_prefixes()
+    for prefix in prefixes:
+        full = (prefix + url) if prefix else url
+        part = dest + ".part"
+        try:
+            with requests.get(full, stream=True, timeout=timeout,
+                              allow_redirects=True) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                last_pct = -1
+                with open(part, "wb") as fp:
+                    for chunk in resp.iter_content(1024 * 256):
+                        if not chunk:
+                            continue
+                        fp.write(chunk)
+                        done += len(chunk)
+                        if on_progress is not None:
+                            pct = int(done * 100 / total) if total else -1
+                            if pct != last_pct:
+                                last_pct = pct
+                                try:
+                                    on_progress(done, total)
+                                except Exception:
+                                    pass
+            if _validate_zip(part):
+                os.replace(part, dest)
+                return True
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(part):
                 try:
-                    data = json.loads(payload)
-                    outputs = data.get('outputs', {})
-                    if 'data' in outputs:
-                        return outputs['data']
-                except json.JSONDecodeError:
+                    os.remove(part)
+                except OSError:
+                    pass
+    return False
+
+
+def _extract_zip(zip_path: str, dest_dir: str, required_rel: str,
+                 on_progress=None) -> bool:
+    """解压到 `dest_dir`，并校验关键路径（避免半成品）。
+
+    先解压到 `dest_dir + "_tmp"`，确认 `required_rel` 存在后再逐个移动到
+    `dest_dir`（同名覆盖）；任何失败都会清理临时目录并返回 False。
+
+    Args:
+        required_rel: 相对 `dest_dir` 的关键路径（组件为 exe 名，模型为 `modelscope`）。
+        on_progress: `fn(done, total)`（按文件数）。
+    """
+    tmp = dest_dir.rstrip("\\/") + "_tmp"
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+            total = max(1, len(names))
+            for i, name in enumerate(names, 1):
+                try:
+                    zf.extract(name, tmp)
+                except Exception:
+                    pass
+                if on_progress is not None and (i % 20 == 0 or i == total):
+                    try:
+                        on_progress(i, total)
+                    except Exception:
+                        pass
+        if not os.path.exists(os.path.join(tmp, required_rel)):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+        os.makedirs(dest_dir, exist_ok=True)
+        for entry in os.listdir(tmp):
+            src = os.path.join(tmp, entry)
+            dst = os.path.join(dest_dir, entry)
+            try:
+                if os.path.isdir(src):
+                    shutil.rmtree(dst, ignore_errors=True)
+                    shutil.move(src, dst)
+                else:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    shutil.move(src, dst)
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+        return True
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
+
+
+def _ensure_component(on_progress=None) -> bool:
+    """确保转写组件 exe 存在（必要时下载 `audio_to_text.zip` 并解压）。"""
+    exe = _component_exe_path()
+    if os.path.isfile(exe):
+        return True
+    ext = _extensions_dir()
+    try:
+        os.makedirs(ext, exist_ok=True)
+    except Exception:
+        pass
+    zip_path = os.path.join(ext, "audio_to_text.zip")
+    if not _download_with_mirrors(COMPONENT_URL, zip_path,
+                                  on_progress=on_progress):
+        return False
+    ok = _extract_zip(zip_path, ext, required_rel=COMPONENT_EXE)
+    try:
+        os.remove(zip_path)
+    except OSError:
+        pass
+    return ok and os.path.isfile(exe)
+
+
+def _ensure_worker_model(on_progress=None) -> bool:
+    """确保模型缓存存在（必要时下载 `modelscope.zip` 并解压）。"""
+    root = _worker_model_root()
+    if os.path.isdir(root) and os.listdir(root):
+        return True
+    model_dir = os.path.dirname(root) or root
+    try:
+        os.makedirs(model_dir, exist_ok=True)
+    except Exception:
+        pass
+    zip_path = os.path.join(model_dir, "modelscope.zip")
+    if not _download_with_mirrors(MODEL_URL, zip_path, on_progress=on_progress):
+        return False
+    ok = _extract_zip(zip_path, model_dir,
+                      required_rel=os.path.basename(root.rstrip("\\/")))
+    try:
+        os.remove(zip_path)
+    except OSError:
+        pass
+    return ok and os.path.isdir(root) and bool(os.listdir(root))
+
+
+def _apply_model_env() -> None:
+    """写入模型缓存/离线相关环境变量（**必须在导入 funasr 之前**调用）。"""
+    root = _worker_model_root()
+    if root:
+        os.environ["MODELSCOPE_CACHE"] = root
+    os.environ["FUNASR_NO_UPDATE_CHECK"] = "1"
+    os.environ["MODELSCOPE_DISABLE_REMOTE"] = "1"
+
+
+# ===========================================================================
+# 进度解析 / 日志重定向（Worker 内使用）
+# ===========================================================================
+
+class _ProgressSink:
+    """临时替换 stdout/stderr，从 tqdm/日志中提取进度事件。
+
+    tqdm 用 `\\r` 刷新、日志用 `\\n`，因此按两者切分；未结束的尾巴留在缓冲里。
+    回调签名为 `fn(kind, text)`（kind 见 `EVENT_*`）。
+    """
+
+    def __init__(self, callback=None) -> None:
+        self._cb = callback
+        self._buf = ""
+        self._lock = threading.Lock()
+        self.files_total = 0        # Got N files
+        self.files_done = 0         # Download ... successfully 次数
+        self.cur_name = ""
+        self.cur_pct = 0
+        self.transcribing = False   # 是否已进入转写阶段（只上报一次）
+
+    # ---- 进度文本 ----
+    def _emit(self, kind: str, text: str = "") -> None:
+        if self._cb is None:
+            return
+        try:
+            self._cb(kind, text)
+        except Exception:
+            pass
+
+    def _compose_download(self) -> str:
+        if self.files_total:
+            head = (f"正在下载模型 "
+                    f"{min(self.files_done, self.files_total)}/{self.files_total}")
+        else:
+            head = "正在下载模型"
+        if self.cur_name:
+            return f"{head}（{self.cur_name} {self.cur_pct}%）"
+        return head
+
+    def _handle_line(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        m = _RE_GOT_FILES.search(line)
+        if m:
+            try:
+                self.files_total = int(m.group("n"))
+            except ValueError:
+                self.files_total = 0
+            self._emit(EVENT_DOWNLOAD, self._compose_download())
+            return
+        m = _RE_DOWNLOAD.search(line)
+        if m:
+            self.cur_name = m.group("name").strip()
+            mp = _RE_PCT.search(line)
+            if mp:
+                self.cur_pct = min(100, int(mp.group("pct")))
+            self._emit(EVENT_DOWNLOAD, self._compose_download())
+            return
+        if _RE_FILE_DONE.search(line):
+            self.files_done += 1
+            self._emit(EVENT_DOWNLOAD, self._compose_download())
+            return
+        if _RE_RTF_STEPS.search(line):
+            # 只通知「已进入转写阶段」，段数无意义（见 EVENT_* 注释，V1.14.7）
+            if not self.transcribing:
+                self.transcribing = True
+                self._emit(EVENT_TRANSCRIBE)
+            return
+        if _RE_LOADING.search(line):
+            self._emit(EVENT_LOAD, "正在加载语音模型…")
+
+    # ---- 类文件对象 ----
+    def write(self, s) -> int:
+        if not s:
+            return 0
+        with self._lock:
+            self._buf += s
+            while True:
+                i_n = self._buf.find("\n")
+                i_r = self._buf.find("\r")
+                idx = min(x for x in (i_n, i_r) if x >= 0) \
+                    if (i_n >= 0 or i_r >= 0) else -1
+                if idx < 0:
+                    break
+                line = self._buf[:idx]
+                self._buf = self._buf[idx + 1:]
+                self._handle_line(line)
+            if len(self._buf) > 4096:      # 防无换行输出撑大缓冲
+                self._handle_line(self._buf)
+                self._buf = ""
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self):
+        raise OSError("no fileno")
+
+
+def _preload_logging() -> None:
+    """提前导入 funasr / modelscope，让它们的 logging handler 先创建好。
+
+    否则 handler 会在 `AutoModel(...)` 构造时才创建（那时已错过重定向时机），
+    导致下载/加载日志捕获不到（V1.14.6 实测）。
+    """
+    for mod in ("modelscope", "modelscope.hub.api", "funasr"):
+        try:
+            importlib.import_module(mod)
+        except Exception:
+            pass
+
+
+def _redirect_log_handlers(sink):
+    """把 funasr / modelscope / root 的 StreamHandler 临时指向 sink。
+
+    logging 的 handler 在创建时已绑定 `sys.stderr` 对象，仅替换
+    `sys.stderr` 对它们无效（V1.14.6 实测），必须直接改 handler.stream。
+    返回 `[(handler, 原 stream)]` 供恢复。
+    """
+    saved = []
+    seen = set()
+    loggers = [logging.getLogger()]
+    for name in ("funasr", "modelscope", "modelscope_hub", "root"):
+        loggers.append(logging.getLogger(name))
+    for lg in loggers:
+        for h in lg.handlers:
+            if id(h) in seen:
+                continue
+            if isinstance(h, logging.StreamHandler):
+                seen.add(id(h))
+                try:
+                    saved.append((h, h.stream))
+                    h.stream = sink
+                except Exception:
+                    pass
+    return saved
+
+
+def _restore_log_handlers(saved) -> None:
+    """恢复 handler 的原始 stream。"""
+    for h, stream in saved or []:
+        try:
+            h.stream = stream
+        except Exception:
+            pass
+
+
+# ===========================================================================
+# 模型（Worker 侧；全部用 importlib 动态导入）
+# ===========================================================================
+
+def is_available() -> bool:
+    """funasr 是否可用（仅检查模块是否存在，不加载模型）。"""
+    try:
+        return importlib.util.find_spec("funasr") is not None
+    except Exception:
+        return False
+
+
+def _pick_device() -> str:
+    """有 CUDA 用 GPU，否则 CPU。"""
+    try:
+        torch = importlib.import_module("torch")
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def get_model():
+    """获取（并缓存）funasr AutoModel（首次调用会加载模型）。"""
+    global _model, _model_device
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            funasr = importlib.import_module("funasr")
+            auto_model = getattr(funasr, "AutoModel")
+            _model_device = _pick_device()
+            _model = auto_model(
+                model="paraformer-zh",
+                vad_model="fsmn-vad",
+                punc_model="ct-punc",          # 标点，用于句子划分
+                timestamp_model="fa-zh",        # 句级时间戳
+                spk_model="cam++",              # 说话人分离
+                device=_model_device,
+                disable_update=True,            # 关闭联网更新检查（V1.14.4）
+            )
+    return _model
+
+
+def model_device() -> str:
+    """当前模型设备（未加载时返回空串）。"""
+    return _model_device
+
+
+# ===========================================================================
+# 静音切分（V1.14.8）
+# ===========================================================================
+
+def _rms_envelope(sf_in, frame: int):
+    """按帧计算 RMS 能量包络（逐块读取，内存只保留包络）。
+
+    `sf_in`：已打开的 `soundfile.SoundFile`（当前位置会被改动）；
+    `frame`：每帧采样点数。跨块的零头会累加到下一块，保证帧对齐不漂移。
+    """
+    import numpy as np
+
+    env: list = []
+    buf = np.empty(0, dtype=np.float32)
+    block = frame * 64
+    while True:
+        data = sf_in.read(frames=block, dtype="float32", always_2d=True)
+        if not len(data):
+            break
+        mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+        if buf.size:
+            mono = np.concatenate([buf, mono])
+        n = len(mono) // frame
+        if n:
+            part = mono[: n * frame].reshape(n, frame)
+            env.append(np.sqrt(np.mean(part * part, axis=1)))
+        buf = mono[n * frame:]
+    if not env:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(env)
+
+
+def _silence_cut_times(env, frame_sec: float, total_sec: float,
+                       min_seg: float) -> list[float]:
+    """从能量包络中选出切点（秒）：静音段中点，且每段 ≥ `min_seg`。
+
+    - 静音判定：帧能量 < max(绝对下限, 95 分位能量 × 比例)；
+    - 连续静音需不短于 `SILENCE_MIN_SEC`，取该静音段中点下刀；
+    - 贪心保证切点间距 ≥ `min_seg`；
+    - 若末尾残余不足 `min_seg`，则放弃该切点（并入上一段，避免小尾巴）。
+    """
+    import numpy as np
+
+    n = int(env.size)
+    if n <= 0 or total_sec <= min_seg:
+        return []
+    thr = max(SILENCE_ABS_THRESH, float(np.percentile(env, 95)) * SILENCE_REL_RATIO)
+    silent = env < thr
+    min_run = max(1, int(round(SILENCE_MIN_SEC / frame_sec)))
+    cuts: list[float] = []
+    i = 0
+    while i < n:
+        if not bool(silent[i]):
+            i += 1
+            continue
+        j = i
+        while j < n and bool(silent[j]):
+            j += 1
+        if j - i >= min_run:
+            cuts.append(((i + j) / 2.0) * frame_sec)
+        i = j
+
+    picked: list[float] = []
+    last = 0.0
+    for c in cuts:
+        if c - last >= min_seg:
+            picked.append(c)
+            last = c
+    while picked and (total_sec - picked[-1]) < min_seg:
+        picked.pop()           # 末尾过短 → 并入上一段
+    return picked
+
+
+def _quiet_cuts_in(env, frame_sec: float, start_sec: float,
+                   end_sec: float, min_seg: float) -> list[float]:
+    """在 `[start_sec, end_sec)` 内按 60s 步进取「能量最低点」下刀。
+
+    兜底策略（V1.14.8）：带伴奏的歌曲中段往往没有真静音，此时在每段
+    `[上次切点 + min_seg, + 2×min_seg]` 窗口内取 RMS 最低帧下刀——
+    尽量落在停顿/间奏处，且保证每段仍不短于 `min_seg`。
+    """
+    import numpy as np
+
+    n = int(env.size)
+    if n <= 0:
+        return []
+    lo_frame = max(0, int(round(start_sec / frame_sec)))
+    hi_frame = min(n, int(round(end_sec / frame_sec)))
+    min_frames = max(1, int(round(min_seg / frame_sec)))
+    cuts: list[float] = []
+    pos = lo_frame
+    while True:
+        lo = pos + min_frames
+        hi = min(pos + 2 * min_frames, hi_frame)
+        if hi - lo < 1:
+            break
+        idx = int(np.argmin(env[lo:hi])) + lo
+        sec = idx * frame_sec
+        if end_sec - sec < min_seg:      # 末尾过短 → 结束
+            break
+        cuts.append(sec)
+        pos = idx
+    return cuts
+
+
+def _plan_cuts(env, frame_sec: float, total_sec: float,
+               min_seg: float) -> list[float]:
+    """切点规划：优先真静音；剩余过长的段再用「最安静处」兜底补齐。"""
+    cuts = _silence_cut_times(env, frame_sec, total_sec, min_seg)
+    bounds = [0.0] + cuts + [total_sec]
+    extra: list[float] = []
+    for i in range(len(bounds) - 1):
+        start, end = bounds[i], bounds[i + 1]
+        if end - start > 2.0 * min_seg:      # 该段过长 → 兜底切
+            extra.extend(_quiet_cuts_in(env, frame_sec, start, end, min_seg))
+    return sorted(set(cuts + extra))
+
+
+def _write_mono_segment(sf_in, path: str, frames: int, sr: int) -> None:
+    """把 `sf_in` 当前起点的 `frames` 帧写成单声道 PCM16 wav。"""
+    import soundfile as sf
+
+    chunk = max(1, int(sr * 30))
+    with sf.SoundFile(path, mode="w", samplerate=sr, channels=1,
+                      subtype="PCM_16") as out:
+        left = frames
+        while left > 0:
+            data = sf_in.read(frames=min(left, chunk), dtype="float32",
+                              always_2d=True)
+            if not len(data):
+                break
+            mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+            out.write(mono)
+            left -= len(data)
+
+
+def _clean_stale_temp_dirs() -> None:
+    """清理早前被 terminate() 打断时残留的分段临时目录（V1.14.10）。
+
+    Worker 被硬终止时 `finally` 不执行，`player_asr_*` 会留在系统临时目录里
+    （每首歌约 100MB+）。这里只删**超过 6 小时**的同名前缀目录，绝不会碰到
+    正在使用的目录。
+    """
+    try:
+        import glob
+
+        root = tempfile.gettempdir()
+        now = time.time()
+        for path in glob.glob(os.path.join(root, "player_asr_*")):
+            try:
+                if not os.path.isdir(path):
                     continue
+                if now - os.path.getmtime(path) < 6 * 3600:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _split_by_silence(audio_path: str):
+    """按静音把音频切成若干段 → `([(段起点秒, wav路径)], 临时目录)`。
+
+    切点策略见 `_plan_cuts()`：优先真静音段中点，无真静音时在段内能量最低处
+    兜底下刀（两种情况均保证每段 ≥ `SEG_MIN_SEC`）。
+    无法切分（解码失败、总长不足 2×`SEG_MIN_SEC` 等）时返回
+    `([(0.0, audio_path)], "")`，退化为「整文件一段」，与旧行为一致。
+    """
+    tmp_dir = ""
+    try:
+        import soundfile as sf
+
+        with sf.SoundFile(audio_path) as sf_in:
+            sr = int(sf_in.samplerate or 0)
+            total_frames = int(sf_in.frames or 0)
+            if sr <= 0 or total_frames <= 0:
+                return [(0.0, audio_path)], ""
+            total_sec = total_frames / float(sr)
+            frame = max(1, int(round(SILENCE_FRAME_SEC * sr)))
+            env = _rms_envelope(sf_in, frame)
+            cuts = _plan_cuts(env, frame / float(sr), total_sec, SEG_MIN_SEC)
+            if not cuts:
+                return [(0.0, audio_path)], ""
+            tmp_dir = tempfile.mkdtemp(prefix="player_asr_")
+            bounds = [0.0] + cuts + [total_sec]
+            segments: list[tuple[float, str]] = []
+            for i in range(len(bounds) - 1):
+                start, end = bounds[i], bounds[i + 1]
+                start_frame = int(round(start * sr))
+                end_frame = int(round(end * sr))
+                if end_frame - start_frame <= 0:
+                    continue
+                path = os.path.join(tmp_dir, f"seg{i:03d}.wav")
+                sf_in.seek(start_frame)
+                _write_mono_segment(sf_in, path, end_frame - start_frame, sr)
+                segments.append((start, path))
+            if len(segments) <= 1:          # 切不出来就别用临时文件了
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return [(0.0, audio_path)], ""
+            return segments, tmp_dir
+    except Exception:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return [(0.0, audio_path)], ""
+
+
+def _extract_items(result, offset: float) -> list[tuple[float, str]]:
+    """把 funasr `generate()` 的返回值转为 `[(开始秒, 文本)]`（叠加段偏移）。"""
+    post = importlib.import_module("funasr.utils.postprocess_utils")
+    rich = getattr(post, "rich_transcription_postprocess")
+
+    items: list[tuple[float, str]] = []
+    for res in (result or []):
+        if not isinstance(res, dict):
+            continue
+        sentences = res.get("sentence_info") or []
+        if sentences:
+            for seg in sentences:
+                if not isinstance(seg, dict):
+                    continue
+                start = float(seg.get("start", 0) or 0) / 1000.0 + offset
+                # funasr 1.4.x 的 sentence_info 用 `text`；旧文档写作 `sentence`
+                raw = seg.get("sentence") or seg.get("text") or ""
+                text = rich(str(raw)).strip()
+                if text:
+                    items.append((start, text))
+        else:                  # 退化：无分句信息时整段作为一句
+            text = rich(str(res.get("text") or "")).strip()
+            if text:
+                items.append((offset, text))
+    return items
+
+
+def _read_position(source) -> float:
+    """读取当前播放位置：支持传入数值或可调用对象（V1.14.11）。"""
+    try:
+        return float(source() if callable(source) else source or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _next_segment(remaining, all_segments, position) -> tuple[float, str]:
+    """从当前播放位置起环找下一个待转写的段并从 `remaining` 移除（V1.14.14）。
+
+    每次调前重新读一次位置，因此用户拖动进度条后会**立刻从新位置继续**
+    （已转完的段不重做）。
+    """
+    times = [offset for offset, _path in all_segments]
+    pending = {i for i, seg in enumerate(all_segments) if seg in remaining}
+    if not pending:
+        return remaining.pop(0)
+    idx = _next_forward_index(pending, times, _read_position(position))
+    seg = all_segments[idx]
+    try:
+        remaining.remove(seg)
+    except ValueError:
+        pass
+    return seg
+
+
+def transcribe(audio_path: str, on_event=None, on_partial=None,
+               position=0.0) -> list[tuple[float, str]]:
+    """在**当前进程**内转写音频 → `[(开始秒, 文本)]`（按时间升序）。
+
+    流程（V1.14.8）：按能量包络找到句间静音 → 在静音处切分为**每段不短于
+    `SEG_MIN_SEC`（60s）** 的若干段（临时单声道 wav）→ 逐段转写并叠加
+    段起点偏移 → 清理临时文件。切不出合适静音时自动退化为整文件一次转写。
+
+    `on_event(kind, text)`：进度事件回调（kind 为 `EVENT_*` 常量）；
+    `on_partial(items)`：**每段转写完立即回调**该段结果（V1.14.9）；
+    `position`：当前播放位置——数值或可调用对象。**在模型加载完成后才读取**，
+    且**每段开始前重新读一次**：拖动进度条后立即从新位置继续（V1.14.11/14）。
+    异常由调用方捕获。
+    """
+    sink = _ProgressSink(on_event)
+    _preload_logging()
+    old_out, old_err = sys.stdout, sys.stderr
+    saved_handlers = _redirect_log_handlers(sink)
+    sys.stdout = sys.stderr = sink          # type: ignore[assignment]
+    tmp_dir = ""
+    try:
+        model = get_model()
+        _clean_stale_temp_dirs()
+        segments, tmp_dir = _split_by_silence(audio_path)
+        total = len(segments)
+        if total > 1 and on_event is not None:
+            try:
+                on_event(EVENT_TRANSCRIBE, "")      # 进入转写阶段
+            except Exception:
+                pass
+        items: list[tuple[float, str]] = []
+        remaining = list(segments)
+        done = 0
+        while remaining:
+            # 每段开始前重新定位：拖动进度条后立刻从新位置继续（V1.14.14）
+            offset, seg_path = _next_segment(remaining, segments, position)
+            done += 1
+            if total > 1 and on_event is not None:
+                try:
+                    on_event(EVENT_PROGRESS, f"{done}/{total}")
+                except Exception:
+                    pass
+            result = model.generate(input=seg_path, timestamp=True)
+            part = _extract_items(result, offset)
+            if part:
+                items.extend(part)
+                if on_partial is not None:
+                    try:
+                        on_partial(list(part))      # 逐段即时回传（V1.14.9）
+                    except Exception:
+                        pass
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        _restore_log_handlers(saved_handlers)
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+# ===========================================================================
+# 协议辅助（JSON Lines）
+# ===========================================================================
+
+def _items_to_json(items) -> list:
+    """`[(秒, 文本)]` → JSON 友好结构（列表的列表）。"""
+    out = []
+    for ts, text in items or []:
+        try:
+            out.append([float(ts), str(text)])
+        except Exception:
+            continue
+    return out
+
+
+def _items_from_json(raw) -> list[tuple[float, str]]:
+    """JSON 结构 → `[(秒, 文本)]`（容错解析）。"""
+    out: list[tuple[float, str]] = []
+    for item in raw or []:
+        try:
+            out.append((float(item[0]), str(item[1])))
+        except Exception:
+            continue
+    return out
+
+
+def _protocol_to_tuple(obj):
+    """Worker 的一行 JSON → 主程序 `poll()` 的消息元组（V1.14.20）。"""
+    if not isinstance(obj, dict):
+        return None
+    kind = obj.get("type")
+    if kind == "event":
+        return ("event", (str(obj.get("kind") or ""), str(obj.get("text") or "")))
+    if kind == "partial":
+        return ("partial", _items_from_json(obj.get("items")))
+    if kind == "done":
+        return ("done", _items_from_json(obj.get("items")))
+    if kind == "error":
+        return ("error", str(obj.get("message") or "转写失败"))
     return None
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="MiMo-V2.5-ASR 语音识别 / Speech Recognition (Gradio API)"
-    )
-    parser.add_argument("audio", help="音频文件路径 / Audio file path")
-    parser.add_argument("--language", choices=["auto", "zh", "en"], default="auto",
-                        help="语言 / Language: auto=自动检测, zh=中文, en=英文")
-    parser.add_argument("--output", help="输出文本文件路径 / Output text file")
+# ===========================================================================
+# 角色一：SubtitleWorker 客户端（主程序侧）
+# ===========================================================================
 
-    args = parser.parse_args()
+class SubtitleWorker:
+    """外部转写组件（`audio_to_text.exe --pipe`）的客户端（V1.14.20）。
 
-    if not os.path.exists(args.audio):
-        print(f"❌ 文件不存在 / File not found: {args.audio}", file=sys.stderr)
-        sys.exit(1)
+    职责：
+    - **按需下载组件**：首次 submit 时若 `_internal/extensions/audio_to_text.exe`
+      不存在，先下载 `audio_to_text.zip` 并解压（进度以 `("event",("download",…))`
+      上报）；下载失败 → 队列收到 `("error", …)`，下次 submit 可重试。
+    - **启动/复用进程**：组件常驻，空闲时 `cancel()` 不杀进程（模型已加载，
+      下次秒开）；正在转写时 `cancel()` 才终止进程。
+    - **JSON Lines 通信**：写 `run` / `position` / `quit`，读 `event` /
+      `partial` / `done` / `error` 并转成元组入队。
 
-    lang_map = {"auto": "Auto", "zh": "Chinese", "en": "English"}
+    消息协议（`poll()` 返回）：
+    - `("event", (kind, text))`：下载/加载/转写进度
+    - `("partial", items)`：某一段转写完成的结果（可边转边显示）
+    - `("done", items)`：全部完成
+    - `("error", msg)`：失败或进程异常
+    """
 
-    print(f"📤 上传音频 / Uploading...", flush=True)
+    def __init__(self) -> None:
+        self._proc = None
+        self._log_fp = None
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        self._reader: threading.Thread | None = None
+        self._write_lock = threading.Lock()
+        self._state_lock = threading.Lock()     # 组件下载/启动互斥
+        self._inflight = False
+        self._pos = 0.0
+        self._pos_sent = -1e9
+        self._pos_sent_at = 0.0
+        self._need_restart = False
+        self._gen = 0                            # 取消世代：让在途准备线程自行退出
+
+    # ---- 状态 ----
+    def alive(self) -> bool:
+        """Worker 进程是否存活。"""
+        proc = self._proc
+        try:
+            return bool(proc is not None and proc.poll() is None)
+        except Exception:
+            return False
+
+    def busy(self) -> bool:
+        """是否有任务在 Worker 里运行。"""
+        return self._inflight
+
+    # ---- 任务 ----
+    def submit(self, audio_path: str, start_at: float = 0.0) -> bool:
+        """提交转写任务（必要时先下载组件、启动 Worker）。
+
+        `start_at`：当前播放位置初值；Worker 会在**模型加载完成后**通过
+        `set_position()` 陆续收到的位置决定优先段。
+        成功提交返回 True（下载/启动在后台线程进行，结果经 `poll()` 上报）。
+        """
+        if self._inflight:
+            return False
+        self._drain_queue()          # 丢弃上一轮取消留下的残留消息
+        self._inflight = True
+        self._gen += 1
+        gen = self._gen
+        try:
+            self._pos = float(start_at or 0.0)
+        except Exception:
+            self._pos = 0.0
+        self._pos_sent = -1e9
+        threading.Thread(target=self._prepare_and_run,
+                         args=(audio_path, gen), daemon=True).start()
+        return True
+
+    def set_position(self, seconds: float) -> None:
+        """写入当前播放位置（主进程持续调用，已节流）。"""
+        try:
+            self._pos = float(seconds or 0.0)
+        except Exception:
+            return
+        now = time.monotonic()
+        if (abs(self._pos - self._pos_sent) < 0.2
+                and now - self._pos_sent_at < 0.5):
+            return                   # 位置变化不明显 → 不发包
+        self._pos_sent = self._pos
+        self._pos_sent_at = now
+        self._send({"type": "position", "value": self._pos})
+
+    def poll(self, timeout: float = 0.0):
+        """取一条消息；无消息返回 None（`timeout=0` 为非阻塞）。"""
+        try:
+            if timeout and timeout > 0:
+                return self._queue.get(timeout=timeout)
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def cancel(self) -> None:
+        """取消当前任务：在跑则终止进程（真正停止），空闲则保留热进程。"""
+        self._gen += 1               # 让在途的下载/启动线程作废（V1.14.20）
+        if self._inflight or self.alive():
+            self._stop_process()
+        self._inflight = False
+
+    def shutdown(self) -> None:
+        """退出 Worker（程序关闭时调用）：先 quit，超时再 terminate。"""
+        self._gen += 1
+        self._send({"type": "quit"})
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        self._stop_process()
+
+    # ---- 内部：准备与启动 ----
+    def _prepare_and_run(self, audio_path: str, gen: int) -> None:
+        """后台线程：确保组件就绪 → 启动 Worker → 发送 run。
+
+        `gen` 是本轮任务世代：期间被 `cancel()`/`submit()` 作废则直接退出，
+        不再继续下载/启动（V1.14.20）。
+        """
+        def stale() -> bool:
+            return gen != self._gen
+        try:
+            if stale():
+                return
+            if not self._ensure_component():
+                if not stale():
+                    self._fail("无法获取转写组件，请检查网络后重试")
+                return
+            if stale():
+                return
+            if self._need_restart or not self.alive():
+                self._stop_process()
+                if not self._launch():
+                    if not stale():
+                        self._fail("无法启动转写进程")
+                    return
+            if stale():
+                return
+            if not self._send({"type": "run", "path": audio_path,
+                               "start_at": self._pos}):
+                if not stale():
+                    self._fail("无法向转写进程发送任务")
+        except Exception as exc:
+            if not stale():
+                self._fail(f"{type(exc).__name__}: {exc}")
+
+    def _fail(self, message: str) -> None:
+        """上报失败并结束本次任务。"""
+        self._inflight = False
+        self._queue.put(("error", message))
+
+    def _ensure_component(self) -> bool:
+        """确保组件 exe 存在（加锁串行化，避免并发重复下载）。"""
+        if os.path.isfile(_component_exe_path()):
+            return True
+        with self._state_lock:
+            if os.path.isfile(_component_exe_path()):
+                return True
+
+            def on_progress(done: int, total: int) -> None:
+                self._queue.put((
+                    "event",
+                    (EVENT_DOWNLOAD,
+                     _download_text("正在下载转写组件", done, total))))
+
+            return _ensure_component(on_progress=on_progress)
+
+    def _launch(self) -> bool:
+        """启动 `audio_to_text.exe --pipe` 并开始读线程。"""
+        exe = _component_exe_path()
+        if not os.path.isfile(exe):
+            return False
+        ext = _extensions_dir()
+        try:
+            os.makedirs(ext, exist_ok=True)
+        except Exception:
+            pass
+        env = os.environ.copy()
+        env.update({
+            "MODELSCOPE_CACHE": _model_cache_dir(),
+            "FUNASR_NO_UPDATE_CHECK": "1",
+            "MODELSCOPE_DISABLE_REMOTE": "1",
+            "PYTHONIOENCODING": "utf-8",
+        })
+        log_fp = None
+        try:
+            log_fp = open(os.path.join(ext, WORKER_LOG), "a",
+                          encoding="utf-8")
+        except Exception:
+            log_fp = subprocess.DEVNULL
+        creationflags = 0x08000000 if os.name == "nt" else 0
+        try:
+            proc = subprocess.Popen(
+                [exe, "--pipe"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log_fp, text=True, encoding="utf-8", bufsize=1,
+                creationflags=creationflags, env=env, cwd=ext)
+        except Exception as exc:
+            self._queue.put(("error",
+                             f"启动转写进程失败：{type(exc).__name__}: {exc}"))
+            if log_fp not in (None, subprocess.DEVNULL):
+                try:
+                    log_fp.close()
+                except Exception:
+                    pass
+            return False
+        self._proc = proc
+        self._log_fp = log_fp if log_fp is not subprocess.DEVNULL else None
+        self._need_restart = False
+        self._pos_sent = -1e9
+        self._reader = threading.Thread(target=self._read_loop, args=(proc,),
+                                        daemon=True)
+        self._reader.start()
+        return True
+
+    def _send(self, obj) -> bool:
+        """向 Worker 写一行 JSON（加锁；失败标记需要重启）。"""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+        data = json.dumps(obj, ensure_ascii=False) + "\n"
+        with self._write_lock:
+            try:
+                proc.stdin.write(data)      # type: ignore[union-attr]
+                proc.stdin.flush()          # type: ignore[union-attr]
+                return True
+            except Exception:
+                self._need_restart = True
+                return False
+
+    def _read_loop(self, proc) -> None:
+        """读线程：逐行解析 JSON 并入队；EOF 视为进程退出。"""
+        bad = 0
+        try:
+            for line in proc.stdout:        # type: ignore[union-attr]
+                text = (line or "").strip()
+                if not text:
+                    continue
+                try:
+                    obj = json.loads(text)
+                except Exception:
+                    bad += 1
+                    if bad >= 10:           # 连续 10 行无法解析 → 认为进程异常
+                        self._need_restart = True
+                        self._queue.put(("error", "转写进程输出异常，已结束"))
+                        self._kill(proc)
+                        return
+                    continue
+                bad = 0
+                message = _protocol_to_tuple(obj)
+                if message is None:
+                    continue
+                if message[0] in ("done", "error"):
+                    self._inflight = False
+                self._queue.put(message)
+        finally:
+            if self._proc is proc:          # 正常/异常退出
+                self._inflight = False
+                self._need_restart = True
+                self._queue.put(("error", "转写进程已退出"))
+                self._cleanup_proc(proc)
+
+    # ---- 内部：清理 ----
+    def _drain_queue(self) -> None:
+        """清空消息队列（新一轮任务开始前丢弃残留）。"""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _kill(self, proc) -> None:
+        """立即终止进程（尽力而为）。"""
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+        except Exception:
+            pass
+
+    def _stop_process(self) -> None:
+        """终止并清理当前进程句柄。"""
+        proc = self._proc
+        if proc is None:
+            return
+        self._need_restart = True
+        self._kill(proc)
+        self._cleanup_proc(proc)
+
+    def _cleanup_proc(self, proc) -> None:
+        """关闭管道/日志，释放句柄（只在当前进程仍指向它时清空）。"""
+        if self._proc is not proc:
+            return
+        self._proc = None
+        for stream in ("stdin", "stdout"):
+            handle = getattr(proc, stream, None)
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
+        log_fp = self._log_fp
+        self._log_fp = None
+        if log_fp is not None:
+            try:
+                log_fp.close()
+            except Exception:
+                pass
+
+
+# ===========================================================================
+# 角色二：Worker 模式（`audio_to_text.exe --pipe`）
+# ===========================================================================
+
+_current_position = 0.0
+_position_lock = threading.Lock()
+
+
+def _set_current_position(value) -> None:
+    """更新 Worker 侧当前播放位置（线程安全，V1.14.20）。"""
+    global _current_position
     try:
-        audio_url = upload_audio(args.audio)
-        print(f"   ✅ 上传成功", flush=True)
-    except Exception as e:
-        print(f"❌ 上传失败 / Upload failed: {e}", file=sys.stderr)
-        sys.exit(1)
+        number = float(value or 0.0)
+    except Exception:
+        return
+    with _position_lock:
+        _current_position = number
 
-    print(f"🎯 开始识别 / Transcribing (lang: {lang_map[args.language]})...", flush=True)
+
+def _get_current_position() -> float:
+    """读取 Worker 侧当前播放位置（线程安全）。"""
+    with _position_lock:
+        return _current_position
+
+
+def _worker_transcribe(path: str, send, send_event) -> None:
+    """Worker 内的转写线程：调用 `transcribe()` 并按协议回传。"""
     try:
-        event_id = call_transcribe(audio_url, lang_map[args.language])
-        if not event_id:
-            print("❌ 无法获取 event_id", file=sys.stderr)
-            sys.exit(1)
-    except Exception as e:
-        print(f"❌ 启动失败: {e}", file=sys.stderr)
-        sys.exit(1)
+        items = transcribe(
+            path,
+            on_event=lambda kind, text="": send_event(kind, text),
+            on_partial=lambda part: send({"type": "partial",
+                                          "items": _items_to_json(part)}),
+            position=_get_current_position,
+        )
+    except Exception as exc:
+        send({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        return
+    send({"type": "done", "items": _items_to_json(items)})
 
+
+def _run_worker_main() -> None:
+    """Worker 主流程：保护 stdout → 检查/下载模型 → 加载模型 → 协议循环。"""
+    real_stdout = sys.stdout
+    if real_stdout is None:
+        real_stdout = _NullSink()
+    if sys.stderr is None:
+        sys.stderr = _NullSink()        # type: ignore[assignment]
+    # 防 funasr / tqdm / 第三方 print 污染协议输出
+    sys.stdout = sys.stderr             # type: ignore[assignment]
+
+    write_lock = threading.Lock()
+
+    def send(obj) -> None:
+        data = json.dumps(obj, ensure_ascii=False) + "\n"
+        with write_lock:
+            try:
+                real_stdout.write(data)
+                real_stdout.flush()
+            except Exception:
+                pass
+
+    def send_event(kind: str, text: str = "") -> None:
+        send({"type": "event", "kind": kind, "text": text})
+
+    _suppress_child_console_windows(force=True)
+    _demote_priority()
+
+    # 1) 模型缓存检查（首次自动下载）
+    send_event(EVENT_PREPARE, "正在检查转写模型…")
+    if not _ensure_worker_model(
+            on_progress=lambda done, total: send_event(
+                EVENT_DOWNLOAD,
+                _download_text("正在下载模型", done, total))):
+        send({"type": "error",
+              "message": "无法获取转写模型，请检查网络后重试"})
+        return
+
+    # 2) 环境变量必须在导入 funasr/modelscope 之前写入
+    _apply_model_env()
+
+    # 3) 加载模型（失败直接报错）
+    send_event(EVENT_LOAD, "正在加载语音模型…")
     try:
-        result = poll_result(event_id)
-        if result and len(result) >= 2:
-            transcript = result[0]
-            status = result[1]
-            if status:
-                print(f"   📊 {status}", flush=True)
-            if args.output:
-                with open(args.output, 'w', encoding='utf-8') as f:
-                    f.write(transcript)
-                print(f"✅ 已保存到 / Saved to: {args.output}", flush=True)
-            else:
-                print(f"\n📝 {transcript}", flush=True)
-        else:
-            print("❌ 未获取到结果 / No result", file=sys.stderr)
-    except Exception as e:
-        print(f"❌ 获取结果失败: {e}", file=sys.stderr)
-        sys.exit(1)
+        _preload_logging()
+        get_model()
+    except Exception as exc:
+        send({"type": "error",
+              "message": f"加载语音模型失败：{type(exc).__name__}: {exc}"})
+        return
+    send_event(EVENT_LOAD, "语音模型已就绪")
 
+    # 4) 协议主循环
+    job: dict = {"thread": None}
+    try:
+        for line in sys.stdin:          # type: ignore[union-attr]
+            text = (line or "").strip()
+            if not text:
+                continue
+            try:
+                obj = json.loads(text)
+            except Exception:
+                send({"type": "error", "message": "无法解析的任务消息"})
+                continue
+            if not isinstance(obj, dict):
+                continue
+            kind = obj.get("type")
+            if kind == "quit":
+                break
+            if kind == "position":
+                _set_current_position(obj.get("value"))
+                continue
+            if kind != "run":
+                continue
+            thread = job.get("thread")
+            if thread is not None and thread.is_alive():
+                send({"type": "error", "message": "已有转写任务在进行"})
+                continue
+            _set_current_position(obj.get("start_at"))
+            path = str(obj.get("path") or "")
+            thread = threading.Thread(target=_worker_transcribe,
+                                      args=(path, send, send_event),
+                                      daemon=True)
+            job["thread"] = thread
+            thread.start()
+    finally:
+        os._exit(0)
+
+
+# ===========================================================================
+# 入口
+# ===========================================================================
 
 if __name__ == "__main__":
-    main()
+    if "--pipe" in sys.argv[1:]:
+        _run_worker_main()
+    elif len(sys.argv) >= 2:
+        # 开发期自测：进程内直接转写（需要本机装有 funasr）
+        for start, text in transcribe(sys.argv[1],
+                                      on_event=lambda k, t="": None):
+            print(f"[{start:.1f}s] {text}")
+    else:
+        print("用法: python audio_to_text.py <音频路径>")
+        print("      audio_to_text.exe --pipe   （Worker 模式）")

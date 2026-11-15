@@ -305,6 +305,7 @@ class OperationPanel:
         self._other_dev_row: tk.Frame | None = None
         self._other_trans_row: tk.Frame | None = None
         self._other_engine_row: tk.Frame | None = None
+        self._other_parallel_row: tk.Frame | None = None
         self._other_subtitle_row: tk.Frame | None = None
         self._other_ipc_row: tk.Frame | None = None
         self._other_console_row: tk.Frame | None = None
@@ -388,7 +389,7 @@ class OperationPanel:
 
         self.pitch_cancel_row = tk.Frame(pitch_frame, bg=self.BG_COLOR)
         self.pitch_cancel_row.pack(fill="x")
-        tk.Label(self.pitch_cancel_row, text="音高（LAB）",
+        tk.Label(self.pitch_cancel_row, text="音高",
                  bg=self.BG_COLOR, fg=self.ACCENT_COLOR,
                  font=self.app.button_font).pack(side="left")
 
@@ -748,15 +749,33 @@ class OperationPanel:
         self.trans_engine_box.bind("<<ComboboxSelected>>",
                                    self._on_engine_selected)
 
-        # 自动字幕（听力辅助）：UI 已建，接口未接入 → 锁定不可点
+        # 自动字幕（听力辅助）：开启需警告（V1.14.3 接入语音转写）
         box = self._build_option_row(other_frame, "自动字幕")
         self._other_subtitle_row = box.master
         for text, val in (("开", True), ("关", False)):
-            btn = self._make_seam_button(
-                box, text, lambda: self.app._hint_status(
-                    "自动字幕接口暂未接入，功能已锁定", kind="warning"))
-            btn.config(state="disabled", disabledforeground="#666C74")
-            self.subtitle_btns[val] = btn
+            self.subtitle_btns[val] = self._make_seam_button(
+                box, text, lambda v=val: self.app._set_auto_subtitle(v))
+
+        # 翻译并行度（1~10，默认 7；V1.14.3）
+        row = tk.Frame(other_frame, bg=self.BG_COLOR)
+        self._other_parallel_row = row
+        tk.Label(row, text="并行", bg=self.BG_COLOR, fg=self.FG_COLOR,
+                 font=self.app.list_font, anchor="w",
+                 width=8).pack(side="left")
+        self.trans_parallel_var = tk.DoubleVar(
+            value=getattr(self.app, "translate_parallel", 7))
+        self.trans_parallel_scale = ttk.Scale(
+            row, style="LRC.Horizontal.TScale", orient="horizontal",
+            from_=1, to=10, variable=self.trans_parallel_var,
+            command=self._on_parallel_changed)
+        self.trans_parallel_scale.pack(side="left", fill="x", expand=True)
+        self.trans_parallel_scale.bind(
+            "<ButtonRelease-1>", self._on_parallel_release)
+        self.trans_parallel_val = tk.Label(
+            row, text=str(getattr(self.app, "translate_parallel", 7)),
+            width=6, bg=self.BG_COLOR, fg=self.FG_COLOR,
+            font=self.app.info_font, anchor="e")
+        self.trans_parallel_val.pack(side="right", padx=(10, 0))
 
         # 开发者选项：开 / 关（默认关、非持久化；关闭时重置子项）
         box = self._build_option_row(other_frame, "开发者选项")
@@ -801,6 +820,35 @@ class OperationPanel:
                 self.app._set_translate_engine(eng)
                 return
 
+    def _on_parallel_changed(self, value: str) -> None:
+        """翻译并行度滑块（V1.14.3；V1.14.15 拖动中吸附到整数）。
+
+        与音量/音高滑块一致：拖动过程中就吸附到整数格，不会停在半格上。
+        """
+        try:
+            v = max(1, min(10, int(round(float(value)))))
+        except (TypeError, ValueError):
+            return
+        try:
+            # 拖动中实时吸附（与 _on_vol_changed 同做法：无条件回写整数值；
+            # 若条件判断是否「已经是整数」会永远为真，等于没吸附）
+            self.trans_parallel_var.set(v)
+            self.trans_parallel_val.config(text=str(v))
+        except (tk.TclError, ValueError):
+            return
+        if v != getattr(self.app, "translate_parallel", 7):
+            self.app._set_translate_parallel(v)
+
+    def _on_parallel_release(self, _event: tk.Event | None = None) -> None:
+        """松手后把滑块对齐到整数值（拖动中不回写，V1.13.6 同理）。"""
+        v = int(getattr(self.app, "translate_parallel", 7))
+        try:
+            if int(round(float(self.trans_parallel_var.get()))) != v:
+                self.trans_parallel_var.set(v)
+            self.trans_parallel_val.config(text=str(v))
+        except (tk.TclError, ValueError):
+            pass
+
     def sync_other_rows(self) -> None:
         """按开关状态重排「其他」区子行显隐（V1.14.0）。
 
@@ -813,6 +861,7 @@ class OperationPanel:
             (getattr(self, "_other_exp_row", None), True),
             (getattr(self, "_other_trans_row", None), exp),
             (getattr(self, "_other_engine_row", None), trans),
+            (getattr(self, "_other_parallel_row", None), trans),
             (getattr(self, "_other_subtitle_row", None), exp),
             (getattr(self, "_other_dev_row", None), True),
             (getattr(self, "_other_ipc_row", None), dev),
@@ -856,6 +905,16 @@ class OperationPanel:
             self.subtitle_btns, getattr(app, "auto_subtitle_enabled", False))
         self._refresh_btn_group(
             self.dev_btns, getattr(app, "dev_options_enabled", False))
+        try:
+            n = int(getattr(app, "translate_parallel", 7))
+            if self.trans_parallel_val.cget("text") != str(n):
+                self.trans_parallel_val.config(text=str(n))
+            # 滑块位置也要跟随实际值（V1.14.15）：启动读配置后曾只改标签，
+            # 滑块停在构建时的默认值上
+            if int(round(float(self.trans_parallel_var.get()))) != n:
+                self.trans_parallel_var.set(n)
+        except (tk.TclError, ValueError):
+            pass
         try:
             label = ENGINE_LABELS.get(
                 getattr(app, "translate_engine", "bing"), "Bing")
