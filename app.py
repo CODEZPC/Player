@@ -184,6 +184,9 @@ class LrcPlayerApp:
         self._task_boxes: dict[str, tuple] = {}  # key → (frame, label)，就地更新（V1.14.17）
         self._task_area_packed = False
         self._subtitle_poll_id = None          # 子进程消息轮询 after id
+        self._prefetch_gen = 0                 # 预下载世代（V1.14.22）
+        self._prefetch_poll_id = None          # 预下载进度轮询 after id
+        self._prefetch_silent = False          # 预下载是否静默（启动恢复时 True）
         self._subtitle_cache: dict[str, list] = {}   # 路径 → 转写结果（本次运行内）
         self.auto_translate_enabled = False    # 歌词自动翻译（持久化）
         self.translate_engine = tran.DEFAULT_ENGINE   # bing / bilibili
@@ -195,7 +198,11 @@ class LrcPlayerApp:
         self._trans_queue: list[tuple[float, str]] = []
         self._trans_lock = threading.Lock()
         self._trans_done_ts: set[float] = set()   # 已翻译的时间戳（去重）
-        self._trans_done_count = 0                # 本批次已翻行数（任务框显示）
+        self._trans_done_count = 0                # 本任务已完成行数（任务框显示）
+        # 进度口径（V1.14.23）：total 只增不减（= 已入队总行数，含翻译中/跳过），
+        # 避免并发中若干行「既不在队列也不在完成数」导致分母忽大忽小。
+        self._trans_total_count = 0
+        self._trans_inflight = 0                  # 已取出去翻译、尚未返回行数
 
         # ---- 歌词浮层 ----
         self._lyric_overlay = None  # 全窗口歌词浮层 Frame
@@ -1640,7 +1647,8 @@ class LrcPlayerApp:
         V1.14.7：已是目标开关状态时直接返回——否则再点一次「开」会重新
         启动一遍转写。
         V1.14.20：转写组件/模型缺失时，在警告确认之后再加一道**蓝色**确认
-        （将下载约 2.8GB），取消则不启用。
+        （将下载约 1.21GB），取消则不启用。
+        V1.14.22：开关打开后**立即**检查并后台预下载缺失资源（不等播放/无歌词）。
         """
         on = bool(on)
         if on == self.auto_subtitle_enabled:
@@ -1652,8 +1660,8 @@ class LrcPlayerApp:
             ans = self.show_dialog(
                 "自动字幕（听力辅助）",
                 "启用自动字幕开关（听力辅助）后，将自动对无歌词文件的音频"
-                "进行语音转写，此过程需要联网上传音频文件，会消耗数据流量，"
-                "需要一定的处理时间，且对歌曲的转写易出错。\n\n确定要启用吗？",
+                "进行语音转写，此过程需要较大的内存占用，需要一定的处理时间，"
+                "且不保证准确性。\n\n确定要启用吗？",
                 kind="warning",
                 buttons=(("确定", "yes"), ("取消", "no")))
             if ans != "yes":
@@ -1666,15 +1674,17 @@ class LrcPlayerApp:
         self._sync_other_ui()
         self._schedule_config_save()
         if on:
+            self._prefetch_subtitle_packages()   # V1.14.22：立即下载缺失资源
             self._maybe_auto_subtitle()
         else:
+            self._cancel_prefetch_packages()     # V1.14.22：停止预下载
             self._cancel_auto_subtitle()
 
     def _confirm_download_extensions(self) -> bool:
         """转写组件/模型缺失时的二次确认（蓝色，V1.14.20）。
 
         仅当 `_internal/extensions` 里缺组件或模型时才弹；文案按**实际缺失项**
-        组合（都缺时合计约 2.8GB）。返回 True 表示继续启用（缺什么会在后台
+        组合（都缺时合计约 1.21GB）。返回 True 表示继续启用（缺什么会在后台
         自动下载），False 表示放弃启用。
         """
         try:
@@ -1690,7 +1700,7 @@ class LrcPlayerApp:
             comp_gb = float(audio_to_text.COMPONENT_SIZE_GB)
             model_gb = float(audio_to_text.MODEL_SIZE_GB)
         except Exception:
-            comp_gb, model_gb = 0.3, 2.5
+            comp_gb, model_gb = 0.36, 1.5
         if "component" in missing:
             lines.append(f"· 转写程序包 audio_to_text.zip（约 {comp_gb:.1f}GB）")
             total_gb += comp_gb
@@ -1706,6 +1716,100 @@ class LrcPlayerApp:
             "下载转写组件", body, kind="info",
             buttons=(("确定下载", "yes"), ("取消", "no")))
         return ans == "yes"
+
+    # ---------------- 转写资源预下载（V1.14.22）----------------
+
+    def _prefetch_subtitle_packages(self, silent: bool = False) -> None:
+        """检查并后台预下载转写资源（组件包 + 模型包）。
+
+        - 用户手动开启自动字幕：前面已有蓝色确认弹窗；
+        - 启动时从配置恢复为「已开启」：`silent=True`，缺资源则**静默**下载，
+          失败只在状态栏提示（不弹窗、不阻塞启动）。
+        **只下载，不启动 Worker、不加载模型**（不占内存）。
+        """
+        if not (self.experimental_enabled and self.auto_subtitle_enabled):
+            return
+        try:
+            import audio_to_text
+            missing = audio_to_text.missing_packages()
+        except Exception:
+            return
+        if not missing:
+            return
+        worker = self._ensure_subtitle_worker()
+        if worker is None:
+            return
+        self._stop_prefetch_poll()
+        self._prefetch_gen += 1
+        self._prefetch_silent = bool(silent)
+        gen = self._prefetch_gen
+        try:
+            if not worker.ensure_download():
+                return                  # 起线程失败/异常
+        except Exception:
+            return
+        if "subtitle" not in self._tasks:
+            self._set_task("subtitle", "正在下载转写资源…")
+        self._prefetch_poll_id = self.root.after(
+            SUBTITLE_POLL_MS, lambda: self._poll_prefetch(gen))
+
+    def _stop_prefetch_poll(self) -> None:
+        """停止预下载进度轮询（幂等）。"""
+        pid = self._prefetch_poll_id
+        self._prefetch_poll_id = None
+        if pid is not None:
+            try:
+                self.root.after_cancel(pid)
+            except Exception:
+                pass
+
+    def _cancel_prefetch_packages(self) -> None:
+        """停止资源下载并收起任务框（关闭自动字幕时调用，V1.14.23）。"""
+        self._stop_prefetch_poll()
+        self._prefetch_gen += 1
+        worker = getattr(self, "_subtitle_worker", None)
+        if worker is not None:
+            try:
+                worker.cancel_download()
+            except Exception:
+                pass
+        if not self._subtitle_path:     # 没有正在进行的转写 → 收起下载任务框
+            self._clear_task("subtitle")
+
+    def _poll_prefetch(self, gen: int) -> None:
+        """轮询预下载进度（与转写轮询互斥：转写开始时会被停掉）。"""
+        self._prefetch_poll_id = None
+        if gen != self._prefetch_gen:
+            return
+        worker = getattr(self, "_subtitle_worker", None)
+        if worker is None:
+            return
+        while True:
+            msg = worker.poll()
+            if msg is None:
+                break
+            kind, payload = msg
+            if kind == "event":
+                ek, etext, eprog = self._unpack_event(payload)
+                self._set_task(
+                    "subtitle", self._task_text_for_event(ek, etext, eprog))
+            elif kind == "prepared":            # 资源已就绪
+                self._clear_task("subtitle")
+                self._hint_status("转写资源已就绪", kind="success")
+                return
+            elif kind == "error":
+                self._clear_task("subtitle")
+                self._hint_status(
+                    str(payload),
+                    kind="warning" if self._prefetch_silent else "error")
+                return
+            else:                               # 转写类消息：本轮询不管
+                continue
+        if not worker.pending():                # 下载/转写都结束了
+            self._clear_task("subtitle")
+            return
+        self._prefetch_poll_id = self.root.after(
+            SUBTITLE_POLL_MS, lambda: self._poll_prefetch(gen))
 
     def _set_dev_options(self, on: bool) -> None:
         """开发者选项开关（默认关、非持久化；关闭时重置：IPC 恢复 + 关控制台）。"""
@@ -1761,6 +1865,8 @@ class LrcPlayerApp:
         with self._trans_lock:
             self._trans_queue.clear()
         self._trans_done_count = 0
+        self._trans_total_count = 0
+        self._trans_inflight = 0
         self._clear_task("translate")      # 任务框移除（V1.14.14）
         if getattr(self, "_busy_owner", "") == "translate":
             self._busy_status_text = ""
@@ -1828,16 +1934,15 @@ class LrcPlayerApp:
             return
         added = 0
         with self._trans_lock:
-            # 队列空且无 worker → 视为新批次，计数归零（含中文句计入的总量）
-            if not self._trans_queue and not (
-                    self._trans_thread is not None
-                    and self._trans_thread.is_alive()):
-                self._trans_done_count = 0
+            # V1.14.23：**不再在新批次开始时归零计数**——逐段转写会不断追加行，
+            # 若每段都归零，任务框会反复从 0/N 重来（分母/已完成都会跳变）。
+            # 计数只在切歌 / 换歌词 / 取消翻译时清零。
             queued = {round(ts, 3) for ts, _text in self._trans_queue}
             for ts, text in items:
                 key = round(float(ts), 3)
                 if key in queued or key in self._trans_done_ts:
                     continue
+                self._trans_total_count += 1        # 分母只增不减（V1.14.23）
                 if not tran.needs_translate(text):
                     # 中文句（或仅数字/符号）：不提交翻译，但计入进度（V1.14.17）
                     self._trans_done_ts.add(key)
@@ -1873,7 +1978,9 @@ class LrcPlayerApp:
             times = [ts for ts, _text in self._trans_queue]
             idx = utils.next_forward_index(
                 set(range(len(times))), times, pos)
-            return self._trans_queue.pop(idx)
+            item = self._trans_queue.pop(idx)
+            self._trans_inflight += 1     # 取出去的行仍计入分母（V1.14.23）
+            return item
 
     def _trans_queue_empty(self) -> bool:
         with self._trans_lock:
@@ -1922,6 +2029,14 @@ class LrcPlayerApp:
                                 self._apply_one_translation(t, o, g))
                         except Exception:
                             return
+                    else:
+                        # 失败行也收尾，否则进度永远差几行（V1.14.23）
+                        try:
+                            self.root.after(
+                                0, lambda t=ts, g=gen:
+                                self._trans_item_failed(t, g))
+                        except Exception:
+                            return
                     try:
                         self.root.after(
                             0, lambda g=gen: self._update_translate_progress(g))
@@ -1956,6 +2071,7 @@ class LrcPlayerApp:
         if worker is not None:
             try:
                 # 正在转写 → terminate（真正取消）；空闲 → 保留已加载模型的热进程
+                # V1.14.23：cancel() 只作用于转写任务，不动资源下载
                 worker.cancel()
             except Exception:
                 pass
@@ -1964,6 +2080,25 @@ class LrcPlayerApp:
             self._busy_owner = ""
             if hasattr(self, "_prog_var"):
                 self._refresh_idle_status()
+        # 转写取消了但资源还在下载 → 接一个下载轮询把进度继续显示出来（V1.14.23）
+        self._ensure_download_poll()
+
+    def _ensure_download_poll(self) -> None:
+        """若还有资源在下载且当前没有轮询在跑，则启动下载轮询（V1.14.23）。"""
+        worker = getattr(self, "_subtitle_worker", None)
+        if worker is None:
+            return
+        try:
+            if not worker.downloading():
+                return
+        except Exception:
+            return
+        if self._subtitle_poll_id is not None or self._prefetch_poll_id is not None:
+            return
+        self._prefetch_gen += 1
+        gen = self._prefetch_gen
+        self._prefetch_poll_id = self.root.after(
+            SUBTITLE_POLL_MS, lambda: self._poll_prefetch(gen))
 
     def _ensure_subtitle_worker(self):
         """懒创建转写子进程句柄（模块本身很轻，不导入 funasr）。"""
@@ -2007,6 +2142,7 @@ class LrcPlayerApp:
         if not path:
             return
         self._cancel_auto_subtitle()      # 作废旧任务（空闲则保留热进程）
+        self._stop_prefetch_poll()        # 预下载让位给真正的转写（V1.14.22）
         gen = self._subtitle_gen
         worker = self._ensure_subtitle_worker()
         try:
@@ -2057,13 +2193,10 @@ class LrcPlayerApp:
                 break
             kind, payload = msg
             if kind == "event":
-                # V1.14.21：事件负载变成 (kind, text, progress)，
-                # 兼容旧的两元素元组
-                ek = payload[0] if len(payload) > 0 else ""
-                etext = payload[1] if len(payload) > 1 else ""
-                eprog = float(payload[2]) if len(payload) > 2 and \
-                    payload[2] is not None else None
+                ek, etext, eprog = self._unpack_event(payload)
                 self._on_subtitle_event(ek, etext, gen, eprog)
+            elif kind == "prepared":                # 资源已就绪（等待中到来）
+                continue
             elif kind == "partial":                 # 某段完成 → 立即显示（V1.14.9）
                 self._append_subtitle_items(payload, gen)
             elif kind == "done":
@@ -2072,9 +2205,9 @@ class LrcPlayerApp:
             else:                              # error
                 self._finish_auto_subtitle([], gen, str(payload))
                 return
-        # 组件下载/进程启动阶段还没创建进程句柄（busy 为 True），
-        # 此时不能按「进程已退出」处理（V1.14.20）
-        if not worker.alive() and not worker.busy():
+        # 资源下载中/进程启动中都没进程句柄（pending 为 True），
+        # 此时不能按「进程已退出」处理（V1.14.20 / V1.14.23）
+        if not worker.alive() and not worker.pending():
             self._finish_auto_subtitle([], gen, "转写进程异常退出")
             return
         self._tick_subtitle_elapsed(gen)
@@ -2103,13 +2236,31 @@ class LrcPlayerApp:
             return
         if not text:
             return
+        self._set_task("subtitle",
+                       self._task_text_for_event(kind, text, progress))
+
+    @staticmethod
+    def _unpack_event(payload):
+        """事件负载 → `(kind, text, progress)`，兼容旧的两元素元组（V1.14.21/22）。"""
+        ek = payload[0] if len(payload) > 0 else ""
+        etext = payload[1] if len(payload) > 1 else ""
+        eprog = payload[2] if len(payload) > 2 else None
+        try:
+            eprog = None if eprog is None else float(eprog)
+        except Exception:
+            eprog = None
+        return ek, etext, eprog
+
+    def _task_text_for_event(self, kind: str, text: str,
+                             progress=None) -> str:
+        """事件 → 任务框文字（下载阶段不带前缀并附文字进度条，V1.14.21）。"""
         if kind == "download" and progress is not None:
             pct = max(0.0, min(1.0, float(progress))) * 100.0
             # 任务框可用宽度约 322px（操作栏 340 - 内边距）；8 格刚好不溢出
             text = f"{text} {make_progress_bar(pct, 8)}"
-        # V1.14.21：下载阶段不显示「语音转写」前缀（把宽度留给进度条）
+        # 下载阶段不显示「语音转写」前缀（把宽度留给进度条）
         prefix = "" if kind == "download" else "语音转写　"
-        self._set_task("subtitle", f"{prefix}{text}")
+        return f"{prefix}{text}"
 
     def _tick_subtitle_elapsed(self, gen: int) -> None:
         """任务框显示「语音转写　第 k/N 段 · 已用 mm:ss」（V1.14.7 / V1.14.14）。
@@ -2230,25 +2381,29 @@ class LrcPlayerApp:
             pass
 
     def _update_translate_progress(self, gen: int) -> None:
-        """更新翻译进度任务框（主线程，V1.14.14 / V1.14.16 增量队列）。"""
+        """更新翻译进度任务框（主线程，V1.14.14 / V1.14.16 增量队列）。
+
+        V1.14.23：分母改为**已入队总行数**（只增不减，含翻译中与跳过的行）——
+        旧实现用「已完成 + 队列剩余」，正在并发翻译的若干行两边都没算，
+        分母忽大忽小（实测出现 4/41 → 13/40 这种倒退），无法阅读。
+        """
         if gen != self._trans_gen:
             return
-        with self._trans_lock:
-            remaining = len(self._trans_queue)
         done = self._trans_done_count
-        total = done + remaining
+        total = self._trans_total_count
         if total <= 0:
             return
-        if remaining:
+        if done < total:
             text = f"歌词翻译　{done}/{total}"
         else:
-            text = f"歌词翻译　已完成 {done} 行"
+            text = f"歌词翻译　已完成 {total} 行"
         self._set_task("translate", text)
 
     def _apply_one_translation(self, ts: float, text: str, gen: int) -> None:
         """单行译文落地（主线程）：追加进翻译轴并刷新显示（V1.14.16）。"""
         if gen != self._trans_gen:
             return
+        self._trans_inflight = max(0, self._trans_inflight - 1)
         self._trans_done_ts.add(round(float(ts), 3))
         self._trans_done_count += 1
         self.lrc_trans_lines.append((float(ts), str(text)))
@@ -2258,6 +2413,14 @@ class LrcPlayerApp:
         self._cur_trans_text = "\x00"
         self._cur_trans_is_placeholder = None
         self._sync_translation(self._current_time())
+
+    def _trans_item_failed(self, ts: float, gen: int) -> None:
+        """某行翻译失败：也从统计里收尾（否则进度永远差几行，V1.14.23）。"""
+        if gen != self._trans_gen:
+            return
+        self._trans_inflight = max(0, self._trans_inflight - 1)
+        self._trans_done_ts.add(round(float(ts), 3))   # 不重复入队重试
+        self._trans_done_count += 1
 
     def _finish_translate_batch(self, gen: int, translated: int) -> None:
         """翻译批次结束（主线程，V1.14.16）。
@@ -2272,14 +2435,15 @@ class LrcPlayerApp:
             self._ensure_trans_worker()
             return
         self._clear_task("translate")
-        self._trans_done_count = 0        # 批次结束，计数归零（V1.14.17）
+        # 完成提示与进度同一口径：已入队总行数（含跳过/失败行）；
+        # 计数**不清零**——逐段翻译下批次之间要保持累计（V1.14.23）
+        n = self._trans_total_count
         self._busy_status_text = ""
         self._busy_owner = ""
         if translated <= 0:
             return
         if self._subtitle_path:
             return          # 转写仍在进行：静默逐段翻译
-        n = len(self.lrc_trans_lines)
         self._hint_status(f"歌词自动翻译完成（{n} 行）", kind="success")
 
     def _toggle_console(self) -> None:
@@ -3275,6 +3439,8 @@ class LrcPlayerApp:
         # 换曲（无歌词路径）：翻译轴与去重记录一并重置（V1.14.16）
         self._trans_done_ts.clear()
         self._trans_done_count = 0
+        self._trans_total_count = 0
+        self._trans_inflight = 0
         # 无歌词文件 → 作废上一首的转写并尝试自动字幕（V1.14.5）
         self._cancel_auto_subtitle()
         self._maybe_auto_subtitle()
@@ -3304,6 +3470,8 @@ class LrcPlayerApp:
         self._cancel_auto_subtitle()   # 有真实歌词 → 作废进行中的转写（V1.14.5）
         self._trans_done_ts.clear()    # 新歌词 → 翻译去重记录重置（V1.14.16）
         self._trans_done_count = 0
+        self._trans_total_count = 0
+        self._trans_inflight = 0
         self._maybe_auto_translate()   # 外语歌词自动翻译（V1.14.0）
 
     def _clear_lrc(self) -> None:
@@ -3314,6 +3482,8 @@ class LrcPlayerApp:
         self.lrc_trans_times.clear()
         self._trans_done_ts.clear()    # V1.14.16
         self._trans_done_count = 0
+        self._trans_total_count = 0
+        self._trans_inflight = 0
         self._cur_trans_text = ""
         self.current_lrc_index = -1
         self.lrc_path = None
@@ -4443,6 +4613,10 @@ class LrcPlayerApp:
         data = config_store.load()
         self._apply_config_values(data.get("config") or {})
         self.root.after(0, self._restore_saved_folders)
+        # V1.14.22：启动时若自动字幕已开启，静默检查并预下载缺失资源
+        #（延迟 1.5s 让主界面/文件夹恢复先跑完；缺资源不弹窗，失败只状态栏提示）
+        self.root.after(1500,
+                        lambda: self._prefetch_subtitle_packages(silent=True))
 
     def _restore_saved_folders(self) -> None:
         """恢复上次打开的文件夹：逐个添加并后台扫描；不存在的跳过（不提示）。"""
@@ -5874,6 +6048,8 @@ class LrcPlayerApp:
     def on_close(self) -> None:
         """窗口关闭时的清理。"""
         self._flush_config_save()   # 兜底保存最新配置/文件夹
+        self._stop_prefetch_poll()  # 停预下载轮询（V1.14.22）
+        self._prefetch_gen += 1     # 让在途的预下载线程收尾退出
         worker = getattr(self, "_subtitle_worker", None)   # 回收转写子进程
         if worker is not None:
             try:

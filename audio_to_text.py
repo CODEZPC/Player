@@ -225,8 +225,25 @@ def _component_exe_path() -> str:
 
 
 def _model_cache_dir() -> str:
-    """主程序侧模型缓存目录：`_internal/extensions/model/modelscope`。"""
+    """模型包解压根目录：`_internal/extensions/model/modelscope`。
+
+    注意这是**我们自己的**约定目录（zip 解压到这里），不等于 modelscope 的
+    缓存根——见 `_modelscope_cache_root()`。
+    """
     return os.path.join(_extensions_dir(), "model", "modelscope")
+
+
+def _modelscope_cache_root() -> str:
+    """模型包目录对应的 `MODELSCOPE_CACHE` 取值（自动兼容两种布局，V1.14.24）。
+
+    modelscope 1.29 在**设置了** `MODELSCOPE_CACHE` 时，把模型放在
+    `<CACHE>/models/<ns>/<model>`（不再有 `hub` 这一层）。所以：
+
+    - 模型包按 `<root>/models/...` 解压 → 直接用 `<root>`；
+    - 旧包/旧用户缓存是 `<root>/hub/models/...` → 把 CACHE 指到 `<root>/hub`，
+      这样 `<CACHE>/models` 正好命中已有文件，**不必搬动几 GB 数据**。
+    """
+    return _modelscope_cache_root_of(_model_cache_dir())
 
 
 def _worker_model_root() -> str:
@@ -235,7 +252,37 @@ def _worker_model_root() -> str:
     if env:
         return env
     base = os.path.dirname(os.path.abspath(sys.executable or sys.argv[0] or "."))
-    return os.path.join(base, "model", "modelscope")
+    return _modelscope_cache_root_of(
+        os.path.join(base, "model", "modelscope"))
+
+
+def _modelscope_cache_root_of(root: str) -> str:
+    """给定模型包目录，返回 modelscope 应使用的 `MODELSCOPE_CACHE`。
+
+    V1.14.24：**按内容**判断（空目录不算数）——
+    - `<root>/models` 里有东西 → 新布局，CACHE = `<root>`；
+    - 否则 `<root>/hub/models` 里有东西 → 旧布局，CACHE = `<root>/hub`；
+    - 都没有 → CACHE = `<root>`（下载会落到 `<root>/models`）。
+    """
+    def has_content(path: str) -> bool:
+        try:
+            return os.path.isdir(path) and bool(os.listdir(path))
+        except OSError:
+            return False
+
+    hub_models = os.path.join(root, "hub", "models")
+    if has_content(hub_models) and not has_content(os.path.join(root, "models")):
+        return os.path.join(root, "hub")
+    return root
+
+
+def _model_files_present() -> bool:
+    """模型是否已就绪（按 modelscope 实际会读的路径判断，V1.14.24）。
+
+    旧实现只判断「`modelscope` 目录非空」，于是 `hub/models` 布局下也判为就绪，
+    但 modelscope 会去 `<CACHE>/models` 找 → 找不到就整套重下（实测 1GB+）。
+    """
+    return _models_present_under(_model_cache_dir())
 
 
 def missing_packages() -> list[str]:
@@ -247,8 +294,7 @@ def missing_packages() -> list[str]:
     missing: list[str] = []
     if not os.path.isfile(_component_exe_path()):
         missing.append("component")
-    model_dir = _model_cache_dir()
-    if not (os.path.isdir(model_dir) and os.listdir(model_dir)):
+    if not _model_files_present():
         missing.append("model")
     return missing
 
@@ -288,7 +334,8 @@ def _validate_zip(path: str) -> bool:
 
 
 def _download_with_mirrors(url: str, dest: str, on_progress=None,
-                           timeout: tuple = (30, 300)) -> bool:
+                           timeout: tuple = (30, 300),
+                           should_stop=None) -> bool:
     """按镜像优先级下载到 `dest`（先写 `.part`，校验 zip 后改名）。
 
     Args:
@@ -296,11 +343,21 @@ def _download_with_mirrors(url: str, dest: str, on_progress=None,
         dest: 目标文件路径。
         on_progress: `fn(done, total)`，已节流（百分比变化时才回调）。
         timeout: `(连接, 读取)` 超时。
+        should_stop: `fn() -> bool`，逐块检查；返回 True 则中止下载
+            （`.part` 会被清理，函数返回 False）。
     """
     import requests          # 延迟导入：顶层只允许轻量模块
 
+    def stopped() -> bool:
+        try:
+            return bool(should_stop and should_stop())
+        except Exception:
+            return True
+
     prefixes = _mirror_prefixes()
     for prefix in prefixes:
+        if stopped():
+            return False
         full = (prefix + url) if prefix else url
         part = dest + ".part"
         try:
@@ -310,6 +367,7 @@ def _download_with_mirrors(url: str, dest: str, on_progress=None,
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 last_pct = -1
+                tick = 0
                 with open(part, "wb") as fp:
                     for chunk in resp.iter_content(1024 * 256):
                         if not chunk:
@@ -324,6 +382,11 @@ def _download_with_mirrors(url: str, dest: str, on_progress=None,
                                     on_progress(done, total)
                                 except Exception:
                                     pass
+                        tick += 1
+                        if tick % 16 == 0 and stopped():
+                            return False      # 用户取消：finally 会清理 .part
+            if stopped():
+                return False
             if _validate_zip(part):
                 os.replace(part, dest)
                 return True
@@ -390,55 +453,143 @@ def _extract_zip(zip_path: str, dest_dir: str, required_rel: str,
         return False
 
 
-def _ensure_component(on_progress=None) -> bool:
+# 下载互斥：预下载（V1.14.22）与【转写前确保】可能分别在不同线程里发起，
+# 同一时刻只允许一个在写 `.part` / 解压，否则会互踩文件。
+_PACKAGE_LOCK = threading.Lock()
+
+
+def _ensure_component(on_progress=None, should_stop=None) -> bool:
     """确保转写组件 exe 存在（必要时下载 `audio_to_text.zip` 并解压）。"""
-    exe = _component_exe_path()
-    if os.path.isfile(exe):
-        return True
-    ext = _extensions_dir()
-    try:
-        os.makedirs(ext, exist_ok=True)
-    except Exception:
-        pass
-    zip_path = os.path.join(ext, "audio_to_text.zip")
-    if not _download_with_mirrors(COMPONENT_URL, zip_path,
-                                  on_progress=on_progress):
-        return False
-    ok = _extract_zip(zip_path, ext, required_rel=COMPONENT_EXE)
-    try:
-        os.remove(zip_path)
-    except OSError:
-        pass
-    return ok and os.path.isfile(exe)
+    with _PACKAGE_LOCK:
+        exe = _component_exe_path()
+        if os.path.isfile(exe):
+            return True
+        ext = _extensions_dir()
+        try:
+            os.makedirs(ext, exist_ok=True)
+        except Exception:
+            pass
+        zip_path = os.path.join(ext, "audio_to_text.zip")
+        if not _download_with_mirrors(COMPONENT_URL, zip_path,
+                                      on_progress=on_progress,
+                                      should_stop=should_stop):
+            return False
+        ok = _extract_zip(zip_path, ext, required_rel=COMPONENT_EXE)
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return ok and os.path.isfile(exe)
 
 
-def _ensure_worker_model(on_progress=None) -> bool:
-    """确保模型缓存存在（必要时下载 `modelscope.zip` 并解压）。"""
-    root = _worker_model_root()
-    if os.path.isdir(root) and os.listdir(root):
-        return True
-    model_dir = os.path.dirname(root) or root
+def _ensure_worker_model(on_progress=None, root: str = "",
+                         should_stop=None) -> bool:
+    """确保模型缓存存在（必要时下载 `modelscope.zip` 并解压）。
+
+    `root`：模型包目录（zip 解压目标，默认 `_worker_model_root()`）；
+    主程序侧预下载时传 `_model_cache_dir()`（V1.14.22）。
+
+    V1.14.24：就绪判定改为**按 modelscope 实际会读的路径**
+    （`<cache_root>/models` 非空），避免「`hub/models` 布局被误判为已就绪、
+    结果 modelscope 又整套重下」。
+    """
+    with _PACKAGE_LOCK:
+        root = root or _worker_model_root()
+        if _models_present_under(root):
+            return True
+        model_dir = os.path.dirname(root) or root
+        try:
+            os.makedirs(model_dir, exist_ok=True)
+        except Exception:
+            pass
+        zip_path = os.path.join(model_dir, "modelscope.zip")
+        if not _download_with_mirrors(MODEL_URL, zip_path,
+                                      on_progress=on_progress,
+                                      should_stop=should_stop):
+            return False
+        ok = _extract_zip(zip_path, model_dir,
+                          required_rel=os.path.basename(root.rstrip("\\/")))
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return ok and _models_present_under(root)
+
+
+def _models_present_under(root: str) -> bool:
+    """`root` 下是否已有 modelscope 能直接命中的模型文件（V1.14.24）。"""
+    cache_root = _modelscope_cache_root_of(root)
+    models_dir = os.path.join(cache_root, "models")
     try:
-        os.makedirs(model_dir, exist_ok=True)
-    except Exception:
-        pass
-    zip_path = os.path.join(model_dir, "modelscope.zip")
-    if not _download_with_mirrors(MODEL_URL, zip_path, on_progress=on_progress):
-        return False
-    ok = _extract_zip(zip_path, model_dir,
-                      required_rel=os.path.basename(root.rstrip("\\/")))
-    try:
-        os.remove(zip_path)
+        if os.path.isdir(models_dir) and os.listdir(models_dir):
+            return True
     except OSError:
-        pass
-    return ok and os.path.isdir(root) and bool(os.listdir(root))
+        return False
+    return False
+
+
+def ensure_packages(on_event=None, should_stop=None) -> bool:
+    """下载缺失的组件包与模型包（V1.14.22）。
+
+    **只下载解压，不启动 Worker、不加载模型**——供「自动字幕开关一打开就
+    预先备好资源」使用。
+
+    Args:
+        on_event: `fn(kind, text, progress)`，直接传 `EVENT_*` 与 0~1 进度。
+        should_stop: `fn() -> bool`，返回 True 时尽快收尾（不再开始下一项）。
+
+    Returns:
+        True 表示两类包均已就绪。
+    """
+    def emit(kind: str, text: str = "", progress=None) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event(kind, text, progress)
+        except Exception:
+            pass
+
+    def stopped() -> bool:
+        try:
+            return bool(should_stop and should_stop())
+        except Exception:
+            return True
+
+    def component_progress(done: int, total: int) -> None:
+        text, frac = _download_progress("正在下载转写组件", done, total)
+        emit(EVENT_DOWNLOAD, text, frac)
+
+    def model_progress(done: int, total: int) -> None:
+        text, frac = _download_progress("正在下载模型", done, total)
+        emit(EVENT_DOWNLOAD, text, frac)
+
+    missing = missing_packages()
+    if "component" in missing:
+        emit(EVENT_DOWNLOAD, "正在下载转写组件")
+        if not _ensure_component(on_progress=component_progress,
+                                 should_stop=should_stop):
+            return False
+    if stopped():
+        return False
+    if "model" in missing_packages():
+        emit(EVENT_DOWNLOAD, "正在下载模型")
+        if not _ensure_worker_model(on_progress=model_progress,
+                                    root=_model_cache_dir(),
+                                    should_stop=should_stop):
+            return False
+    if stopped():
+        return False
+    emit(EVENT_PREPARE, "转写资源已就绪")
+    return True
 
 
 def _apply_model_env() -> None:
     """写入模型缓存/离线相关环境变量（**必须在导入 funasr 之前**调用）。"""
     root = _worker_model_root()
     if root:
-        os.environ["MODELSCOPE_CACHE"] = root
+        # modelscope 1.29：<CACHE>/models/<ns>/<model>；旧包在 <root>/hub/models，
+        # 就自动把 CACHE 指到 hub（V1.14.24）
+        os.environ["MODELSCOPE_CACHE"] = _modelscope_cache_root_of(root)
     os.environ["FUNASR_NO_UPDATE_CHECK"] = "1"
     os.environ["MODELSCOPE_DISABLE_REMOTE"] = "1"
 
@@ -644,9 +795,12 @@ def get_model():
             _model = auto_model(
                 model="paraformer-zh",
                 vad_model="fsmn-vad",
-                punc_model="ct-punc",          # 标点，用于句子划分
+                # V1.14.25：改用**小标点模型**（zh-common-vocab272727，约 290MB；
+                # `ct-punc` 是 cn-en-large，1131MB）——模型包要控制在 2GiB 内
+                punc_model="ct-punc-c",
                 timestamp_model="fa-zh",        # 句级时间戳
-                spk_model="cam++",              # 说话人分离
+                # 不再需要说话人分离：字幕只用「时间 + 文本」（V1.14.25 去掉
+                # spk_model="cam++"，省 27.5MB；分句改由 sentence_timestamp 提供）
                 device=_model_device,
                 disable_update=True,            # 关闭联网更新检查（V1.14.4）
             )
@@ -961,7 +1115,10 @@ def transcribe(audio_path: str, on_event=None, on_partial=None,
                     on_event(EVENT_PROGRESS, f"{done}/{total}")
                 except Exception:
                     pass
-            result = model.generate(input=seg_path, timestamp=True)
+            # timestamp=True：字符级时间戳；sentence_timestamp=True：输出
+            # `sentence_info`（V1.14.25 去掉 spk_model 后必须显式开，否则只有整段文本）
+            result = model.generate(input=seg_path, timestamp=True,
+                                    sentence_timestamp=True)
             part = _extract_items(result, offset)
             if part:
                 items.extend(part)
@@ -1056,14 +1213,24 @@ class SubtitleWorker:
         self._log_fp = None
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._reader: threading.Thread | None = None
+        self._writer: threading.Thread | None = None
         self._write_lock = threading.Lock()
-        self._state_lock = threading.Lock()     # 组件下载/启动互斥
-        self._inflight = False
+        # 发送队列 + 写线程（V1.14.24）：主线程只入队，永不因管道写满而阻塞
+        self._outbox: "queue.Queue" = queue.Queue(maxsize=256)
+        self._inflight = False                   # 转写任务是否在进行
         self._pos = 0.0
         self._pos_sent = -1e9
         self._pos_sent_at = 0.0
         self._need_restart = False
-        self._gen = 0                            # 取消世代：让在途准备线程自行退出
+        self._gen = 0                            # 转写取消世代
+        # ---- 资源下载（与转写**解耦**，V1.14.23）----
+        # 下载只受 cancel_download() 影响：切歌/取消转写都不会打断下载，
+        # 转写任务在下载没完成时**等待**，不会重启第二次下载。
+        self._dl_thread: threading.Thread | None = None
+        self._dl_gen = 0                         # 下载取消世代
+        self._dl_ok = False                      # 上一次下载是否成功
+        self._dl_event = threading.Event()       # 下载结束信号（成功/失败/取消）
+        self._dl_event.set()
 
     # ---- 状态 ----
     def alive(self) -> bool:
@@ -1075,16 +1242,28 @@ class SubtitleWorker:
             return False
 
     def busy(self) -> bool:
-        """是否有任务在 Worker 里运行。"""
+        """是否有转写任务在跑（准备/等待下载/转写中）。"""
         return self._inflight
+
+    def downloading(self) -> bool:
+        """资源下载是否在进行。"""
+        th = self._dl_thread
+        try:
+            return bool(th is not None and th.is_alive())
+        except Exception:
+            return False
+
+    def pending(self) -> bool:
+        """是否还有活（转写任务或资源下载）——界面轮询用。"""
+        return self._inflight or self.downloading()
 
     # ---- 任务 ----
     def submit(self, audio_path: str, start_at: float = 0.0) -> bool:
-        """提交转写任务（必要时先下载组件、启动 Worker）。
+        """提交转写任务（资源没就绪时会先等下载完成，不会重启下载）。
 
         `start_at`：当前播放位置初值；Worker 会在**模型加载完成后**通过
         `set_position()` 陆续收到的位置决定优先段。
-        成功提交返回 True（下载/启动在后台线程进行，结果经 `poll()` 上报）。
+        成功提交返回 True（准备/下载等待/启动都在后台线程，结果经 `poll()` 上报）。
         """
         if self._inflight:
             return False
@@ -1100,6 +1279,65 @@ class SubtitleWorker:
         threading.Thread(target=self._prepare_and_run,
                          args=(audio_path, gen), daemon=True).start()
         return True
+
+    # ---- 资源下载（独立于转写任务，V1.14.23）----
+    def ensure_download(self) -> bool:
+        """确保资源在下载/已就绪。
+
+        - 资源已齐 → 立即返回 True；
+        - 已在下载 → 返回 True（复用，不重启）；
+        - 否则起后台线程下载，返回 True；
+        - 起线程失败 → False。
+        """
+        if not missing_packages():
+            self._dl_ok = True
+            self._dl_event.set()
+            return True
+        if self.downloading():
+            return True
+        self._dl_ok = False
+        self._dl_event.clear()
+        self._dl_gen += 1
+        gen = self._dl_gen
+        try:
+            self._dl_thread = threading.Thread(
+                target=self._download_run, args=(gen,), daemon=True)
+            self._dl_thread.start()
+        except Exception:
+            self._dl_event.set()
+            self._dl_thread = None
+            return False
+        return True
+
+    def _download_run(self, gen: int) -> None:
+        """后台线程：下载组件包与模型包（只下载，不启动 Worker）。"""
+        def on_event(kind, text="", progress=None) -> None:
+            # 下载事件**不过滤世代**：取消转写不应吞掉下载进度（V1.14.23）
+            self._queue.put(("event", (kind, text, progress)))
+
+        ok = False
+        try:
+            ok = ensure_packages(on_event=on_event,
+                                 should_stop=lambda: gen != self._dl_gen)
+        except Exception:
+            ok = False
+        cancelled = gen != self._dl_gen
+        self._dl_ok = bool(ok) and not cancelled
+        if not cancelled:
+            if ok:
+                self._queue.put(("prepared", None))
+            else:
+                self._queue.put(
+                    ("error", "转写资源下载失败，请检查网络后重试"))
+        self._dl_event.set()         # 唤醒等待中的转写任务
+
+    def cancel_download(self) -> None:
+        """停止资源下载（用户关闭自动字幕时调用，V1.14.23）。"""
+        if not self.downloading():
+            return
+        self._dl_gen += 1            # 下载线程在下一个检查点收尾退出
+        self._dl_ok = False
+        self._dl_event.set()         # 让等待中的转写任务立刻返回
 
     def set_position(self, seconds: float) -> None:
         """写入当前播放位置（主进程持续调用，已节流）。"""
@@ -1125,40 +1363,68 @@ class SubtitleWorker:
             return None
 
     def cancel(self) -> None:
-        """取消当前任务：在跑则终止进程（真正停止），空闲则保留热进程。"""
-        self._gen += 1               # 让在途的下载/启动线程作废（V1.14.20）
-        if self._inflight or self.alive():
+        """取消**转写任务**（在跑则终止进程，空闲则保留热进程）。
+
+        V1.14.23：**完全不动资源下载**——切歌 / 加载真实歌词 / 关闭自动字幕
+        都不会打断下载，也不会让下载重启。
+        """
+        self._gen += 1
+        if self.alive():
             self._stop_process()
         self._inflight = False
 
     def shutdown(self) -> None:
-        """退出 Worker（程序关闭时调用）：先 quit，超时再 terminate。"""
+        """退出 Worker（程序关闭时调用）：先 quit，超时再 terminate。
+
+        V1.14.24：`_send()` 已改为只入队（不会阻塞），所以这里直接发 quit 后
+        最多等 1.5s，再强制 terminate——关闭流程绝不会卡住。
+        """
         self._gen += 1
-        self._send({"type": "quit"})
         proc = self._proc
+        self._send({"type": "quit"})
         if proc is not None:
             try:
-                proc.wait(timeout=1.0)
+                proc.wait(timeout=1.5)
             except Exception:
                 pass
         self._stop_process()
+        self._inflight = False
+        self._dl_gen += 1                # 下载线程（daemon）自行收尾
 
     # ---- 内部：准备与启动 ----
     def _prepare_and_run(self, audio_path: str, gen: int) -> None:
-        """后台线程：确保组件就绪 → 启动 Worker → 发送 run。
+        """后台线程：等资源就绪 → 启动 Worker → 发送 run。
 
-        `gen` 是本轮任务世代：期间被 `cancel()`/`submit()` 作废则直接退出，
-        不再继续下载/启动（V1.14.20）。
+        V1.14.23：资源由 `ensure_download()` 统一下载并与转写任务解耦——
+        这里只**等待**下载结束（下载进度照常上报），不再自己发起第二次下载，
+        所以切歌/重启转写不会把进行中的下载打断或重新下载。
         """
         def stale() -> bool:
             return gen != self._gen
         try:
             if stale():
                 return
-            if not self._ensure_component():
-                if not stale():
-                    self._fail("无法获取转写组件，请检查网络后重试")
-                return
+            if not missing_packages():
+                pass                       # 资源已就绪
+            else:
+                if not self.ensure_download():
+                    if not stale():
+                        self._fail("无法启动资源下载")
+                    return
+                # 等待下载结束（每 0.2s 检查一次取消世代；下载不受影响）
+                while not self._dl_event.wait(0.2):
+                    if stale():
+                        return             # 只退出本任务，下载继续
+                if stale():
+                    return
+                if not self._dl_ok:
+                    self._fail("转写资源下载失败，请检查网络后重试")
+                    return
+        except Exception as exc:
+            if not stale():
+                self._fail(f"{type(exc).__name__}: {exc}")
+            return
+        try:
             if stale():
                 return
             if self._need_restart or not self.alive():
@@ -1182,21 +1448,6 @@ class SubtitleWorker:
         self._inflight = False
         self._queue.put(("error", message))
 
-    def _ensure_component(self) -> bool:
-        """确保组件 exe 存在（加锁串行化，避免并发重复下载）。"""
-        if os.path.isfile(_component_exe_path()):
-            return True
-        with self._state_lock:
-            if os.path.isfile(_component_exe_path()):
-                return True
-
-            def on_progress(done: int, total: int) -> None:
-                text, frac = _download_progress(
-                    "正在下载转写组件", done, total)
-                self._queue.put(("event", (EVENT_DOWNLOAD, text, frac)))
-
-            return _ensure_component(on_progress=on_progress)
-
     def _launch(self) -> bool:
         """启动 `audio_to_text.exe --pipe` 并开始读线程。"""
         exe = _component_exe_path()
@@ -1209,7 +1460,8 @@ class SubtitleWorker:
             pass
         env = os.environ.copy()
         env.update({
-            "MODELSCOPE_CACHE": _model_cache_dir(),
+            # V1.14.24：取 modelscope 实际会用的缓存根（兼容 hub/models 旧布局）
+            "MODELSCOPE_CACHE": _modelscope_cache_root(),
             "FUNASR_NO_UPDATE_CHECK": "1",
             "MODELSCOPE_DISABLE_REMOTE": "1",
             "PYTHONIOENCODING": "utf-8",
@@ -1243,22 +1495,55 @@ class SubtitleWorker:
         self._reader = threading.Thread(target=self._read_loop, args=(proc,),
                                         daemon=True)
         self._reader.start()
+        # 写线程（V1.14.24）：主线程入队，由它真正写管道
+        self._writer = threading.Thread(target=self._write_loop, args=(proc,),
+                                        daemon=True)
+        self._writer.start()
         return True
 
     def _send(self, obj) -> bool:
-        """向 Worker 写一行 JSON（加锁；失败标记需要重启）。"""
+        """把一行 JSON 放进发送队列（**绝不阻塞调用方**，V1.14.24）。
+
+        Worker 未启动/已退出返回 False；队列满时位置类消息直接丢弃（下一次
+        位置会覆盖它），其余消息短超时入队。真正的写由 `_write_loop()` 做。
+        """
         proc = self._proc
         if proc is None or proc.poll() is not None:
             return False
         data = json.dumps(obj, ensure_ascii=False) + "\n"
-        with self._write_lock:
-            try:
-                proc.stdin.write(data)      # type: ignore[union-attr]
-                proc.stdin.flush()          # type: ignore[union-attr]
-                return True
-            except Exception:
-                self._need_restart = True
-                return False
+        try:
+            self._outbox.put_nowait(data)
+            return True
+        except queue.Full:
+            pass
+        if isinstance(obj, dict) and obj.get("type") == "position":
+            return True                     # 位置可以丢（后到的最新）
+        try:
+            self._outbox.put(data, timeout=0.5)
+            return True
+        except queue.Full:
+            self._need_restart = True
+            return False
+
+    def _write_loop(self, proc) -> None:
+        """写线程：真正把发送队列里的数据写进 Worker 的 stdin。
+
+        放在独立线程后，即使 Worker 长时间不读 stdin（例如旧版组件在下载
+        模型、或 onefile 还在解压），也不会把主界面卡住。
+        """
+        while True:
+            data = self._outbox.get()
+            if data is None:                # 收尾信号
+                return
+            if self._proc is not proc:
+                return
+            with self._write_lock:
+                try:
+                    proc.stdin.write(data)  # type: ignore[union-attr]
+                    proc.stdin.flush()      # type: ignore[union-attr]
+                except Exception:
+                    self._need_restart = True
+                    return
 
     def _read_loop(self, proc) -> None:
         """读线程：逐行解析 JSON 并入队；EOF 视为进程退出。"""
@@ -1324,11 +1609,22 @@ class SubtitleWorker:
         if self._proc is not proc:
             return
         self._proc = None
+        # 让写线程退出：清空待发数据 + 放收尾信号（V1.14.24）
+        try:
+            while True:
+                self._outbox.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._outbox.put_nowait(None)
+        except queue.Full:
+            pass
+        self._writer = None
         for stream in ("stdin", "stdout"):
             handle = getattr(proc, stream, None)
             try:
                 if handle is not None:
-                    handle.close()
+                    handle.close()      # 阻塞中的 write 会抛错并结束写线程
             except Exception:
                 pass
         log_fp = self._log_fp
@@ -1415,6 +1711,34 @@ def _run_worker_main() -> None:
     _suppress_child_console_windows(force=True)
     _demote_priority()
 
+    # 0) 立刻起 stdin 读线程（V1.14.22 修卡死的关键）：
+    #    模型下载/加载可能要几十分钟，若此时不读 stdin，主程序定期发来的
+    #    position 会写满管道缓冲区 → 主程序 stdin.write() 阻塞 → 界面卡死。
+    #    EOF（主程序退出/被杀）则立刻自杀，不留下继续下载的孤儿进程。
+    inbox: "queue.Queue" = queue.Queue()
+
+    def _read_stdin() -> None:
+        try:
+            for line in sys.stdin:      # type: ignore[union-attr]
+                text = (line or "").strip()
+                if not text:
+                    continue
+                try:
+                    obj = json.loads(text)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") == "position":
+                    _set_current_position(obj.get("value"))
+                    continue
+                inbox.put(obj)
+        except Exception:
+            pass
+        os._exit(0)                     # 管道已断开：父进程没了，直接退
+
+    threading.Thread(target=_read_stdin, daemon=True).start()
+
     # 1) 模型缓存检查（首次自动下载）
     send_event(EVENT_PREPARE, "正在检查转写模型…")
 
@@ -1441,26 +1765,16 @@ def _run_worker_main() -> None:
         return
     send_event(EVENT_LOAD, "语音模型已就绪")
 
-    # 4) 协议主循环
+    # 4) 协议主循环（消息由读线程入队，与下载/加载并行）
     job: dict = {"thread": None}
     try:
-        for line in sys.stdin:          # type: ignore[union-attr]
-            text = (line or "").strip()
-            if not text:
-                continue
-            try:
-                obj = json.loads(text)
-            except Exception:
-                send({"type": "error", "message": "无法解析的任务消息"})
-                continue
-            if not isinstance(obj, dict):
-                continue
+        while True:
+            obj = inbox.get()
+            if obj is None:
+                break
             kind = obj.get("type")
             if kind == "quit":
                 break
-            if kind == "position":
-                _set_current_position(obj.get("value"))
-                continue
             if kind != "run":
                 continue
             thread = job.get("thread")

@@ -93,28 +93,43 @@ VS Code 中也可直接用「终端 → 运行任务」里的
 Compress-Archive -Path "C:\Users\<你>\.cache\modelscope" -DestinationPath "dist_ex\modelscope.zip" -CompressionLevel Optimal
 ```
 
-需要的模型（`funasr` 首次运行会自动下载，体积约 2GB）：
+需要的模型（`funasr` 会按下面的仓库名去缓存里找；缺哪个就下哪个，总体积约 1.4GB）：
 
-| 模型 | 用途 |
-| --- | --- |
-| `iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch` | 中文识别主模型 |
-| `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch` | VAD |
-| `iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch` | 标点 |
-| `iic/speech_timestamp_prediction-v1-16k-offline` | 时间戳（fa-zh） |
-| `iic/speech_campplus_sv_zh-cn_16k-common` | 说话人（cam++） |
+| 模型仓库 | 用途 | 体积 |
+| --- | --- | --- |
+| `iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch` | 中文识别主模型（`paraformer-zh` 在 funasr 1.4.x 实际指向这个） | ~950MB |
+| `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch` | VAD（`fsmn-vad`） | ~4MB |
+| `iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch` | 标点（`ct-punc-c`，**小标点模型**） | ~290MB |
+| `iic/speech_timestamp_prediction-v1-16k-offline` | 时间戳（`fa-zh`） | ~200MB |
+| （可选）`jieba.c.dict` 等模型仓库附带文件 | 由 modelscope 自动下载 | ~40MB |
 
-**zip 结构要求（关键）**：zip 根目录下必须直接是 `modelscope\`，其下是 `hub\`：
+> **V1.14.25 起**：`punc_model` 用 `ct-punc-c`（小标点），并**去掉了 `spk_model="cam++"`**
+> （说话人分离对字幕无用）。这样整套模型约 **1.4GB**，`modelscope.zip` 能压在
+> GitHub 的 **2GiB 单资产上限**以内。
+> `ct-punc`（`punc_ct-transformer_cn-en-common-vocab471067-large`，1.1GB）与
+> `speech_campplus_sv_zh-cn_16k-common` **不再需要**，可以从包里删掉。
+
+> ⚠ **最稳的打包方式**：先让程序自己把模型下载完整一次，再把
+> `_internal\extensions\model\modelscope` 下**实际生成的内容**压成 zip。
+> 这样模型仓库名、附带文件（如 `jieba.c.dict`）都不会漏。
+
+**zip 结构要求（关键）**：zip 根目录下必须直接是 `modelscope\`。其下支持两种布局
+（程序会自动识别用哪一种，**不需要**手动搬迁几 GB 文件）：
 
 ```
 modelscope.zip
 └─ modelscope\
-   └─ hub\
-      ├─ models\iic\...        （5 个模型目录）
-      └─ .md5 / .lock 等（可保留，无妨）
+   ├─ models\iic\...        ← 新布局（modelscope 1.29 原生，推荐）
+   └─ hub\models\iic\...    ← 旧布局（~/.cache/modelscope 的默认结构，也兼容）
 ```
 
-解压后校验路径为 `_internal\extensions\model\modelscope\hub`，即解压目标是
-`_internal\extensions\model`，`required_rel = "modelscope"`。
+- 程序在启动/下载后会按内容判断：`<root>\models` 有东西 → 用新布局；
+  否则 `<root>\hub\models` 有东西 → 把 `MODELSCOPE_CACHE` 指向 `<root>\hub`；
+- 解压目标是 `_internal\extensions\model`，`required_rel = "modelscope"`。
+
+> 若两种布局**同时**存在（例如旧包 + 新下载的半成品），程序优先用 `models\`。
+> 想省掉重复下载：删掉 `_internal\extensions\model\modelscope\models\`，
+> 让它回退到已有的 `hub\models\`。
 
 ---
 

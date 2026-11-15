@@ -15,7 +15,7 @@ if TYPE_CHECKING:   # 仅类型检查：app 依赖 utils，运行时导入会循
 # ===========================================================================
 
 APP_NAME = "Player PRO"
-APP_VERSION = "1.14.21"
+APP_VERSION = "1.14.25"
 
 
 # ===========================================================================
@@ -194,11 +194,37 @@ def get_duration_mutagen(path: str) -> float | None:
 # 进度条
 # ===========================================================================
 
+# 1/8 ~ 8/8 方块（U+258F…U+2588）：进度条按 1/8 格精度填充（V1.14.22）
+BAR_EIGHTHS = "▏▎▍▌▋▊▉█"
+BAR_FULL = BAR_EIGHTHS[-1]
+BAR_EMPTY = "\u3000"        # 全角空格：与 1 个 █ 等宽，保证各进度对齐（V1.14.22）
+
+
 def make_progress_bar(pct: float, width: int = 10) -> str:
-    """生成文字进度条：▓▓▓▓▓░░░ 60%"""
-    done = int(round(pct / 100 * width))
-    done = max(0, min(width, done))
-    return f"{'▓' * done}{'░' * (width - done)} {pct:.0f}%"
+    """生成文字进度条：`███▌　　　　 45%`（1/8 方块精度）。
+
+    Args:
+        pct: 百分比 0~100（越界自动钳制）。
+        width: 总格数（每格再细分为 8 份，即 width×8 级精度）。
+
+    空白格用**全角空格**（U+3000）补齐——`█` 是整字宽，用半角空格补会让
+    「不满的进度」比满格进度短，后面的百分比数字左右乱跳；一个 `█` 对应
+    一个全角空格才对得齐。同一 width 下各进度文本等宽。
+    """
+    try:
+        value = float(pct)
+    except Exception:
+        value = 0.0
+    value = max(0.0, min(100.0, value))
+    cells = max(1, int(width))
+    steps = int(round(value / 100.0 * cells * 8))
+    steps = max(0, min(cells * 8, steps))
+    full, rest = divmod(steps, 8)
+    bar = BAR_FULL * full
+    if rest and full < cells:
+        bar += BAR_EIGHTHS[rest - 1]
+    bar = bar.ljust(cells, BAR_EMPTY)
+    return f"{bar} {value:.0f}%"
 
 
 # ===========================================================================
