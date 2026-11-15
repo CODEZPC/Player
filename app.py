@@ -2057,8 +2057,13 @@ class LrcPlayerApp:
                 break
             kind, payload = msg
             if kind == "event":
-                ek, text = payload
-                self._on_subtitle_event(ek, text, gen)
+                # V1.14.21：事件负载变成 (kind, text, progress)，
+                # 兼容旧的两元素元组
+                ek = payload[0] if len(payload) > 0 else ""
+                etext = payload[1] if len(payload) > 1 else ""
+                eprog = float(payload[2]) if len(payload) > 2 and \
+                    payload[2] is not None else None
+                self._on_subtitle_event(ek, etext, gen, eprog)
             elif kind == "partial":                 # 某段完成 → 立即显示（V1.14.9）
                 self._append_subtitle_items(payload, gen)
             elif kind == "done":
@@ -2076,8 +2081,13 @@ class LrcPlayerApp:
         self._subtitle_poll_id = self.root.after(
             SUBTITLE_POLL_MS, lambda: self._poll_subtitle_worker(gen))
 
-    def _on_subtitle_event(self, kind: str, text: str, gen: int) -> None:
-        """主线程：处理子进程上报的进度事件（V1.14.7 / V1.14.8）。"""
+    def _on_subtitle_event(self, kind: str, text: str, gen: int,
+                           progress=None) -> None:
+        """主线程：处理子进程上报的进度事件（V1.14.7 / V1.14.8）。
+
+        V1.14.21：`progress`（0~1）不再为 None 时，在任务框文字后面拼一条
+        文字进度条（与状态栏扫描进度同一风格：`▓▓▓░░░ 45%`）。
+        """
         if gen != self._subtitle_gen:
             return
         if kind == "transcribe":
@@ -2091,8 +2101,15 @@ class LrcPlayerApp:
             self._subtitle_phase = "transcribe"
             self._subtitle_last_tick = 0.0
             return
-        if text:                                   # download / load 阶段原文显示
-            self._set_task("subtitle", f"语音转写　{text}")
+        if not text:
+            return
+        if kind == "download" and progress is not None:
+            pct = max(0.0, min(1.0, float(progress))) * 100.0
+            # 任务框可用宽度约 322px（操作栏 340 - 内边距）；8 格刚好不溢出
+            text = f"{text} {make_progress_bar(pct, 8)}"
+        # V1.14.21：下载阶段不显示「语音转写」前缀（把宽度留给进度条）
+        prefix = "" if kind == "download" else "语音转写　"
+        self._set_task("subtitle", f"{prefix}{text}")
 
     def _tick_subtitle_elapsed(self, gen: int) -> None:
         """任务框显示「语音转写　第 k/N 段 · 已用 mm:ss」（V1.14.7 / V1.14.14）。

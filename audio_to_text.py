@@ -266,11 +266,16 @@ def _mirror_prefixes() -> list[str]:
     return list(DEFAULT_MIRRORS)
 
 
-def _download_text(head: str, done: int, total: int) -> str:
-    """下载进度文本：有总长给百分比，否则给已下载 MB。"""
-    if total > 0:
-        return f"{head} {min(100, int(done * 100 / total))}%"
-    return f"{head} {done / 1048576:.1f} MB"
+def _download_progress(head: str, done: int, total: int):
+    """下载进度 → `(文本, 0~1 比例或 None)`（V1.14.21）。
+
+    比例用于界面画文字进度条（`make_progress_bar`）；总长未知时返回 None，
+    文本里改成「已下载 xx MB」供参考。
+    """
+    if total and total > 0:
+        frac = max(0.0, min(1.0, float(done) / float(total)))
+        return head, frac
+    return f"{head} {done / 1048576:.1f} MB", None
 
 
 def _validate_zip(path: str) -> bool:
@@ -460,23 +465,34 @@ class _ProgressSink:
         self.transcribing = False   # 是否已进入转写阶段（只上报一次）
 
     # ---- 进度文本 ----
-    def _emit(self, kind: str, text: str = "") -> None:
+    def _emit(self, kind: str, text: str = "", progress=None) -> None:
         if self._cb is None:
+            return
+        try:
+            self._cb(kind, text, progress)      # 新签名：带 0~1 进度
+            return
+        except TypeError:
+            pass                                # 旧签名，回退两参数式
+        except Exception:
             return
         try:
             self._cb(kind, text)
         except Exception:
             pass
 
+    def _download_frac(self):
+        """按「已完成文件数 + 当前文件百分比」估算总进度（0~1，未知时 None）。"""
+        if not self.files_total:
+            return None
+        frac = (self.files_done + self.cur_pct / 100.0) / float(self.files_total)
+        return max(0.0, min(1.0, frac))
+
     def _compose_download(self) -> str:
+        """下载文本（V1.14.21 起只留短文本：文件名/百分比交给任务框进度条）。"""
         if self.files_total:
-            head = (f"正在下载模型 "
+            return (f"正在下载模型 "
                     f"{min(self.files_done, self.files_total)}/{self.files_total}")
-        else:
-            head = "正在下载模型"
-        if self.cur_name:
-            return f"{head}（{self.cur_name} {self.cur_pct}%）"
-        return head
+        return "正在下载模型"
 
     def _handle_line(self, line: str) -> None:
         line = line.strip()
@@ -488,7 +504,8 @@ class _ProgressSink:
                 self.files_total = int(m.group("n"))
             except ValueError:
                 self.files_total = 0
-            self._emit(EVENT_DOWNLOAD, self._compose_download())
+            self._emit(EVENT_DOWNLOAD, self._compose_download(),
+                       self._download_frac())
             return
         m = _RE_DOWNLOAD.search(line)
         if m:
@@ -496,11 +513,14 @@ class _ProgressSink:
             mp = _RE_PCT.search(line)
             if mp:
                 self.cur_pct = min(100, int(mp.group("pct")))
-            self._emit(EVENT_DOWNLOAD, self._compose_download())
+            self._emit(EVENT_DOWNLOAD, self._compose_download(),
+                       self._download_frac())
             return
         if _RE_FILE_DONE.search(line):
             self.files_done += 1
-            self._emit(EVENT_DOWNLOAD, self._compose_download())
+            self.cur_pct = 0
+            self._emit(EVENT_DOWNLOAD, self._compose_download(),
+                       self._download_frac())
             return
         if _RE_RTF_STEPS.search(line):
             # 只通知「已进入转写阶段」，段数无意义（见 EVENT_* 注释，V1.14.7）
@@ -991,7 +1011,14 @@ def _protocol_to_tuple(obj):
         return None
     kind = obj.get("type")
     if kind == "event":
-        return ("event", (str(obj.get("kind") or ""), str(obj.get("text") or "")))
+        progress = obj.get("progress")
+        try:
+            progress = None if progress is None else float(progress)
+        except Exception:
+            progress = None
+        return ("event",
+                (str(obj.get("kind") or ""), str(obj.get("text") or ""),
+                 progress))
     if kind == "partial":
         return ("partial", _items_from_json(obj.get("items")))
     if kind == "done":
@@ -1164,10 +1191,9 @@ class SubtitleWorker:
                 return True
 
             def on_progress(done: int, total: int) -> None:
-                self._queue.put((
-                    "event",
-                    (EVENT_DOWNLOAD,
-                     _download_text("正在下载转写组件", done, total))))
+                text, frac = _download_progress(
+                    "正在下载转写组件", done, total)
+                self._queue.put(("event", (EVENT_DOWNLOAD, text, frac)))
 
             return _ensure_component(on_progress=on_progress)
 
@@ -1344,7 +1370,8 @@ def _worker_transcribe(path: str, send, send_event) -> None:
     try:
         items = transcribe(
             path,
-            on_event=lambda kind, text="": send_event(kind, text),
+            on_event=lambda kind, text="", progress=None:
+                send_event(kind, text, progress),
             on_partial=lambda part: send({"type": "partial",
                                           "items": _items_to_json(part)}),
             position=_get_current_position,
@@ -1376,18 +1403,26 @@ def _run_worker_main() -> None:
             except Exception:
                 pass
 
-    def send_event(kind: str, text: str = "") -> None:
-        send({"type": "event", "kind": kind, "text": text})
+    def send_event(kind: str, text: str = "", progress=None) -> None:
+        obj = {"type": "event", "kind": kind, "text": text}
+        if progress is not None:
+            try:
+                obj["progress"] = round(float(progress), 4)
+            except Exception:
+                pass
+        send(obj)
 
     _suppress_child_console_windows(force=True)
     _demote_priority()
 
     # 1) 模型缓存检查（首次自动下载）
     send_event(EVENT_PREPARE, "正在检查转写模型…")
-    if not _ensure_worker_model(
-            on_progress=lambda done, total: send_event(
-                EVENT_DOWNLOAD,
-                _download_text("正在下载模型", done, total))):
+
+    def _model_progress(done: int, total: int) -> None:
+        text, frac = _download_progress("正在下载模型", done, total)
+        send_event(EVENT_DOWNLOAD, text, frac)
+
+    if not _ensure_worker_model(on_progress=_model_progress):
         send({"type": "error",
               "message": "无法获取转写模型，请检查网络后重试"})
         return
